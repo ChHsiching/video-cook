@@ -774,6 +774,62 @@ def cmd_cover(args: argparse.Namespace) -> None:
 
 
 # ============================================================================
+# Subcommand: show-source — extract key fields from source.json
+# ============================================================================
+
+# The fields worth surfacing to the agent. yt-dlp's full info-dict is 1MB+
+# with hundreds of fields most of which are internal (formats, thumbnails
+# list, automatic_caps, etc). This is the curated subset that actually helps
+# translation context (Step 3) and upload metadata (Step 6/7).
+_SOURCE_FIELDS = [
+    "title",              # original title — for upload.md titles + README header
+    "uploader",           # author name — for "who is the author" in description
+    "channel",            # channel name (often same as uploader, sometimes cleaner)
+    "uploader_url",       # author's profile/page — for linking their repo/handle
+    "webpage_url",        # source video URL — for README header + source links
+    "duration",           # seconds — for README header
+    "upload_date",        # YYYYMMDD — for README header
+    "description",        # source description — KEY for translation context:
+                          #   often contains video topic, chapter outline,
+                          #   terminology, mentioned tools/people/projects.
+                          #   Helps fix ASR proper-noun errors in Step 3.
+    "tags",               # source tags — terminology hints
+    "categories",         # source categories — topic context
+]
+
+
+def cmd_show_source(args: argparse.Namespace) -> None:
+    """Extract the useful fields from raw/<name>.source.json and emit them
+    as a small JSON object. The source.json written by `cook download` is
+    yt-dlp's full info-dict (1MB+, hundreds of fields) — fine on disk, but
+    reading it wholesale into agent context wastes budget. This subcommand
+    surfaces just the fields translation (Step 3) and upload metadata
+    (Step 6/7) actually consume.
+
+    Exit 1 if source.json is missing (run `cook download` first)."""
+    root = _video_dir(args.output_root)
+    src = _raw(root, args.name, ".source.json")
+    if not src.exists():
+        _die(f"source.json not found: {src}. Run 'cook download' first.")
+
+    try:
+        info = json.loads(src.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        _die(f"source.json is not valid JSON: {e}")
+
+    out = {"ok": True, "source_json": str(src.relative_to(root))}
+    for field in _SOURCE_FIELDS:
+        val = info.get(field)
+        if val is not None:
+            # trim absurdly long values (some descriptions are 10KB+)
+            if isinstance(val, str) and len(val) > 5000 and not args.full:
+                out[field] = val[:5000] + f"\n... [truncated, {len(val)} chars total, pass --full to see all]"
+            else:
+                out[field] = val
+    _emit_json(out)
+
+
+# ============================================================================
 # Subcommand: verify-align — DP global alignment of en.srt vs translations.txt
 # ============================================================================
 
@@ -1076,6 +1132,15 @@ def build_parser() -> argparse.ArgumentParser:
     pvs.add_argument("--stage", choices=["raw", "transcript", "subtitle",
                                           "cloud-srt", "cooked", "root"])
     pvs.set_defaults(func=cmd_verify_shipment)
+
+    # show-source
+    pss = sub.add_parser("show-source",
+                         help="extract key fields from source.json for translation/upload context")
+    pss.add_argument("output_root")
+    pss.add_argument("name")
+    pss.add_argument("--full", action="store_true",
+                     help="don't truncate long fields (descriptions can be 10KB+)")
+    pss.set_defaults(func=cmd_show_source)
 
     return p
 

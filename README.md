@@ -36,6 +36,7 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 | `cook subtitles <root> <name>` | shorten → merge-short → biliteral → ASS + cloud-srt in one shot | video-subtitle Step 4 + cloud-srt |
 | `cook burn <root> <name>` | ffmpeg subtitle burning, auto-detaches, subprocess list-form | video-subtitle Step 5 |
 | `cook cover <root> <name>` | Place `cover.jpg` in `cooked/` (reuses raw thumbnail) | video-subtitle Step 6 cover task |
+| `cook show-source <root> <name>` | Extract key fields (title/uploader/links/description) from source.json | (new — surfaces the source context for translation + upload metadata) |
 | `cook verify-align <root> <name>` | DP-align `en.srt` vs `translations.txt`, catch missing/drifted translations | (new — no prior equivalent) |
 | `cook verify-shipment <root> <name>` | Check the full release set exists; exit 0 = ready to ship | (new — no prior equivalent) |
 
@@ -68,6 +69,7 @@ The router (`video-cooking`) calls `cook verify-shipment` as the final gate befo
 | Windows `C:` paths broke ffmpeg `ass` filter | cook uses subprocess list-form (never shell), runs from subtitle/ dir with bare filename |
 | `subtitles.py split` leaked single-language cues across zh.srt/en.srt | cook copies `*.merged.srt` to cloud-srt instead of splitting bilingual.srt |
 | `transcribe.py` hardcoded `device="cpu"`, float16 unusable on GPU | cook auto-detects CUDA → float16+cuda, else float32+cpu |
+| `source.json` downloaded but never read by downstream — author/links/description wasted | `cook show-source` surfaces the curated fields translation and upload metadata consume |
 | detached template only covered transcribe, not burn | cook's `_detach()` helper handles both uniformly |
 | No mechanical way to catch translation drift | `cook verify-align` runs DP global alignment |
 | No mechanical way to catch missing release-set files | `cook verify-shipment` checks every expected file |

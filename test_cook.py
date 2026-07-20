@@ -335,6 +335,104 @@ class TestCloudSrtNoCrossLeak:
 
 
 # ----------------------------------------------------------------------------
+# show-source: extract key fields from source.json
+# ----------------------------------------------------------------------------
+
+class TestShowSource:
+    """source.json is yt-dlp's full info-dict (1MB+). show-source surfaces
+    only the curated fields translation/upload actually consume."""
+
+    def _run(self, root: Path, full: bool = False) -> dict:
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": "video", "full": full,
+        })()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_show_source(args)
+        return json.loads(buf.getvalue())
+
+    def _make_source_json(self, root: Path, fields: dict) -> Path:
+        import json as _json
+        raw_dir = root / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        path = raw_dir / "video.source.json"
+        path.write_text(_json.dumps(fields), encoding="utf-8")
+        return path
+
+    def test_extracts_key_fields(self, tmp_path: Path):
+        """All curated fields surface; internal yt-dlp fields don't."""
+        root = tmp_path / "vid"
+        self._make_source_json(root, {
+            "title": "Demo Video",
+            "uploader": "Jane Dev",
+            "channel": "Jane Dev",
+            "uploader_url": "https://example.com/@jane",
+            "webpage_url": "https://example.com/watch?v=123",
+            "duration": 600,
+            "upload_date": "20260101",
+            "description": "A video about things.",
+            "tags": ["python", "tutorial"],
+            "categories": ["Education"],
+            # internal yt-dlp fields that should NOT surface
+            "formats": [{"format_id": "123", "ext": "mp4"}],
+            "automatic_caption": {"tracks": []},
+            "__original_url": "internal",
+        })
+        report = self._run(root)
+        assert report["ok"] is True
+        assert report["title"] == "Demo Video"
+        assert report["uploader"] == "Jane Dev"
+        assert report["uploader_url"] == "https://example.com/@jane"
+        assert report["webpage_url"] == "https://example.com/watch?v=123"
+        assert report["duration"] == 600
+        assert report["upload_date"] == "20260101"
+        assert report["description"] == "A video about things."
+        assert report["tags"] == ["python", "tutorial"]
+        assert report["categories"] == ["Education"]
+        # internal fields must not leak
+        assert "formats" not in report
+        assert "automatic_caption" not in report
+        assert "__original_url" not in report
+
+    def test_truncates_long_description(self, tmp_path: Path):
+        """Long descriptions (10KB+) get truncated to 5000 chars by default."""
+        root = tmp_path / "vid"
+        long_desc = "x" * 8000
+        self._make_source_json(root, {"title": "T", "description": long_desc})
+        report = self._run(root, full=False)
+        assert len(report["description"]) < 5100  # ~5000 + truncation marker
+        assert "truncated" in report["description"]
+        assert "8000 chars total" in report["description"]
+
+    def test_full_flag_disables_truncation(self, tmp_path: Path):
+        """--full returns the entire description, no truncation."""
+        root = tmp_path / "vid"
+        long_desc = "x" * 8000
+        self._make_source_json(root, {"title": "T", "description": long_desc})
+        report = self._run(root, full=True)
+        assert report["description"] == long_desc
+
+    def test_missing_fields_omitted(self, tmp_path: Path):
+        """Fields absent from source.json don't appear as null in output."""
+        root = tmp_path / "vid"
+        self._make_source_json(root, {"title": "T"})  # only title, nothing else
+        report = self._run(root)
+        assert report["title"] == "T"
+        assert "uploader" not in report
+        assert "description" not in report
+
+    def test_missing_source_json_exits_nonzero(self, tmp_path: Path):
+        """No source.json -> exit 1, clear error."""
+        root = tmp_path / "vid"
+        root.mkdir(parents=True)
+        with pytest.raises(SystemExit) as exc:
+            self._run(root)
+        assert exc.value.code == 1
+
+
+# ----------------------------------------------------------------------------
 # Path helper sanity
 # ----------------------------------------------------------------------------
 
