@@ -27,9 +27,9 @@ dependencies = []
 #   pip install video-cook[download]    # for cook download
 #   pip install video-cook[transcribe]  # for cook transcribe
 #   pip install video-cook[all]         # everything
-download = ["yt-dlp>=2026.7.9"]
+download = ["yt-dlp>=2026.3.3"]
 transcribe = ["whisperx>=3.8.0"]
-all = ["yt-dlp>=2026.7.9", "whisperx>=3.8.0"]
+all = ["yt-dlp>=2026.3.3", "whisperx>=3.8.0"]
 dev = ["pytest>=7"]
 
 [project.scripts]
