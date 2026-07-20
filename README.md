@@ -16,10 +16,23 @@ cook fixes all three by being the single place where the commands are assembled.
 
 ## Install
 
+**Option 1: One-liner via uv** (recommended — uv handles Python interpreter + isolated env + PATH wiring automatically, no pip/venv knowledge needed):
+
 ```bash
-pip install video-cook[all]      # yt-dlp + whisperx + cook itself
+# Linux / macOS
+curl -LsSf https://github.com/ChHsiching/video-cook/releases/latest/download/install.sh | sh
+# Windows (PowerShell)
+irm https://github.com/ChHsiching/video-cook/releases/latest/download/install.ps1 | iex
+```
+
+The installer uses [uv](https://astral.sh/uv/) to install `video-cook[all]` as an isolated tool (~2GB — pulls whisperx + torch). After install, open a new shell and run `cook doctor`.
+
+**Option 2: pip directly**:
+
+```bash
+pip install video-cook[all]       # yt-dlp + whisperx + cook itself
 # or pick what you need:
-pip install video-cook[download]  # for `cook download`
+pip install video-cook[download]   # for `cook download`
 pip install video-cook[transcribe] # for `cook transcribe`
 ```
 

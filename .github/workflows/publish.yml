@@ -1,32 +1,83 @@
-# Publish video-cook to PyPI on release.
+# Publish video-cook: push a v* tag → smoke test → build → PyPI → GitHub Release.
 #
-# Uses Trusted Publishing (OIDC) — no API token. PyPI trusts this workflow
-# because of a pre-registered publisher entry on pypi.org that pins
-# (owner, repo, workflow filename, environment). Mismatch any of those
-# four and the upload is rejected.
+# Triggered by pushing a tag like `v0.1.0`. The pipeline is strictly serial:
+# smoke-test → build → pypi-publish → github-release. Any failure stops the
+# chain, so a failed smoke test never reaches PyPI (which is immutable —
+# once vN.N.N uploads, that version is locked forever).
 #
-# Trigger: a GitHub Release is published (draft a release with a vN.N.N tag
-# in the GitHub UI, click Publish). Also runnable manually via workflow_dispatch
-# for recovery / re-release of the same version if a build failed mid-publish.
+# Why this trigger instead of `on: release: published`: you said "push tag
+# should auto-release" — pushing a tag is the natural publish gesture, and
+# requiring a separate manual Release step in the GitHub UI is friction.
+# This workflow creates the Release itself via `gh release create`.
 #
-# PyPI is immutable — once vN.N.N uploads, that version is locked. To fix
-# something, bump the version and publish again.
+# PyPI auth uses Trusted Publishing (OIDC) — no API token. PyPI trusts this
+# workflow because of a pre-registered publisher on pypi.org that pins
+# (owner=ChHsiching, repo=video-cook, workflow=publish.yml, environment=pypi).
+# The required_reviewers protection on the `pypi` environment pauses the
+# pypi-publish job for human approval before the irreversible upload.
 
-name: Publish to PyPI
+name: Publish to PyPI and create GitHub Release
 
 "on":
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (must already exist in the repo)'
+        required: true
+        type: string
 
-# Cancel any superseded run on the same ref (only one release publishes at a time anyway).
+# Only one publish run per ref — a re-pushed tag supersedes the prior run.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: write   # gh release create needs this
+  id-token: write   # OIDC for PyPI trusted publishing
+
 jobs:
+  smoke-test:
+    # Multi-platform sanity check BEFORE doing anything irreversible.
+    # cook.py is pure Python (py3-none-any wheel), so a build only needs
+    # to succeed once — but the entry point and lazy imports behave
+    # differently on each platform, so we smoke test all three.
+    name: Smoke test (${{ matrix.os }})
+    strategy:
+      fail-fast: false   # report all platform failures, not just the first
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cook in dev mode
+        run: pip install -e '.[dev]'
+
+      - name: Run unit tests
+        run: pytest test_cook.py -v
+
+      - name: Install with all extras (entry point smoke test)
+        # This pulls whisperx/torch (~2GB) — but it's the only way to confirm
+        # `cook` (the entry point) actually works on each platform.
+        run: pip install '.[all]'
+
+      - name: cook --version
+        run: cook --version
+
+      - name: cook doctor (env check)
+        # doctor never exits non-zero — it reports what's missing as JSON.
+        # We just want to see it run without import errors.
+        run: cook doctor
+
   build:
-    name: Build sdist + wheel
+    name: Build sdist + wheel + SHA256SUMS
+    needs: smoke-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,35 +92,80 @@ jobs:
       - name: Build distributions
         run: python -m build
 
-      - name: Upload build artifacts
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: sha256sum video-cook-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
-  publish:
+  pypi-publish:
     name: Publish to PyPI (OIDC trusted publisher)
     needs: build
     runs-on: ubuntu-latest
-    # Must match the Environment name registered on the PyPI trusted
-    # publisher entry. The required_reviewers protection on this environment
-    # means GitHub pauses here until a maintainer approves the run.
+    # Must match the Environment name registered on the PyPI trusted publisher
+    # entry. The required_reviewers protection on this environment pauses here
+    # until a maintainer approves the run — PyPI uploads are irreversible.
     environment: pypi
-    permissions:
-      # Required for OIDC — lets the job mint a trusted token PyPI will accept.
-      id-token: write
     steps:
-      - name: Download build artifacts
+      - name: Download dist artifacts
         uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
       - name: Publish to PyPI
-        # The official PyPA action. With no `password:` input it uses
-        # OIDC trusted publishing. See:
-        # https://github.com/pypa/gh-action-pypi-publish
+        # The official PyPA action with no `password:` input uses OIDC trusted
+        # publishing. print-hash shows what's about to be uploaded and fails
+        # loud if metadata is missing.
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          # Show what's about to be uploaded, fail loud on missing metadata.
           print-hash: true
+
+  github-release:
+    name: Create GitHub Release with assets
+    needs: pypi-publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Resolve tag name
+        id: tag
+        # When triggered by `on: push: tags`, github.ref is refs/tags/v0.1.0.
+        # When triggered by workflow_dispatch, the tag comes from inputs.tag.
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage release assets
+        # Move install scripts into dist/ so they upload alongside the wheel.
+        run: |
+          cp scripts/install.sh dist/
+          cp scripts/install.ps1 dist/
+          ls -la dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.name }}" \
+            --title "${{ steps.tag.outputs.name }}" \
+            --generate-notes \
+            --verify-tag \
+            dist/video-cook-*.whl \
+            dist/video-cook-*.tar.gz \
+            dist/SHA256SUMS.txt \
+            dist/install.sh \
+            dist/install.ps1
