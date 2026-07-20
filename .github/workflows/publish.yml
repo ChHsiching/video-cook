@@ -1,0 +1,75 @@
+# Publish video-cook to PyPI on release.
+#
+# Uses Trusted Publishing (OIDC) — no API token. PyPI trusts this workflow
+# because of a pre-registered publisher entry on pypi.org that pins
+# (owner, repo, workflow filename, environment). Mismatch any of those
+# four and the upload is rejected.
+#
+# Trigger: a GitHub Release is published (draft a release with a vN.N.N tag
+# in the GitHub UI, click Publish). Also runnable manually via workflow_dispatch
+# for recovery / re-release of the same version if a build failed mid-publish.
+#
+# PyPI is immutable — once vN.N.N uploads, that version is locked. To fix
+# something, bump the version and publish again.
+
+name: Publish to PyPI
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Cancel any superseded run on the same ref (only one release publishes at a time anyway).
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build
+        run: pip install build
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI (OIDC trusted publisher)
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the Environment name registered on the PyPI trusted
+    # publisher entry. The required_reviewers protection on this environment
+    # means GitHub pauses here until a maintainer approves the run.
+    environment: pypi
+    permissions:
+      # Required for OIDC — lets the job mint a trusted token PyPI will accept.
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        # The official PyPA action. With no `password:` input it uses
+        # OIDC trusted publishing. See:
+        # https://github.com/pypa/gh-action-pypi-publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Show what's about to be uploaded, fail loud on missing metadata.
+          print-hash: true
