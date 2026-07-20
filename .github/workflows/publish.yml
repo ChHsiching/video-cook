@@ -94,7 +94,9 @@ jobs:
 
       - name: Generate SHA256SUMS.txt
         working-directory: dist
-        run: sha256sum video-cook-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+        # PEP 625: sdist/wheel filenames normalize dashes to underscores
+        # (video-cook the package -> video_cook-0.1.0.tar.gz the file).
+        run: sha256sum video_cook-* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
@@ -164,8 +166,8 @@ jobs:
             --title "${{ steps.tag.outputs.name }}" \
             --generate-notes \
             --verify-tag \
-            dist/video-cook-*.whl \
-            dist/video-cook-*.tar.gz \
+            dist/video_cook-*.whl \
+            dist/video_cook-*.tar.gz \
             dist/SHA256SUMS.txt \
             dist/install.sh \
             dist/install.ps1
