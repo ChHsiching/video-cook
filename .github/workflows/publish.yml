@@ -98,11 +98,23 @@ jobs:
         # (video-cook the package -> video_cook-0.1.0.tar.gz the file).
         run: sha256sum video_cook-* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
-      - name: Upload dist artifacts
+      - name: Upload Python distributions (for PyPI)
         uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
+          name: python-dists
+          # Only the actual packages — pypa/gh-action-pypi-publish tries to
+          # validate every file in this dir as a Python distribution, so
+          # SHA256SUMS.txt must NOT be here (it would fail with
+          # "InvalidDistribution: Unknown distribution format").
+          path: |
+            dist/video_cook-*.whl
+            dist/video_cook-*.tar.gz
+
+      - name: Upload release assets (SHA256SUMS, for GitHub Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-extra
+          path: dist/SHA256SUMS.txt
 
   pypi-publish:
     name: Publish to PyPI (OIDC trusted publisher)
@@ -113,10 +125,10 @@ jobs:
     # until a maintainer approves the run — PyPI uploads are irreversible.
     environment: pypi
     steps:
-      - name: Download dist artifacts
+      - name: Download Python distributions
         uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: python-dists
           path: dist/
 
       - name: Publish to PyPI
@@ -134,10 +146,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download dist artifacts
+      - name: Download Python distributions
         uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: python-dists
+          path: dist/
+
+      - name: Download release extras
+        uses: actions/download-artifact@v4
+        with:
+          name: release-extra
           path: dist/
 
       - name: Resolve tag name
