@@ -46,7 +46,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # ----------------------------------------------------------------------------
 # Output helpers — JSON to stdout (agents parse this), prose to stderr (humans)
@@ -120,10 +120,18 @@ def _detach_windows(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -
     subprocess.Popen with DETACHED_PROCESS would also work, but Start-Process
     gives cleaner process-group separation and is what the existing skill
     template used. Returns the launched PID.
+
+    -ArgumentList is passed as a PowerShell array @('a','b',...) — NOT a single
+    space-joined string. The string form breaks on paths containing spaces
+    (PowerShell re-tokenizes the whole string into one positional arg, and
+    Start-Process rejects it with "positional parameter not found"). Each arg
+    is single-quoted with embedded quotes doubled, so spaces/special chars
+    survive intact.
     """
+    args_ps = ",".join("'" + c.replace("'", "''") + "'" for c in cmd[1:])
     ps_script = (
         f"Start-Process -FilePath '{cmd[0]}' "
-        f"-ArgumentList '{' '.join(_ps_quote(c) for c in cmd[1:])}' "
+        f"-ArgumentList @({args_ps}) "
         f"-WorkingDirectory '{cwd}' "
         f"-RedirectStandardOutput '{log_file}' "
         f"-RedirectStandardError '{err_file}' "
