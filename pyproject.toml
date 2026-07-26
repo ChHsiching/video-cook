@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-cook"
-version = "0.1.0"
-description = "Deterministic executor for the video-cooking skill pipeline. Handles yt-dlp download, whisperX transcription, ffmpeg burn, and mechanical shipment verification — so agents don't hand-assemble long commands."
+version = "0.2.0"
+description = "Deterministic executor for the video-cooking skill pipeline. Handles yt-dlp download, whisperX transcription, ffmpeg burn, Demucs vocal separation, dub mixing, and mechanical shipment verification — so agents don't hand-assemble long commands."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
