@@ -731,6 +731,25 @@ def _run_subs(mod, argv: list[str]) -> None:
         sys.argv = old
 
 
+def _import_dub_module():
+    """Import full_dub.py from the video-dubbing skill scripts. The module
+    handles IndexTTS2 synthesis, timeline construction, video re-timing, and
+    burning. cook is a thin dispatcher — same pattern as _import_subtitles_module."""
+    candidates = [
+        Path.home() / ".agents" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
+        Path.home() / ".zcode" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
+        Path.home() / ".claude" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("full_dub", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    _die("full_dub.py not found. Install video-dubbing skill: npx skills add ChHsiching/video-dubbing-skill")
+
+
 # ============================================================================
 # Subcommand: burn
 # ============================================================================
@@ -1305,6 +1324,52 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
     sys.exit(0 if report["ok"] else 1)
 
 
+# ----------------------------------------------------------------------------
+# dub subcommands: synth / timeline / retime / burn / full
+# Thin wrappers over video-dubbing skill's full_dub.py. Each loads the module
+# via importlib and calls the corresponding stage function. Same pattern as
+# cmd_subtitles → subtitles.py.
+# ----------------------------------------------------------------------------
+
+def cmd_dub_synth(args: argparse.Namespace) -> None:
+    """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2 (single-threaded).
+    Produces dubbed/_full/_segments/sent_NNNN.wav. Slow on CPU (~7h for 140 cues)."""
+    dub = _import_dub_module()
+    dub.stage_synth(args.output_root, args.name)
+
+
+def cmd_dub_timeline(args: argparse.Namespace) -> None:
+    """Stage 2: build the string-of-pearls re-timed timeline.
+    Reads _segments/ + en.full.srt, writes dubbed/_full/timeline.json."""
+    dub = _import_dub_module()
+    dub.stage_timeline(args.output_root, args.name)
+
+
+def cmd_dub_retime(args: argparse.Namespace) -> None:
+    """Stage 3: cut raw video into segments, re-time each (setpts), interpolate
+    slow segments (minterpolate). Produces dubbed/_full/_vsegs/v_NNNN.mp4."""
+    dub = _import_dub_module()
+    dub.stage_retime(args.output_root, args.name)
+
+
+def cmd_dub_burn(args: argparse.Namespace) -> None:
+    """Stage 4: concat segments + place audio + generate subtitles (shorten +
+    merge-short + ass) + burn into cooked/<name>.dubbed.mp4. Also copies the
+    upload subtitle to cloud-srt/zh.dub.srt."""
+    dub = _import_dub_module()
+    dub.stage_burn(args.output_root, args.name)
+
+
+def cmd_dub_full(args: argparse.Namespace) -> None:
+    """Run all four stages in sequence: synth → timeline → retime → burn.
+    Use for a fresh run; resume by running individual stages (cache-aware)."""
+    dub = _import_dub_module()
+    dub.stage_synth(args.output_root, args.name)
+    dub.stage_timeline(args.output_root, args.name)
+    dub.stage_retime(args.output_root, args.name)
+    dub.stage_burn(args.output_root, args.name)
+
+
 # ============================================================================
 # CLI entry point
 # ============================================================================
@@ -1421,6 +1486,38 @@ def build_parser() -> argparse.ArgumentParser:
     pdv.add_argument("output_root")
     pdv.add_argument("name")
     pdv.set_defaults(func=cmd_dub_verify)
+
+    # New pipeline (IndexTTS2 + bi-directional re-timing). Thin wrappers over
+    # video-dubbing skill's full_dub.py — loaded via importlib at call time.
+    pdsyn = dub_sub.add_parser("synth",
+                               help="Stage 1: IndexTTS2 synthesis → dubbed/_full/_segments/")
+    pdsyn.add_argument("output_root")
+    pdsyn.add_argument("name")
+    pdsyn.set_defaults(func=cmd_dub_synth)
+
+    pdtl = dub_sub.add_parser("timeline",
+                              help="Stage 2: string-of-pearls timeline → dubbed/_full/timeline.json")
+    pdtl.add_argument("output_root")
+    pdtl.add_argument("name")
+    pdtl.set_defaults(func=cmd_dub_timeline)
+
+    pdrt = dub_sub.add_parser("retime",
+                              help="Stage 3: video segments + minterpolate → dubbed/_full/_vsegs/")
+    pdrt.add_argument("output_root")
+    pdrt.add_argument("name")
+    pdrt.set_defaults(func=cmd_dub_retime)
+
+    pdbn = dub_sub.add_parser("burn",
+                              help="Stage 4: concat + audio + subtitles + burn → cooked/<name>.dubbed.mp4")
+    pdbn.add_argument("output_root")
+    pdbn.add_argument("name")
+    pdbn.set_defaults(func=cmd_dub_burn)
+
+    pdfl = dub_sub.add_parser("full",
+                              help="Run all 4 stages: synth → timeline → retime → burn")
+    pdfl.add_argument("output_root")
+    pdfl.add_argument("name")
+    pdfl.set_defaults(func=cmd_dub_full)
 
     return p
 
