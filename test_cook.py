@@ -176,7 +176,13 @@ class TestVerifyShipment:
 
     def _touch(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"x")
+        # source.json gets real JSON content — verify-shipment validates it has
+        # a title (a 3-byte "NA" or empty file would now flag as an issue).
+        if path.name.endswith(".source.json"):
+            path.write_text('{"title": "test video", "uploader": "author"}',
+                            encoding="utf-8")
+        else:
+            path.write_bytes(b"x")
 
     def test_empty_dir_reports_all_missing(self, tmp_path: Path):
         root = tmp_path / "author" / "video"
