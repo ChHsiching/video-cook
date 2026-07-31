@@ -79,8 +79,14 @@ def _die(msg: str, obj: dict[str, Any] | None = None) -> None:
 def _video_dir(output_root: str | Path) -> Path:
     """The per-video directory. output_root IS the per-video dir in our
     convention (<cwd>/<author>/<video-name>/), so it's a passthrough, but
-    having a named function keeps the call sites readable."""
-    return Path(output_root)
+    having a named function keeps the call sites readable.
+
+    Resolves to an absolute path: every downstream detached child process runs
+    with its own cwd (the per-video dir), so relative output_root values would
+    resolve against the wrong base and fail with "No such file". Resolving once
+    here means callers can pass either relative or absolute paths safely.
+    """
+    return Path(output_root).resolve()
 
 
 def _raw(output_root: str | Path, name: str, suffix: str) -> Path:
@@ -111,57 +117,71 @@ def _dubbed_dir(output_root: str | Path) -> Path:
 
 
 # ----------------------------------------------------------------------------
-# Detached execution — survives shell timeouts (~10 min in some agent envs).
+# Long-task execution.
+#
+# cook runs long tasks (transcribe, burn, demucs separation) in the FOREGROUND
+# by default: the command blocks until done, exit code is the task's result.
+# This makes cook a pure executor — the caller (an agent shell, a task manager
+# like zcode's background tasks, or a human at a terminal) owns the lifecycle:
+# it decides how to wait, gets notified on completion, and can stop the task.
+#
+# `--detach` opts back into the old detached behaviour for users who run cook
+# directly from a terminal and want to reclaim it. Detached mode launches a
+# child that survives the parent shell; the caller then polls the log file for
+# the done marker, since it no longer gets an exit code.
+#
+# The previous default was detach-always, launched via PowerShell Start-Process
+# on Windows. That had two bugs this rewrite fixes:
+#   1. Start-Process mangled multi-line `-c <script>` argv (PowerShell's
+#      single-quoted ArgumentList elements don't preserve embedded newlines),
+#      truncating whisperX's inline transcribe script at the first line break.
+#   2. Detach-by-default fought any outer task manager: the detached process
+#      escaped the manager's tracking, notification, and stop controls.
 # ----------------------------------------------------------------------------
 
-def _detach_windows(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> int:
-    """Launch cmd detached on Windows via PowerShell Start-Process.
+def _run_long_task(cmd: list[str], cwd: Path, log_file: Path, err_file: Path,
+                   detach: bool = False) -> dict:
+    """Run a long command either in the foreground (default) or detached.
 
-    subprocess.Popen with DETACHED_PROCESS would also work, but Start-Process
-    gives cleaner process-group separation and is what the existing skill
-    template used. Returns the launched PID.
-
-    -ArgumentList is passed as a PowerShell array @('a','b',...) — NOT a single
-    space-joined string. The string form breaks on paths containing spaces
-    (PowerShell re-tokenizes the whole string into one positional arg, and
-    Start-Process rejects it with "positional parameter not found"). Each arg
-    is single-quoted with embedded quotes doubled, so spaces/special chars
-    survive intact.
+    Foreground: blocks, returns {"ok": rc==0, "returncode": rc, "detached": False}.
+    Detached:   returns immediately with {"ok": True, "pid": pid, "detached": True}.
+    Both write stdout/stderr to log_file/err_file.
     """
-    args_ps = ",".join("'" + c.replace("'", "''") + "'" for c in cmd[1:])
-    ps_script = (
-        f"Start-Process -FilePath '{cmd[0]}' "
-        f"-ArgumentList @({args_ps}) "
-        f"-WorkingDirectory '{cwd}' "
-        f"-RedirectStandardOutput '{log_file}' "
-        f"-RedirectStandardError '{err_file}' "
-        f"-WindowStyle Hidden "
-        f"-PassThru | Select-Object -ExpandProperty Id"
-    )
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps_script],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        _die(f"failed to launch detached process: {result.stderr.strip()}")
-    pid = int(result.stdout.strip())
-    return pid
-
-
-def _ps_quote(s: str) -> str:
-    """Quote a single arg for PowerShell -ArgumentList string."""
-    if not s or re.search(r"[ \t'\"\\]", s):
-        return "'" + s.replace("'", "''") + "'"
-    return s
-
-
-def _detach_unix(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> int:
-    """Launch cmd detached on Unix via nohup. Returns the launched PID."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     err_file.parent.mkdir(parents=True, exist_ok=True)
+    if detach:
+        pid = _launch_detached(cmd, cwd, log_file, err_file)
+        return {"ok": True, "detached": True, "pid": pid}
+    with open(log_file, "w", encoding="utf-8") as log_fh, \
+         open(err_file, "w", encoding="utf-8") as err_fh:
+        rc = subprocess.run(cmd, cwd=str(cwd), stdout=log_fh, stderr=err_fh).returncode
+    return {"ok": rc == 0, "detached": False, "returncode": rc}
+
+
+def _launch_detached(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> int:
+    """Launch cmd detached, platform-appropriate. Returns the launched PID.
+
+    On Windows uses subprocess.Popen with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    rather than PowerShell Start-Process — Start-Process's -ArgumentList quoting
+    mangles argv containing embedded newlines (e.g. `python -c "<multiline>"`),
+    truncating the script. Popen passes argv as a list, preserving every arg.
+    """
+    if sys.platform == "win32":
+        log_fh = open(log_file, "w", encoding="utf-8")
+        err_fh = open(err_file, "w", encoding="utf-8")
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), stdout=log_fh, stderr=err_fh,
+            stdin=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        return proc.pid
+    # Unix
     with open(log_file, "wb") as log, open(err_file, "wb") as err:
         proc = subprocess.Popen(
-            cmd, cwd=cwd, stdout=log, stderr=err,
+            cmd, cwd=str(cwd), stdout=log, stderr=err,
             stdin=subprocess.DEVNULL,
             start_new_session=True,  # equivalent to setsid
         )
@@ -169,10 +189,12 @@ def _detach_unix(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> i
 
 
 def _detach(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> int:
-    """Launch cmd detached, platform-appropriate. Returns PID."""
-    if sys.platform == "win32":
-        return _detach_windows(cmd, cwd, log_file, err_file)
-    return _detach_unix(cmd, cwd, log_file, err_file)
+    """Back-compat shim: launch detached via _launch_detached. Returns PID.
+
+    Kept so any external caller (or a branch that hasn't migrated to
+    _run_long_task yet) keeps working. Prefer _run_long_task(..., detach=...).
+    """
+    return _launch_detached(cmd, cwd, log_file, err_file)
 
 
 # ----------------------------------------------------------------------------
@@ -325,13 +347,24 @@ def cmd_download(args: argparse.Namespace) -> None:
     url = args.url
     cwd = Path.cwd()
 
+    # A user-supplied cookies.txt wins over browser negotiation.
+    cookies_file = getattr(args, "cookies", None)
+    if cookies_file:
+        cookies_file = Path(cookies_file)
+        if not cookies_file.is_absolute():
+            cookies_file = (cwd / cookies_file).resolve()
+        if not cookies_file.exists():
+            _die(f"--cookies file not found: {cookies_file}")
+
     # --- Phase 1: probe metadata to derive author/name ---
     _log(f"cook download: probing {url}")
     probe_opts = {
         "quiet": True, "no_warnings": True, "skip_download": True,
         "js_runtimes": "node", "remote_components": "ejs:github",
     }
-    if args.cookies_from_browser:
+    if cookies_file:
+        probe_opts["cookiefile"] = str(cookies_file)
+    elif args.cookies_from_browser:
         probe_opts["cookiesfrombrowser"] = (args.cookies_from_browser,)
 
     with yt_dlp.YoutubeDL(probe_opts) as ydl:
@@ -340,11 +373,15 @@ def cmd_download(args: argparse.Namespace) -> None:
         except Exception as e:
             err = str(e)
             if "Sign in to confirm" in err or "bot" in err.lower():
+                if cookies_file:
+                    _die(f"auth wall hit even with --cookies {cookies_file}; "
+                         "the cookies.txt may be stale — re-export it")
                 # cookieless failed with auth wall — negotiate
                 cookie_src = _negotiate_cookie(url, args.cookies_from_browser)
                 if cookie_src is None:
                     _die("could not find a working cookie source — "
-                         "ask the user which browser they are logged in with")
+                         "ask the user which browser they are logged in with, "
+                         "or pass --cookies <cookies.txt>")
                 probe_opts["cookiesfrombrowser"] = (cookie_src,)
                 with yt_dlp.YoutubeDL(probe_opts) as ydl2:
                     info = ydl2.extract_info(url, download=False)
@@ -384,21 +421,46 @@ def cmd_download(args: argparse.Namespace) -> None:
         "remote_components": "ejs:github",
         "quiet": False,
         "no_warnings": False,
-        # use print_to_file rather than dump-json — avoids the stdout-redirect
-        # trap that silently swallowed downloads in the old skill.
-        "print_to_file": {"%(all)j": str(json_path)},
     }
-    if "cookiesfrombrowser" in probe_opts:
+    if "cookiefile" in probe_opts:
+        dl_opts["cookiefile"] = probe_opts["cookiefile"]
+    elif "cookiesfrombrowser" in probe_opts:
         dl_opts["cookiesfrombrowser"] = probe_opts["cookiesfrombrowser"]
 
     _log("cook download: downloading video, thumbnail, and metadata")
     with yt_dlp.YoutubeDL(dl_opts) as ydl:
         ydl.download([url])
 
-    # --- Phase 4: fix thumbnail name (yt-dlp leaves it as <name>.raw.jpg) ---
-    if thumb_actual.exists() and not thumb_target.exists():
-        thumb_actual.rename(thumb_target)
-        _log(f"cook download: renamed thumbnail {thumb_actual.name} -> {thumb_target.name}")
+    # --- Phase 4: fix thumbnail name + handle webp→jpg fallback ---
+    # yt-dlp may leave the thumbnail as <name>.raw.jpg OR <name>.raw.webp
+    # (convert_thumbnails:jpg sometimes fails on newer yt-dlp). Promote either
+    # to <name>.jpg, converting via ffmpeg if only webp is present.
+    thumb_jpg_raw = raw_dir / f"{name}.raw.jpg"
+    thumb_webp_raw = raw_dir / f"{name}.raw.webp"
+    if not thumb_target.exists():
+        if thumb_jpg_raw.exists():
+            thumb_jpg_raw.rename(thumb_target)
+            _log(f"cook download: renamed thumbnail {thumb_jpg_raw.name} -> {thumb_target.name}")
+        elif thumb_webp_raw.exists():
+            _log(f"cook download: converting webp thumbnail -> jpg")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(thumb_webp_raw), str(thumb_target)],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and thumb_target.exists():
+                thumb_webp_raw.unlink(missing_ok=True)
+                _log(f"cook download: converted thumbnail -> {thumb_target.name}")
+            else:
+                _log(f"cook download: WARN webp->jpg conversion failed, keeping webp")
+
+    # --- Phase 4b: write source.json from the probed info ---
+    # We write it ourselves from the probe result rather than relying on
+    # yt-dlp's print_to_file (whose %(all)j template broke on newer versions,
+    # silently writing a 3-byte "NA"). The probe `info` dict is the same data.
+    import json as _json
+    json_path.write_text(_json.dumps(info, ensure_ascii=False, indent=2, default=str),
+                         encoding="utf-8")
+    _log(f"cook download: wrote source.json ({json_path.stat().st_size} bytes)")
 
     # --- Phase 5: verify ---
     raw_mp4 = raw_dir / f"{name}.raw.mp4"
@@ -427,7 +489,8 @@ def cmd_download(args: argparse.Namespace) -> None:
         "files": files,
         "thumbnail_renamed": thumb_target.exists(),
         "source_json_present": json_path.exists(),
-        "cookie_source": probe_opts.get("cookiesfrombrowser", (None,))[0],
+        "cookie_source": probe_opts.get("cookiefile")
+                         or probe_opts.get("cookiesfrombrowser", (None,))[0],
     })
 
 
@@ -551,20 +614,36 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
     ]
     log_file = _transcript(root, args.name, ".transcribe.log")
     err_file = _transcript(root, args.name, ".transcribe.err.log")
+    detach = getattr(args, "detach", False)
 
-    pid = _detach(inner_cmd, cwd=root, log_file=log_file, err_file=err_file)
-    _log(f"cook transcribe: detached PID={pid}, log={log_file.name}")
+    if detach:
+        pid = _run_long_task(inner_cmd, cwd=root, log_file=log_file,
+                             err_file=err_file, detach=True)["pid"]
+        _log(f"cook transcribe: detached PID={pid}, log={log_file.name}")
+        _log("cook transcribe: this is the slow step (CPU large-v3 runs ~0.5-0.7x realtime)")
+        _emit_json({
+            "ok": True, "detached": True, "pid": pid,
+            "device": device, "compute": compute, "model": model, "language": language,
+            "log": str(log_file.relative_to(root)),
+            "err_log": str(err_file.relative_to(root)),
+            "output_srt": str(srt.relative_to(root)),
+            "done_marker": "[transcribe] done.",
+        })
+        return
+
+    _log(f"cook transcribe: foreground, log={log_file.name}")
     _log("cook transcribe: this is the slow step (CPU large-v3 runs ~0.5-0.7x realtime)")
-
+    res = _run_long_task(inner_cmd, cwd=root, log_file=log_file, err_file=err_file)
     _emit_json({
-        "ok": True, "detached": True, "pid": pid,
+        "ok": res["ok"], "detached": False, "returncode": res["returncode"],
         "device": device, "compute": compute, "model": model, "language": language,
         "log": str(log_file.relative_to(root)),
         "err_log": str(err_file.relative_to(root)),
         "output_srt": str(srt.relative_to(root)),
-        # The agent polls until this file exists and contains "[transcribe] done."
         "done_marker": "[transcribe] done.",
     })
+    if not res["ok"]:
+        _die(f"transcribe failed (exit {res['returncode']}); see {err_file}")
 
 
 # This string is exec'd by the detached child. Kept inline so cook is a single
@@ -731,10 +810,8 @@ def _run_subs(mod, argv: list[str]) -> None:
         sys.argv = old
 
 
-def _import_dub_module():
-    """Import full_dub.py from the video-dubbing skill scripts. The module
-    handles IndexTTS2 synthesis, timeline construction, video re-timing, and
-    burning. cook is a thin dispatcher — same pattern as _import_subtitles_module."""
+def _find_dub_script() -> Path:
+    """Locate full_dub.py from the video-dubbing skill scripts."""
     candidates = [
         Path.home() / ".agents" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
         Path.home() / ".zcode" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
@@ -742,12 +819,57 @@ def _import_dub_module():
     ]
     for cand in candidates:
         if cand.exists():
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("full_dub", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
+            return cand
     _die("full_dub.py not found. Install video-dubbing skill: npx skills add ChHsiching/video-dubbing-skill")
+
+
+def _run_dub_stage(stage: str, output_root: str, name: str,
+                   python: str | None = None, detach: bool = False,
+                   log_name: str | None = None) -> None:
+    """Run one full_dub.py stage as a subprocess under the chosen interpreter.
+
+    This is the fix for the IndexTTS2 environment split: full_dub.py needs
+    `from indextts import ...`, but indextts lives in a separate venv that
+    cook's own Python cannot import. The old code exec'd full_dub.py in-process,
+    which failed with ModuleNotFoundError on every stage. By launching a
+    subprocess with `--python <venv>/python`, the stage runs in an interpreter
+    that CAN import indextts, demucs, and torch.
+
+    synth/timeline/retime/burn are all routed through here so a single
+    `cook dub full --python <venv>` runs the whole pipeline in one environment.
+    """
+    script = _find_dub_script()
+    py_bin = python or sys.executable
+    root = _video_dir(output_root)
+    log_file = root / "dubbed" / (log_name or f"{stage}.log")
+    err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [py_bin, str(script), stage, str(root), name]
+    label = f"cook dub {stage}"
+    _log(f"{label}: stage={stage} python={py_bin} ({'detached' if detach else 'foreground'})")
+
+    if detach:
+        pid = _run_long_task(cmd, cwd=root, log_file=log_file,
+                             err_file=err_file, detach=True)["pid"]
+        _emit_json({
+            "ok": True, "detached": True, "pid": pid, "stage": stage,
+            "python": py_bin,
+            "log": str(log_file.relative_to(root)),
+            "err_log": str(err_file.relative_to(root)),
+            "done_marker": f"Stage {stage} DONE",
+        })
+        return
+
+    res = _run_long_task(cmd, cwd=root, log_file=log_file, err_file=err_file)
+    _emit_json({
+        "ok": res["ok"], "detached": False, "returncode": res["returncode"],
+        "stage": stage, "python": py_bin,
+        "log": str(log_file.relative_to(root)),
+        "err_log": str(err_file.relative_to(root)),
+    })
+    if not res["ok"]:
+        _die(f"dub {stage} failed (exit {res['returncode']}); see {err_file}")
 
 
 # ============================================================================
@@ -791,18 +913,34 @@ def cmd_burn(args: argparse.Namespace) -> None:
     ]
     log_file = cooked_dir / "burn.log"
     err_file = cooked_dir / "burn.err.log"
+    detach = getattr(args, "detach", False)
 
-    _log(f"cook burn: detaching ffmpeg (mode={args.mode})")
-    pid = _detach(cmd, cwd=cwd, log_file=log_file, err_file=err_file)
+    if detach:
+        _log(f"cook burn: detaching ffmpeg (mode={args.mode})")
+        pid = _run_long_task(cmd, cwd=cwd, log_file=log_file,
+                             err_file=err_file, detach=True)["pid"]
+        _emit_json({
+            "ok": True, "detached": True, "pid": pid,
+            "mode": args.mode,
+            "output": str(out.relative_to(root)),
+            "log": str(log_file.relative_to(root)),
+            "err_log": str(err_file.relative_to(root)),
+            "done_marker": "kb/s",
+        })
+        return
 
+    _log(f"cook burn: foreground ffmpeg (mode={args.mode})")
+    res = _run_long_task(cmd, cwd=cwd, log_file=log_file, err_file=err_file)
     _emit_json({
-        "ok": True, "detached": True, "pid": pid,
+        "ok": res["ok"], "detached": False, "returncode": res["returncode"],
         "mode": args.mode,
         "output": str(out.relative_to(root)),
         "log": str(log_file.relative_to(root)),
         "err_log": str(err_file.relative_to(root)),
-        "done_marker": "kb/s",  # last line of ffmpeg progress contains bitrate
+        "done_marker": "kb/s",
     })
+    if not res["ok"]:
+        _die(f"burn failed (exit {res['returncode']}); see {err_file}")
 
 
 # ============================================================================
@@ -1095,6 +1233,26 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
 
     # cross-checks (issues, not hard missing)
     issues = []
+    # raw stage: source.json must be valid JSON with a title (not the 3-byte
+    # "NA" that yt-dlp's broken %(all)j template used to write), and the
+    # thumbnail must be a real jpg (not a webp that conversion failed on).
+    if not args.stage or args.stage == "raw":
+        src_json = _raw(root, name, ".source.json")
+        if src_json.exists():
+            import json as _json
+            try:
+                data = _json.loads(src_json.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not data.get("title"):
+                    issues.append("source.json has no title — likely corrupted; re-run cook download")
+            except _json.JSONDecodeError:
+                issues.append("source.json is not valid JSON — re-run cook download")
+        thumb = _raw(root, name, ".jpg")
+        if thumb.exists():
+            # jpg files start with FF D8 FF; webp starts with "RIFF".
+            with open(thumb, "rb") as f:
+                head = f.read(4)
+            if head[:4] == b"RIFF":
+                issues.append(f"{thumb.name} is actually webp, not jpg — conversion failed")
     if not args.stage or args.stage == "cooked":
         if cooked_mp4.exists():
             raw_dur = _ffprobe_duration(_raw(root, name, ".raw.mp4"))
@@ -1117,6 +1275,26 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
 
 # ============================================================================
 # Subcommand group: dub (video-dubbing skill — Chinese voiceover)
+
+
+def _move_separated_stems(sep_root: Path, model: str, stem_name: str,
+                          vocals: Path, no_vocals: Path, root: Path) -> None:
+    """After demucs runs, move its outputs to the expected dubbed/ paths.
+
+    demucs writes to <sep_root>/<model>/<stem_name>/{vocals,no_vocals}.wav.
+    We move (not copy) them to dubbed/{vocals,no_vocals}.wav so downstream
+    stages find them. In foreground mode this saves the caller a manual step;
+    in detached mode the caller still does it after the done_marker appears.
+    """
+    out_dir = sep_root / model / stem_name
+    src_vocals = out_dir / "vocals.wav"
+    src_no_vocals = out_dir / "no_vocals.wav"
+    if src_vocals.exists():
+        shutil.move(str(src_vocals), str(vocals))
+        _log(f"cook dub separate: moved {src_vocals.name} -> {vocals.relative_to(root)}")
+    if src_no_vocals.exists():
+        shutil.move(str(src_no_vocals), str(no_vocals))
+        _log(f"cook dub separate: moved {src_no_vocals.name} -> {no_vocals.relative_to(root)}")
 # ============================================================================
 
 def cmd_dub_separate(args: argparse.Namespace) -> None:
@@ -1139,20 +1317,26 @@ def cmd_dub_separate(args: argparse.Namespace) -> None:
     sep_root = dubbed_dir / "separated"
     model = args.model
 
-    # Lazy-import demucs so `cook dub verify` works even without it installed.
-    try:
-        from demucs.separate import main as demucs_main  # noqa: F401
-    except ImportError:
+    # Check demucs is reachable via the chosen interpreter. When --python points
+    # at a separate venv, demucs may live there rather than in cook's own Python,
+    # so we probe `python -m demucs --help` instead of importing here.
+    py_bin = getattr(args, "python", None) or sys.executable
+    probe = subprocess.run(
+        [py_bin, "-m", "demucs", "--help"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
         _die(
-            "demucs is not installed. Install with: pip install demucs  "
-            "(or run the skill's scripts/ fallback — see REFERENCE.md)",
-            {"model": model, "raw": str(raw_mp4.relative_to(root))},
+            f"demucs is not reachable via {py_bin}. Install it there: "
+            f"{py_bin} -m pip install demucs",
+            {"model": model, "raw": str(raw_mp4.relative_to(root)),
+             "python": py_bin},
         )
 
     # Build the demucs CLI args and run in a child process so we can detach.
     # Demucs's main() parses argv itself; we re-invoke `python -m demucs`.
     inner_cmd = [
-        sys.executable, "-m", "demucs",
+        py_bin, "-m", "demucs",
         "--two-stems", "vocals",
         "-n", model,
         "--shifts", str(args.shifts),
@@ -1163,21 +1347,40 @@ def cmd_dub_separate(args: argparse.Namespace) -> None:
     log_file = dubbed_dir / "separate.log"
     err_file = dubbed_dir / "separate.err.log"
 
-    _log(f"cook dub separate: model={model} (detached)")
-    pid = _detach(inner_cmd, cwd=root, log_file=log_file, err_file=err_file)
+    detach = getattr(args, "detach", False)
 
+    if detach:
+        _log(f"cook dub separate: model={model} (detached)")
+        pid = _run_long_task(inner_cmd, cwd=root, log_file=log_file,
+                             err_file=err_file, detach=True)["pid"]
+        _emit_json({
+            "ok": True, "detached": True, "pid": pid,
+            "model": model,
+            "expected_vocals": str(vocals.relative_to(root)),
+            "expected_no_vocals": str(no_vocals.relative_to(root)),
+            "log": str(log_file.relative_to(root)),
+            "err_log": str(err_file.relative_to(root)),
+            "done_marker": "Separated tracks",
+            # note: post-detach, the agent must move separated/<model>/<stem>/*.wav
+            # to dubbed/{vocals,no_vocals}.wav. We emit expected paths so the agent
+            # knows where to look; the move is a one-liner the agent does after
+            # the done_marker appears.
+        })
+        return
+
+    _log(f"cook dub separate: model={model} (foreground)")
+    res = _run_long_task(inner_cmd, cwd=root, log_file=log_file, err_file=err_file)
+    if not res["ok"]:
+        _die(f"dub separate failed (exit {res['returncode']}); see {err_file}")
+    # Foreground: move the separated stems to the expected dubbed/ paths now.
+    _move_separated_stems(sep_root, model, raw_mp4.stem, vocals, no_vocals, root)
     _emit_json({
-        "ok": True, "detached": True, "pid": pid,
+        "ok": True, "detached": False, "returncode": res["returncode"],
         "model": model,
-        "expected_vocals": str(vocals.relative_to(root)),
-        "expected_no_vocals": str(no_vocals.relative_to(root)),
+        "vocals": str(vocals.relative_to(root)),
+        "no_vocals": str(no_vocals.relative_to(root)),
         "log": str(log_file.relative_to(root)),
         "err_log": str(err_file.relative_to(root)),
-        "done_marker": "Separated tracks",
-        # note: post-detach, the agent must move separated/<model>/<stem>/*.wav
-        # to dubbed/{vocals,no_vocals}.wav. We emit expected paths so the agent
-        # knows where to look; the move is a one-liner the agent does after
-        # the done_marker appears.
     })
 
 
@@ -1278,11 +1481,15 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
     name = args.name
     dubbed_dir = _dubbed_dir(root)
 
+    # NOTE: full_dub.py writes its working files under dubbed/_full/ and the
+    # final video under cooked/<name>.dubbed.mp4 — NOT under dubbed/ directly.
+    # The earlier version of this check looked for dubbed/dub.wav and
+    # dubbed/<name>.dubbed.mp4, which produced false "missing" reports.
     required = {
         "vocals.wav": dubbed_dir / "vocals.wav",
         "no_vocals.wav": dubbed_dir / "no_vocals.wav",
-        "dub.wav": dubbed_dir / "dub.wav",
-        "dubbed_mp4": _dubbed(root, name, ".dubbed.mp4"),
+        "dub.wav": dubbed_dir / "_full" / "dub.wav",
+        "dubbed_mp4": _cooked(root, name, ".dubbed.mp4"),
         "ref.wav": dubbed_dir / "_reference" / "ref.wav",
         "ref.txt": dubbed_dir / "_reference" / "ref.txt",
     }
@@ -1304,7 +1511,7 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
         if raw_dur > 0 and dubbed_dur > 0 and abs(raw_dur - dubbed_dur) > 2.0:
             issues.append(f"duration mismatch: raw={raw_dur:.1f}s dubbed={dubbed_dur:.1f}s")
     # Cross-check: dub.wav duration should match raw within 2%
-    dub_wav = dubbed_dir / "dub.wav"
+    dub_wav = dubbed_dir / "_full" / "dub.wav"
     if raw_mp4.exists() and dub_wav.exists():
         raw_dur = _ffprobe_duration(raw_mp4)
         dub_dur = _ffprobe_duration(dub_wav)
@@ -1334,40 +1541,49 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 def cmd_dub_synth(args: argparse.Namespace) -> None:
     """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2 (single-threaded).
     Produces dubbed/_full/_segments/sent_NNNN.wav. Slow on CPU (~7h for 140 cues)."""
-    dub = _import_dub_module()
-    dub.stage_synth(args.output_root, args.name)
+    _run_dub_stage("synth", args.output_root, args.name,
+                   python=getattr(args, "python", None),
+                   detach=getattr(args, "detach", False),
+                   log_name="synth.log")
 
 
 def cmd_dub_timeline(args: argparse.Namespace) -> None:
     """Stage 2: build the string-of-pearls re-timed timeline.
     Reads _segments/ + en.full.srt, writes dubbed/_full/timeline.json."""
-    dub = _import_dub_module()
-    dub.stage_timeline(args.output_root, args.name)
+    _run_dub_stage("timeline", args.output_root, args.name,
+                   python=getattr(args, "python", None))
 
 
 def cmd_dub_retime(args: argparse.Namespace) -> None:
     """Stage 3: cut raw video into segments, re-time each (setpts), interpolate
     slow segments (minterpolate). Produces dubbed/_full/_vsegs/v_NNNN.mp4."""
-    dub = _import_dub_module()
-    dub.stage_retime(args.output_root, args.name)
+    _run_dub_stage("retime", args.output_root, args.name,
+                   python=getattr(args, "python", None),
+                   detach=getattr(args, "detach", False),
+                   log_name="retime.log")
 
 
 def cmd_dub_burn(args: argparse.Namespace) -> None:
     """Stage 4: concat segments + place audio + generate subtitles (shorten +
     merge-short + ass) + burn into cooked/<name>.dubbed.mp4. Also copies the
     upload subtitle to cloud-srt/zh.dub.srt."""
-    dub = _import_dub_module()
-    dub.stage_burn(args.output_root, args.name)
+    _run_dub_stage("burn", args.output_root, args.name,
+                   python=getattr(args, "python", None))
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
     """Run all four stages in sequence: synth → timeline → retime → burn.
-    Use for a fresh run; resume by running individual stages (cache-aware)."""
-    dub = _import_dub_module()
-    dub.stage_synth(args.output_root, args.name)
-    dub.stage_timeline(args.output_root, args.name)
-    dub.stage_retime(args.output_root, args.name)
-    dub.stage_burn(args.output_root, args.name)
+    Use for a fresh run; resume by running individual stages (cache-aware).
+    synth/retime are the long stages (CPU-bound); detach applies to them."""
+    py = getattr(args, "python", None)
+    detach = getattr(args, "detach", False)
+    # synth and retime honor detach (the long stages); timeline/burn are fast.
+    _run_dub_stage("synth", args.output_root, args.name, python=py,
+                   detach=detach, log_name="synth.log")
+    _run_dub_stage("timeline", args.output_root, args.name, python=py)
+    _run_dub_stage("retime", args.output_root, args.name, python=py,
+                   detach=detach, log_name="retime.log")
+    _run_dub_stage("burn", args.output_root, args.name, python=py)
 
 
 # ============================================================================
@@ -1393,6 +1609,8 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--name", help="override <video-name> and <name> stem")
     pd.add_argument("--quality", help="cap height, e.g. 1080")
     pd.add_argument("--cookies-from-browser", help="skip negotiation, use this browser")
+    pd.add_argument("--cookies", help="path to a Netscape cookies.txt file for auth "
+                     "(takes precedence over --cookies-from-browser)")
     pd.set_defaults(func=cmd_download)
 
     # extract
@@ -1402,29 +1620,41 @@ def build_parser() -> argparse.ArgumentParser:
     pe.set_defaults(func=cmd_extract)
 
     # transcribe
-    pt = sub.add_parser("transcribe", help="whisperX transcription (auto-detached)")
+    pt = sub.add_parser("transcribe", help="whisperX transcription")
     pt.add_argument("output_root")
     pt.add_argument("name")
     pt.add_argument("--model", default="large-v3")
     pt.add_argument("--compute", default="auto",
                     choices=["auto", "float16", "float32", "int8"])
     pt.add_argument("--language", default="en")
+    pt.add_argument("--detach", action="store_true",
+                    help="run detached (survives shell timeout). Default is foreground; "
+                         "use --detach when running cook directly from a terminal. When an "
+                         "outer task manager (e.g. zcode background tasks) supervises the "
+                         "process, leave it foreground so that manager owns the lifecycle.")
     pt.set_defaults(func=cmd_transcribe)
 
     # subtitles
     ps = sub.add_parser("subtitles", help="shorten+merge+biliteral+ass+cloud-srt in one shot")
     ps.add_argument("output_root")
     ps.add_argument("name")
-    ps.add_argument("--mode", choices=["overlay", "bottom-bar"], default="overlay")
+    ps.add_argument("--mode", choices=["overlay", "bottom-bar"], default="bottom-bar",
+                    help="subtitle placement. bottom-bar (default) pads a black strip below "
+                         "the frame — use for dense visual content (IDE/terminal/UI demos). "
+                         "overlay renders on the picture — use only for talking-head content.")
     ps.add_argument("--bar-px", type=int, default=180)
     ps.set_defaults(func=cmd_subtitles)
 
     # burn
-    pb = sub.add_parser("burn", help="burn subtitles into video (auto-detached)")
+    pb = sub.add_parser("burn", help="burn subtitles into video")
     pb.add_argument("output_root")
     pb.add_argument("name")
-    pb.add_argument("--mode", choices=["overlay", "bottom-bar"], default="overlay")
+    pb.add_argument("--mode", choices=["overlay", "bottom-bar"], default="bottom-bar",
+                    help="subtitle placement. bottom-bar (default) pads a black strip below "
+                         "the frame; overlay renders on the picture (talking-head only).")
     pb.add_argument("--bar-px", type=int, default=180)
+    pb.add_argument("--detach", action="store_true",
+                    help="run detached. Default is foreground (see transcribe --detach).")
     pb.set_defaults(func=cmd_burn)
 
     # cover
@@ -1462,7 +1692,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub_sub = pdub.add_subparsers(dest="dub_cmd", required=True)
 
     pds = dub_sub.add_parser("separate",
-                             help="Demucs vocal separation (auto-detached) → dubbed/{vocals,no_vocals}.wav")
+                             help="Demucs vocal separation → dubbed/{vocals,no_vocals}.wav")
     pds.add_argument("output_root")
     pds.add_argument("name")
     pds.add_argument("--model", default="htdemucs_ft",
@@ -1471,6 +1701,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="number of random shifts for artifact reduction (default 1)")
     pds.add_argument("--overlap", type=float, default=0.5,
                      help="segment overlap (default 0.5; raise for cleaner output)")
+    pds.add_argument("--python", help="path to a Python interpreter for running demucs "
+                     "(default: sys.executable). Use this when demucs lives in a separate venv.")
+    pds.add_argument("--detach", action="store_true",
+                     help="run detached. Default is foreground (see transcribe --detach). "
+                          "Foreground mode auto-moves the separated stems to dubbed/.")
     pds.set_defaults(func=cmd_dub_separate)
 
     pdm = dub_sub.add_parser("mix",
@@ -1489,34 +1724,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     # New pipeline (IndexTTS2 + bi-directional re-timing). Thin wrappers over
     # video-dubbing skill's full_dub.py — loaded via importlib at call time.
+    # Helper: every dub stage needs --python (for the indextts/demucs venv).
+    # The long stages (synth, retime, and full which runs them) also get --detach.
+    def _add_dub_common(parser, with_detach=False):
+        parser.add_argument("output_root")
+        parser.add_argument("name")
+        parser.add_argument("--python",
+                            help="Python interpreter for running full_dub.py (default: "
+                                 "cook's own python). Use this when indextts/demucs live "
+                                 "in a separate venv — e.g. --python ~/Git/index-tts/.venv/Scripts/python.exe")
+        if with_detach:
+            parser.add_argument("--detach", action="store_true",
+                                help="run detached. Default is foreground (see transcribe --detach).")
+
     pdsyn = dub_sub.add_parser("synth",
                                help="Stage 1: IndexTTS2 synthesis → dubbed/_full/_segments/")
-    pdsyn.add_argument("output_root")
-    pdsyn.add_argument("name")
+    _add_dub_common(pdsyn, with_detach=True)
     pdsyn.set_defaults(func=cmd_dub_synth)
 
     pdtl = dub_sub.add_parser("timeline",
                               help="Stage 2: string-of-pearls timeline → dubbed/_full/timeline.json")
-    pdtl.add_argument("output_root")
-    pdtl.add_argument("name")
+    _add_dub_common(pdtl)
     pdtl.set_defaults(func=cmd_dub_timeline)
 
     pdrt = dub_sub.add_parser("retime",
                               help="Stage 3: video segments + minterpolate → dubbed/_full/_vsegs/")
-    pdrt.add_argument("output_root")
-    pdrt.add_argument("name")
+    _add_dub_common(pdrt, with_detach=True)
     pdrt.set_defaults(func=cmd_dub_retime)
 
     pdbn = dub_sub.add_parser("burn",
                               help="Stage 4: concat + audio + subtitles + burn → cooked/<name>.dubbed.mp4")
-    pdbn.add_argument("output_root")
-    pdbn.add_argument("name")
+    _add_dub_common(pdbn)
     pdbn.set_defaults(func=cmd_dub_burn)
 
     pdfl = dub_sub.add_parser("full",
                               help="Run all 4 stages: synth → timeline → retime → burn")
-    pdfl.add_argument("output_root")
-    pdfl.add_argument("name")
+    _add_dub_common(pdfl, with_detach=True)
     pdfl.set_defaults(func=cmd_dub_full)
 
     return p
