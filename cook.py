@@ -46,7 +46,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 
 # ----------------------------------------------------------------------------
 # Output helpers — JSON to stdout (agents parse this), prose to stderr (humans)
