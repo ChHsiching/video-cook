@@ -1642,7 +1642,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="subtitle placement. bottom-bar (default) pads a black strip below "
                          "the frame — use for dense visual content (IDE/terminal/UI demos). "
                          "overlay renders on the picture — use only for talking-head content.")
-    ps.add_argument("--bar-px", type=int, default=180)
+    ps.add_argument("--bar-px", type=int, default=220)
     ps.set_defaults(func=cmd_subtitles)
 
     # burn
@@ -1652,7 +1652,7 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--mode", choices=["overlay", "bottom-bar"], default="bottom-bar",
                     help="subtitle placement. bottom-bar (default) pads a black strip below "
                          "the frame; overlay renders on the picture (talking-head only).")
-    pb.add_argument("--bar-px", type=int, default=180)
+    pb.add_argument("--bar-px", type=int, default=220)
     pb.add_argument("--detach", action="store_true",
                     help="run detached. Default is foreground (see transcribe --detach).")
     pb.set_defaults(func=cmd_burn)
