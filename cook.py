@@ -716,7 +716,7 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     # import the vendor'd subtitles module
     subs = _import_subtitles_module()
 
-    # Step 4a: shorten both languages (only splits extreme cues >2× limit)
+    # Step 4a: shorten both languages (split long cues into single-line cues)
     en_short = tdir / f"{name}.en.short.srt"
     zh_short = tdir / f"{name}.zh.short.srt"
     _run_subs(subs, ["shorten", str(en_srt), str(en_short), "--lang", "en"])
@@ -889,18 +889,7 @@ def cmd_burn(args: argparse.Namespace) -> None:
     if args.mode == "bottom-bar":
         ass = _subtitle(root, name, ".bilingual.bar.ass")
         out = _cooked(root, name, ".cooked.bar.mp4")
-        # Read the actual bar height from the ASS header (cmd_ass may have
-        # auto-grown it beyond the requested --bar-px to fit multi-line cues).
-        bar_px = args.bar_px
-        try:
-            for line in ass.read_text(encoding="utf-8").splitlines():
-                if line.startswith("PlayResY:"):
-                    bar_px = int(line.split(":")[1].strip()) - 1080
-                    break
-        except Exception:
-            pass
-        vf = f"pad=iw:ih+{bar_px}:color=black,ass={ass.name}"
-        _log(f"cook burn: bar={bar_px}px (PlayResY={bar_px + 1080})")
+        vf = f"pad=iw:ih+{args.bar_px}:color=black,ass={ass.name}"
         cwd = ass.parent  # run from subtitle/ so ass filter gets bare filename
     else:
         ass = _subtitle(root, name, ".bilingual.ass")
