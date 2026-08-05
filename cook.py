@@ -726,7 +726,7 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     en_merged = tdir / f"{name}.en.merged.srt"
     zh_merged = tdir / f"{name}.zh.merged.srt"
     _run_subs(subs, ["merge-short", str(en_short), str(en_merged),
-                     "--min-dur", "1.2", "--max-len", "90", "--lang", "en"])
+                     "--min-dur", "1.2", "--max-len", "160", "--lang", "en"])
     _run_subs(subs, ["merge-short", str(zh_short), str(zh_merged),
                      "--min-dur", "1.2", "--max-len", "56", "--lang", "zh"])
 
