@@ -360,7 +360,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     _log(f"cook download: probing {url}")
     probe_opts = {
         "quiet": True, "no_warnings": True, "skip_download": True,
-        "js_runtimes": "node", "remote_components": "ejs:github",
+        "js_runtimes": {"node": {}}, "remote_components": "ejs:github",
     }
     if cookies_file:
         probe_opts["cookiefile"] = str(cookies_file)
@@ -417,7 +417,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         "writethumbnail": True,
         "convert_thumbnails": "jpg",
         "outtmpl": out_tpl,
-        "js_runtimes": "node",
+        "js_runtimes": {"node": {}},
         "remote_components": "ejs:github",
         "quiet": False,
         "no_warnings": False,
@@ -525,7 +525,7 @@ def _negotiate_cookie(url: str, user_specified: str | None) -> str | None:
         opts = {
             "quiet": True, "no_warnings": True, "skip_download": True,
             "cookiesfrombrowser": (browser,),
-            "js_runtimes": "node", "remote_components": "ejs:github",
+            "js_runtimes": {"node": {}}, "remote_components": "ejs:github",
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -716,25 +716,25 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     # import the vendor'd subtitles module
     subs = _import_subtitles_module()
 
-    # Step 4a: shorten both languages
+    # Step 4a: shorten both languages (only splits extreme cues >2× limit)
     en_short = tdir / f"{name}.en.short.srt"
     zh_short = tdir / f"{name}.zh.short.srt"
     _run_subs(subs, ["shorten", str(en_srt), str(en_short), "--lang", "en"])
-    _run_subs(subs, ["shorten", str(zh_srt), str(zh_short), "--lang", "zh"])
+    _run_subs(subs, ["shorten", str(zh_srt), str(zh_short), "--lang", "zh", "--max-zh", "56"])
 
-    # Step 4b: merge-short both
+    # Step 4b: merge-short both (zh uses width-aware max-len)
     en_merged = tdir / f"{name}.en.merged.srt"
     zh_merged = tdir / f"{name}.zh.merged.srt"
     _run_subs(subs, ["merge-short", str(en_short), str(en_merged),
-                     "--min-dur", "1.2", "--max-len", "90"])
+                     "--min-dur", "1.2", "--max-len", "90", "--lang", "en"])
     _run_subs(subs, ["merge-short", str(zh_short), str(zh_merged),
-                     "--min-dur", "1.2", "--max-len", "42"])
+                     "--min-dur", "1.2", "--max-len", "56", "--lang", "zh"])
 
     # Step 4c: biliteral merge
     bilingual = sdir / f"{name}.bilingual.srt"
     _run_subs(subs, ["biliteral", str(en_merged), str(zh_merged), str(bilingual)])
 
-    # Step 4d: ASS (overlay and/or bottom-bar)
+    # Step 4d: ASS (overlay and/or bottom-bar) — \N wrapping handles overflow
     ass_files = []
     overlay_ass = sdir / f"{name}.bilingual.ass"
     _run_subs(subs, ["ass", str(bilingual), str(overlay_ass)])
@@ -889,7 +889,18 @@ def cmd_burn(args: argparse.Namespace) -> None:
     if args.mode == "bottom-bar":
         ass = _subtitle(root, name, ".bilingual.bar.ass")
         out = _cooked(root, name, ".cooked.bar.mp4")
-        vf = f"pad=iw:ih+{args.bar_px}:color=black,ass={ass.name}"
+        # Read the actual bar height from the ASS header (cmd_ass may have
+        # auto-grown it beyond the requested --bar-px to fit multi-line cues).
+        bar_px = args.bar_px
+        try:
+            for line in ass.read_text(encoding="utf-8").splitlines():
+                if line.startswith("PlayResY:"):
+                    bar_px = int(line.split(":")[1].strip()) - 1080
+                    break
+        except Exception:
+            pass
+        vf = f"pad=iw:ih+{bar_px}:color=black,ass={ass.name}"
+        _log(f"cook burn: bar={bar_px}px (PlayResY={bar_px + 1080})")
         cwd = ass.parent  # run from subtitle/ so ass filter gets bare filename
     else:
         ass = _subtitle(root, name, ".bilingual.ass")
