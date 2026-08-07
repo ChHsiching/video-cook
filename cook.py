@@ -823,6 +823,75 @@ def _find_dub_script() -> Path:
     _die("full_dub.py not found. Install video-dubbing skill: npx skills add ChHsiching/video-dubbing-skill")
 
 
+# ----------------------------------------------------------------------------
+# Dub stage prerequisites.
+#
+# A single source-of-truth mapping from stage name to the files that must
+# exist (and be non-empty) before that stage's subprocess is launched. Each
+# prerequisite carries a 'produces' hint naming the command the operator
+# should rerun to generate it, so the _die message is actionable.
+#
+# The check fires at entry to _run_dub_stage, before any subprocess (including
+# the detached path) is spawned — so no IndexTTS2/demucs/ffmpeg work begins on
+# a run that would die partway through.
+#
+# Special case: timeline's prerequisite is a DIRECTORY that must contain at
+# least one .wav (the synthesized segments). That is expressed with kind="dir_glob".
+# ----------------------------------------------------------------------------
+
+def _dub_prereqs() -> dict:
+    """Return the stage → prerequisites mapping. Built fresh each call so the
+    paths derive from the (resolved) video root passed to the check."""
+    return {
+        "synth": [
+            {"rel": "transcript/translations_dub.txt", "kind": "file",
+             "produces": "cook dub verify / the upstream dub-prep step"},
+            {"rel": "dubbed/_reference/ref.wav", "kind": "file",
+             "produces": "cook dub separate + the dub-prep step"},
+        ],
+        "timeline": [
+            {"rel": "dubbed/_full/_segments/", "kind": "dir_glob", "glob": "*.wav",
+             "produces": "cook dub synth"},
+        ],
+        "retime": [
+            {"rel": "dubbed/_full/timeline.json", "kind": "file",
+             "produces": "cook dub timeline"},
+        ],
+        "burn": [
+            {"rel": "dubbed/_full/video_adjusted.mp4", "kind": "file",
+             "produces": "cook dub retime"},
+            {"rel": "dubbed/_full/dub.wav", "kind": "file",
+             "produces": "cook dub synth"},
+        ],
+    }
+
+
+def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
+    """Verify all prerequisite files for a dub stage exist and are non-empty.
+    Calls _die with a clear, actionable message on the first missing/empty
+    one. No-op for stages with no prerequisites in the mapping."""
+    prereqs = _dub_prereqs().get(stage)
+    if not prereqs:
+        return
+    for spec in prereqs:
+        rel = spec["rel"]
+        path = root / rel
+        kind = spec["kind"]
+        ok = False
+        if kind == "file":
+            ok = path.is_file() and path.stat().st_size > 0
+        elif kind == "dir_glob":
+            # directory must exist AND contain at least one file matching glob
+            if path.is_dir():
+                ok = any(path.glob(spec.get("glob", "*")))
+        if not ok:
+            produces = spec.get("produces", "the upstream dub step")
+            _die(
+                f"missing {rel} — run {produces}",
+                {"stage": stage, "missing": rel, "produces": produces},
+            )
+
+
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
                    log_name: str | None = None) -> None:
@@ -837,10 +906,18 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
 
     synth/timeline/retime/burn are all routed through here so a single
     `cook dub full --python <venv>` runs the whole pipeline in one environment.
+
+    Before launching the subprocess, the stage-to-prerequisites mapping is
+    consulted; if any required input file is missing or zero bytes, the stage
+    dies with a clear message naming the file and the command that produces it.
+    This fires before any subprocess launch (including the detached path), so
+    no IndexTTS2/demucs/ffmpeg work begins on a doomed run.
     """
+    root = _video_dir(output_root)
+    _check_dub_stage_prerequisites(stage, root, name)
+
     script = _find_dub_script()
     py_bin = python or sys.executable
-    root = _video_dir(output_root)
     log_file = root / "dubbed" / (log_name or f"{stage}.log")
     err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)

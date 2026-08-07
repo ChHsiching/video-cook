@@ -585,3 +585,160 @@ class TestPathHelpers:
         assert cook._slugify("你好 World") == "你好-world"
         # pure separators collapse to empty, which the fallback turns into "video"
         assert cook._slugify("===") == "video"
+
+
+# ----------------------------------------------------------------------------
+# dub stage prerequisite checks (issue #3)
+# ----------------------------------------------------------------------------
+
+class TestDubStagePrerequisites:
+    """Each dub stage must fail fast with a clear _die message when its
+    prerequisite files are missing or empty — before any subprocess launches.
+    The test asserts on the JSON error and exit code, and that no real dub
+    tooling is invoked (the prerequisite check fires first)."""
+
+    def _run_stage(self, root: Path, stage: str, name: str = "video") -> dict | None:
+        """Invoke the cmd_dub_<stage> function in-process, capturing stdout
+        JSON. Returns None if the command exited before emitting JSON."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": name,
+            "python": None, "detach": False,
+        })()
+        cmd = {
+            "synth": cook.cmd_dub_synth,
+            "timeline": cook.cmd_dub_timeline,
+            "retime": cook.cmd_dub_retime,
+            "burn": cook.cmd_dub_burn,
+        }[stage]
+        with contextlib.redirect_stdout(buf):
+            try:
+                cmd(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        text = buf.getvalue().strip()
+        return json.loads(text) if text else None
+
+    def _touch(self, path: Path, content: bytes = b"x") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    # -- synth: needs transcript/translations_dub.txt and dubbed/_reference/ref.wav
+
+    def test_synth_fails_when_translations_dub_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_reference" / "ref.wav")
+        # translations_dub.txt NOT staged
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "translations_dub.txt" in report["error"]
+
+    def test_synth_fails_when_ref_wav_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "transcript" / "translations_dub.txt")
+        # ref.wav NOT staged
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "ref.wav" in report["error"]
+
+    def test_synth_fails_when_ref_wav_empty(self, tmp_path: Path):
+        """Zero-byte prerequisite counts as missing."""
+        root = tmp_path / "vid"
+        self._touch(root / "transcript" / "translations_dub.txt")
+        self._touch(root / "dubbed" / "_reference" / "ref.wav", content=b"")  # empty
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert "ref.wav" in report["error"]
+
+    # -- timeline: needs dubbed/_full/_segments/ with at least one .wav
+
+    def test_timeline_fails_when_segments_dir_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        # _segments/ dir not created at all
+        report = self._run_stage(root, "timeline")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "_segments" in report["error"]
+
+    def test_timeline_fails_when_segments_dir_empty(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "_segments" / ".keep")  # no .wav
+        report = self._run_stage(root, "timeline")
+        assert self.last_exit == 1
+        assert "_segments" in report["error"]
+
+    # -- retime: needs dubbed/_full/timeline.json
+
+    def test_retime_fails_when_timeline_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        # timeline.json NOT staged
+        report = self._run_stage(root, "retime")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "timeline.json" in report["error"]
+
+    def test_retime_fails_when_timeline_empty(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "timeline.json", content=b"")
+        report = self._run_stage(root, "retime")
+        assert self.last_exit == 1
+        assert "timeline.json" in report["error"]
+
+    # -- burn: needs dubbed/_full/video_adjusted.mp4 and dubbed/_full/dub.wav
+
+    def test_burn_fails_when_adjusted_mp4_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "dub.wav")
+        # video_adjusted.mp4 NOT staged
+        report = self._run_stage(root, "burn")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "video_adjusted.mp4" in report["error"]
+
+    def test_burn_fails_when_dub_wav_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "video_adjusted.mp4")
+        # dub.wav NOT staged
+        report = self._run_stage(root, "burn")
+        assert self.last_exit == 1
+        assert "dub.wav" in report["error"]
+
+    # -- error message names the producing command
+
+    def test_error_names_producing_command(self, tmp_path: Path):
+        """The _die message must tell the operator what to rerun."""
+        root = tmp_path / "vid"
+        # synth stage, both prereqs missing
+        report = self._run_stage(root, "synth")
+        msg = report["error"]
+        # must mention cook (rerun hint) — covers the "run X" guidance
+        assert "cook dub" in msg or "dub verify" in msg or "cook" in msg, msg
+
+    # -- full pipeline inherits checks (first missing prereq aborts)
+
+    def test_full_inherits_first_prereq_check(self, tmp_path: Path):
+        """cook dub full should fail on synth's missing prereq before any
+        subprocess is launched."""
+        import io
+        import contextlib
+        root = tmp_path / "vid"
+        root.mkdir(parents=True)
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": False,
+        })()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_full(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        report = json.loads(buf.getvalue().strip())
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        # synth is the first stage; its prereq (translations_dub.txt) must be named
+        assert "translations_dub.txt" in report["error"]
