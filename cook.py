@@ -1259,6 +1259,19 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
             cooked_dur = _ffprobe_duration(cooked_mp4)
             if raw_dur > 0 and cooked_dur > 0 and abs(raw_dur - cooked_dur) > 2.0:
                 issues.append(f"duration mismatch: raw={raw_dur:.1f}s cooked={cooked_dur:.1f}s")
+        # Cross-check: if a dubbed video exists, its duration should be at least
+        # half the raw video's — a suspiciously short dubbed file means the
+        # dub pipeline truncated audio/video partway. Scoped to the cooked stage
+        # (the dubbed video is a cooked-stage artifact).
+        dubbed_mp4 = _cooked(root, name, ".dubbed.mp4")
+        if dubbed_mp4.exists():
+            raw_dur = _ffprobe_duration(_raw(root, name, ".raw.mp4"))
+            dubbed_dur = _ffprobe_duration(dubbed_mp4)
+            if raw_dur > 0 and dubbed_dur > 0 and dubbed_dur < raw_dur * 0.5:
+                issues.append(
+                    f"dubbed video suspiciously short: raw={raw_dur:.1f}s "
+                    f"dubbed={dubbed_dur:.1f}s"
+                )
 
     report = {
         "ok": not missing and not issues,

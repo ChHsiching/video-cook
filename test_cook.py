@@ -272,6 +272,134 @@ class TestVerifyShipment:
         assert "cloud-srt/en.srt" in missing_norm
         assert self.last_exit == 1
 
+    # ---- dubbed-video short-duration cross-check (issue #2) ----
+
+    def _stage_full_cooked_set(self, root: Path, n: str = "video"):
+        """Stage a complete release set (so no missing-file noise)."""
+        self._touch(root / "raw" / f"{n}.raw.mp4")
+        self._touch(root / "raw" / f"{n}.source.json")
+        self._touch(root / "raw" / f"{n}.jpg")
+        self._touch(root / "transcript" / f"{n}.audio.wav")
+        self._touch(root / "transcript" / f"{n}.en.srt")
+        self._touch(root / "transcript" / f"{n}.zh.srt")
+        self._touch(root / "transcript" / "asr-fixes.md")
+        self._touch(root / "subtitle" / f"{n}.bilingual.srt")
+        self._touch(root / "subtitle" / f"{n}.bilingual.ass")
+        self._touch(root / "cloud-srt" / "zh.srt")
+        self._touch(root / "cloud-srt" / "en.srt")
+        self._touch(root / "cooked" / f"{n}.cooked.mp4")
+        self._touch(root / "cooked" / f"{n}.upload.md")
+        self._touch(root / "cooked" / "cover.jpg")
+        self._touch(root / "README.md")
+
+    def test_dubbed_short_flagged_when_dubbed_under_half_raw(self, tmp_path: Path,
+                                                             monkeypatch):
+        """Dubbed video duration < 0.5 * raw → issue naming both durations."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        # stage the dubbed mp4 (the trigger)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        # Drive the ffprobe helper: raw=732.0, cooked=732.0 (so the cooked
+        # mismatch check does NOT fire), dubbed=185.0 (short → fires).
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is False
+        short_issues = [i for i in report["issues"] if "dubbed video suspiciously short" in i]
+        assert len(short_issues) == 1, f"expected one short issue, got {report['issues']}"
+        msg = short_issues[0]
+        assert "raw=732.0s" in msg
+        assert "dubbed=185.0s" in msg
+        assert self.last_exit == 1
+
+    def test_dubbed_short_not_flagged_when_healthy(self, tmp_path: Path, monkeypatch):
+        """Dubbed duration >= 0.5 * raw → no short issue, ok unchanged."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 730.0,  # healthy
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is True, f"unexpected issues: {report['issues']}"
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_not_flagged_when_no_dubbed_file(self, tmp_path: Path,
+                                                          monkeypatch):
+        """No dubbed.mp4 → check does not run (non-dubbed shipments unaffected)."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        # no dubbed.mp4 staged
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is True, f"unexpected issues: {report['issues']}"
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_not_flagged_when_raw_duration_zero(self, tmp_path: Path,
+                                                             monkeypatch):
+        """Dubbed exists but raw probes to non-positive → check skipped."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 0.0,  # missing/unreadable baseline
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_check_scoped_to_cooked_stage(self, tmp_path: Path,
+                                                      monkeypatch):
+        """--stage cooked runs the check; --stage raw does not."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        # under --stage raw the dubbed-short check must NOT run
+        report = self._run(root, stage="raw")
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+        # under --stage cooked it DOES run
+        report = self._run(root, stage="cooked")
+        assert any("dubbed video suspiciously short" in i for i in report["issues"])
+
 
 # ----------------------------------------------------------------------------
 # cloud-srt copy logic: the fix for B3 (splitting leaks cues across languages)
