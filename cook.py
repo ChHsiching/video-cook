@@ -258,6 +258,33 @@ def _is_relative_file(p: Path) -> bool:
     return p.exists() and p.is_file()
 
 
+def _read_ass_playresy(ass_path: Path) -> int | None:
+    """Read PlayResY from an ASS file's [Script Info] header. Returns None if
+    the file is unreadable or has no PlayResY line. Used by cmd_burn to detect
+    when a bar ASS was generated for a different bar-px than the burn is using.
+
+    Only the header is scanned — the ASS body can be large and is irrelevant.
+    """
+    try:
+        with open(ass_path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    # entered a new section; PlayResY lives in [Script Info],
+                    # so once we leave it (or hit [Events]) we can stop.
+                    if line.lower().startswith("[events") or line.lower().startswith("[v4"):
+                        break
+                    continue
+                # case-insensitive key match; ASS keys are case-insensitive
+                low = line.lower()
+                if low.startswith("playresy:"):
+                    val = line.split(":", 1)[1].strip()
+                    return int(val)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 # ============================================================================
 # Subcommand: doctor
 # ============================================================================
@@ -978,6 +1005,29 @@ def cmd_burn(args: argparse.Namespace) -> None:
         _die(f"raw video not found: {raw_mp4}")
     if not ass.exists():
         _die(f"ASS not found: {ass}. Run 'cook subtitles' first.")
+
+    # Bar-px geometry check (bottom-bar only): the bar ASS's PlayResY is the
+    # frame height plus the bar height it was built for (1080 + bar-px). If the
+    # burn --bar-px differs from what the ASS was generated against, subtitles
+    # will be positioned for a strip of a different size than the one actually
+    # drawn. Warn only — don't error — so the operator can decide.
+    #
+    # Skipped in overlay mode (no bar geometry) and when the bar ASS is absent
+    # (the clearer existence error above takes precedence). The expected-PlayResY
+    # derivation assumes the standard 1080p frame height; supporting other frame
+    # heights would require deriving the frame height from the actual video and
+    # is intentionally out of scope for this change.
+    if args.mode == "bottom-bar":
+        ass_play_res_y = _read_ass_playresy(ass)
+        if ass_play_res_y is not None:
+            expected = 1080 + args.bar_px
+            if ass_play_res_y != expected:
+                _log(
+                    f"cook burn: WARN bar-px geometry mismatch — "
+                    f"ASS PlayResY={ass_play_res_y} but burn expects {expected} "
+                    f"(1080 + bar-px={args.bar_px}). Subtitles may be mispositioned. "
+                    f"Rerun 'cook subtitles --bar-px {args.bar_px}'."
+                )
 
     cmd = [
         "ffmpeg", "-y", "-i", str(raw_mp4),

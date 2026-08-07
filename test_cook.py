@@ -742,3 +742,132 @@ class TestDubStagePrerequisites:
         assert report["ok"] is False
         # synth is the first stage; its prereq (translations_dub.txt) must be named
         assert "translations_dub.txt" in report["error"]
+
+
+# ----------------------------------------------------------------------------
+# burn bar-px / ASS geometry mismatch warning (issue #4)
+# ----------------------------------------------------------------------------
+
+# A minimal bar ASS header carrying a controlled PlayResY. The body is
+# irrelevant to the geometry check — only the [Script Info] header is read.
+_ASS_BAR_TEMPLATE = """[Script Info]
+Title: bilingual bar
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: {play_res_y}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H00000000,0,0,1,2,0,2,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00,0:00:02,Default,,0,0,0,,hello
+"""
+
+
+class TestBurnBarPxAssGeometry:
+    """When burn runs in bottom-bar mode and the bar ASS exists, read its
+    PlayResY (which for a bar build equals frame_height + bar_px) and warn
+    when it differs from 1080 + args.bar_px. Overlay mode and missing-ASS
+    skip the check entirely."""
+
+    def _run_burn(self, root: Path, mode: str = "bottom-bar", bar_px: int = 220,
+                  detach: bool = False):
+        """Invoke cmd_burn in-process, capturing stdout JSON and stderr.
+        Returns (report_or_None, stderr_text)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        err = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "mode": mode, "bar_px": bar_px, "detach": detach,
+        })()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            try:
+                cook.cmd_burn(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        text = buf.getvalue().strip()
+        report = json.loads(text) if text else None
+        return report, err.getvalue()
+
+    def _stage_burn_inputs(self, root: Path, mode: str, ass_play_res_y: int | None):
+        """Stage raw.mp4 + the appropriate ASS. If ass_play_res_y is None,
+        no ASS is staged (to test the missing-ASS path)."""
+        n = "video"
+        (root / "raw").mkdir(parents=True, exist_ok=True)
+        (root / "raw" / f"{n}.raw.mp4").write_bytes(b"x")
+        (root / "subtitle").mkdir(parents=True, exist_ok=True)
+        (root / "cooked").mkdir(parents=True, exist_ok=True)
+        if ass_play_res_y is not None:
+            if mode == "bottom-bar":
+                ass = root / "subtitle" / f"{n}.bilingual.bar.ass"
+            else:
+                ass = root / "subtitle" / f"{n}.bilingual.ass"
+            ass.write_text(_ASS_BAR_TEMPLATE.format(play_res_y=ass_play_res_y),
+                           encoding="utf-8")
+
+    def _stub_ffmpeg(self, monkeypatch, *, succeed=True):
+        """Prevent real ffmpeg runs by stubbing _run_long_task. Burn would
+        normally shell out to ffmpeg; we make it succeed instantly so the
+        geometry check (which runs BEFORE the burn) is the only thing tested."""
+        def fake_run(cmd, cwd, log_file, err_file, detach=False):
+            # pretend the output file was produced
+            if succeed:
+                # the output path is the last positional in the ffmpeg argv
+                out_arg = cmd[-1]
+                from pathlib import Path as _P
+                _P(str(out_arg)).parent.mkdir(parents=True, exist_ok=True)
+                _P(str(out_arg)).write_bytes(b"\x00\x00\x00 mp4")
+            return {"ok": succeed, "detached": False, "returncode": 0 if succeed else 1}
+        monkeypatch.setattr(cook, "_run_long_task", fake_run)
+
+    def test_warns_on_bar_px_mismatch(self, tmp_path: Path, monkeypatch):
+        """bar ASS PlayResY != 1080 + bar_px → warning naming both values."""
+        root = tmp_path / "vid"
+        # ASS built for 1080+200=1280, but burn --bar-px 220 (expects 1300)
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1280)
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "1300" in stderr or "1280" in stderr  # names the values
+        assert "bar-px" in stderr or "bar_px" in stderr  # points to the fix
+        # warning does not fail the burn
+        assert report is None or report.get("ok") is True or self.last_exit == 0
+
+    def test_no_warning_when_playresy_matches(self, tmp_path: Path, monkeypatch):
+        """PlayResY == 1080 + bar_px → no warning, burn proceeds."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)  # 1080+220
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+        assert "1300" not in stderr  # no mismatch banner
+
+    def test_no_geometry_check_in_overlay_mode(self, tmp_path: Path, monkeypatch):
+        """Overlay mode has no bar geometry — check must not run even when the
+        overlay ASS has a PlayResY that would mismatch."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "overlay", ass_play_res_y=999)  # would mismatch
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="overlay", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "999" not in stderr
+
+    def test_missing_ass_keeps_existing_error(self, tmp_path: Path, monkeypatch):
+        """When the bar ASS is absent, the existing 'ASS not found' error is
+        produced unchanged; the geometry check does not run or mask it."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=None)  # no ASS
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert self.last_exit == 1
+        assert report is None  # _die before any JSON for the burn
+        assert "ASS not found" in stderr or "ASS" in stderr
+        # geometry check did not run (no mismatch banner)
+        assert "playresy" not in stderr.lower()
