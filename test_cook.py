@@ -272,6 +272,134 @@ class TestVerifyShipment:
         assert "cloud-srt/en.srt" in missing_norm
         assert self.last_exit == 1
 
+    # ---- dubbed-video short-duration cross-check (issue #2) ----
+
+    def _stage_full_cooked_set(self, root: Path, n: str = "video"):
+        """Stage a complete release set (so no missing-file noise)."""
+        self._touch(root / "raw" / f"{n}.raw.mp4")
+        self._touch(root / "raw" / f"{n}.source.json")
+        self._touch(root / "raw" / f"{n}.jpg")
+        self._touch(root / "transcript" / f"{n}.audio.wav")
+        self._touch(root / "transcript" / f"{n}.en.srt")
+        self._touch(root / "transcript" / f"{n}.zh.srt")
+        self._touch(root / "transcript" / "asr-fixes.md")
+        self._touch(root / "subtitle" / f"{n}.bilingual.srt")
+        self._touch(root / "subtitle" / f"{n}.bilingual.ass")
+        self._touch(root / "cloud-srt" / "zh.srt")
+        self._touch(root / "cloud-srt" / "en.srt")
+        self._touch(root / "cooked" / f"{n}.cooked.mp4")
+        self._touch(root / "cooked" / f"{n}.upload.md")
+        self._touch(root / "cooked" / "cover.jpg")
+        self._touch(root / "README.md")
+
+    def test_dubbed_short_flagged_when_dubbed_under_half_raw(self, tmp_path: Path,
+                                                             monkeypatch):
+        """Dubbed video duration < 0.5 * raw → issue naming both durations."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        # stage the dubbed mp4 (the trigger)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        # Drive the ffprobe helper: raw=732.0, cooked=732.0 (so the cooked
+        # mismatch check does NOT fire), dubbed=185.0 (short → fires).
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is False
+        short_issues = [i for i in report["issues"] if "dubbed video suspiciously short" in i]
+        assert len(short_issues) == 1, f"expected one short issue, got {report['issues']}"
+        msg = short_issues[0]
+        assert "raw=732.0s" in msg
+        assert "dubbed=185.0s" in msg
+        assert self.last_exit == 1
+
+    def test_dubbed_short_not_flagged_when_healthy(self, tmp_path: Path, monkeypatch):
+        """Dubbed duration >= 0.5 * raw → no short issue, ok unchanged."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 730.0,  # healthy
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is True, f"unexpected issues: {report['issues']}"
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_not_flagged_when_no_dubbed_file(self, tmp_path: Path,
+                                                          monkeypatch):
+        """No dubbed.mp4 → check does not run (non-dubbed shipments unaffected)."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        # no dubbed.mp4 staged
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert report["ok"] is True, f"unexpected issues: {report['issues']}"
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_not_flagged_when_raw_duration_zero(self, tmp_path: Path,
+                                                             monkeypatch):
+        """Dubbed exists but raw probes to non-positive → check skipped."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 0.0,  # missing/unreadable baseline
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        report = self._run(root)
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+    def test_dubbed_short_check_scoped_to_cooked_stage(self, tmp_path: Path,
+                                                      monkeypatch):
+        """--stage cooked runs the check; --stage raw does not."""
+        root = tmp_path / "author" / "video"
+        n = "video"
+        self._stage_full_cooked_set(root, n)
+        self._touch(root / "cooked" / f"{n}.dubbed.mp4")
+
+        durations = {
+            str(root / "raw" / f"{n}.raw.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
+            str(root / "cooked" / f"{n}.dubbed.mp4"): 185.0,
+        }
+        monkeypatch.setattr(cook, "_ffprobe_duration",
+                            lambda p: durations.get(str(p), 0.0))
+
+        # under --stage raw the dubbed-short check must NOT run
+        report = self._run(root, stage="raw")
+        assert not any("dubbed video suspiciously short" in i for i in report["issues"])
+
+        # under --stage cooked it DOES run
+        report = self._run(root, stage="cooked")
+        assert any("dubbed video suspiciously short" in i for i in report["issues"])
+
 
 # ----------------------------------------------------------------------------
 # cloud-srt copy logic: the fix for B3 (splitting leaks cues across languages)
@@ -457,3 +585,289 @@ class TestPathHelpers:
         assert cook._slugify("你好 World") == "你好-world"
         # pure separators collapse to empty, which the fallback turns into "video"
         assert cook._slugify("===") == "video"
+
+
+# ----------------------------------------------------------------------------
+# dub stage prerequisite checks (issue #3)
+# ----------------------------------------------------------------------------
+
+class TestDubStagePrerequisites:
+    """Each dub stage must fail fast with a clear _die message when its
+    prerequisite files are missing or empty — before any subprocess launches.
+    The test asserts on the JSON error and exit code, and that no real dub
+    tooling is invoked (the prerequisite check fires first)."""
+
+    def _run_stage(self, root: Path, stage: str, name: str = "video") -> dict | None:
+        """Invoke the cmd_dub_<stage> function in-process, capturing stdout
+        JSON. Returns None if the command exited before emitting JSON."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": name,
+            "python": None, "detach": False,
+        })()
+        cmd = {
+            "synth": cook.cmd_dub_synth,
+            "timeline": cook.cmd_dub_timeline,
+            "retime": cook.cmd_dub_retime,
+            "burn": cook.cmd_dub_burn,
+        }[stage]
+        with contextlib.redirect_stdout(buf):
+            try:
+                cmd(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        text = buf.getvalue().strip()
+        return json.loads(text) if text else None
+
+    def _touch(self, path: Path, content: bytes = b"x") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    # -- synth: needs transcript/translations_dub.txt and dubbed/_reference/ref.wav
+
+    def test_synth_fails_when_translations_dub_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_reference" / "ref.wav")
+        # translations_dub.txt NOT staged
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "translations_dub.txt" in report["error"]
+
+    def test_synth_fails_when_ref_wav_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "transcript" / "translations_dub.txt")
+        # ref.wav NOT staged
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "ref.wav" in report["error"]
+
+    def test_synth_fails_when_ref_wav_empty(self, tmp_path: Path):
+        """Zero-byte prerequisite counts as missing."""
+        root = tmp_path / "vid"
+        self._touch(root / "transcript" / "translations_dub.txt")
+        self._touch(root / "dubbed" / "_reference" / "ref.wav", content=b"")  # empty
+        report = self._run_stage(root, "synth")
+        assert self.last_exit == 1
+        assert "ref.wav" in report["error"]
+
+    # -- timeline: needs dubbed/_full/_segments/ with at least one .wav
+
+    def test_timeline_fails_when_segments_dir_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        # _segments/ dir not created at all
+        report = self._run_stage(root, "timeline")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "_segments" in report["error"]
+
+    def test_timeline_fails_when_segments_dir_empty(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "_segments" / ".keep")  # no .wav
+        report = self._run_stage(root, "timeline")
+        assert self.last_exit == 1
+        assert "_segments" in report["error"]
+
+    # -- retime: needs dubbed/_full/timeline.json
+
+    def test_retime_fails_when_timeline_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        # timeline.json NOT staged
+        report = self._run_stage(root, "retime")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "timeline.json" in report["error"]
+
+    def test_retime_fails_when_timeline_empty(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "timeline.json", content=b"")
+        report = self._run_stage(root, "retime")
+        assert self.last_exit == 1
+        assert "timeline.json" in report["error"]
+
+    # -- burn: needs dubbed/_full/video_adjusted.mp4 and dubbed/_full/dub.wav
+
+    def test_burn_fails_when_adjusted_mp4_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "dub.wav")
+        # video_adjusted.mp4 NOT staged
+        report = self._run_stage(root, "burn")
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        assert "video_adjusted.mp4" in report["error"]
+
+    def test_burn_fails_when_dub_wav_missing(self, tmp_path: Path):
+        root = tmp_path / "vid"
+        self._touch(root / "dubbed" / "_full" / "video_adjusted.mp4")
+        # dub.wav NOT staged
+        report = self._run_stage(root, "burn")
+        assert self.last_exit == 1
+        assert "dub.wav" in report["error"]
+
+    # -- error message names the producing command
+
+    def test_error_names_producing_command(self, tmp_path: Path):
+        """The _die message must tell the operator what to rerun."""
+        root = tmp_path / "vid"
+        # synth stage, both prereqs missing
+        report = self._run_stage(root, "synth")
+        msg = report["error"]
+        # must mention cook (rerun hint) — covers the "run X" guidance
+        assert "cook dub" in msg or "dub verify" in msg or "cook" in msg, msg
+
+    # -- full pipeline inherits checks (first missing prereq aborts)
+
+    def test_full_inherits_first_prereq_check(self, tmp_path: Path):
+        """cook dub full should fail on synth's missing prereq before any
+        subprocess is launched."""
+        import io
+        import contextlib
+        root = tmp_path / "vid"
+        root.mkdir(parents=True)
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": False,
+        })()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_full(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        report = json.loads(buf.getvalue().strip())
+        assert self.last_exit == 1
+        assert report["ok"] is False
+        # synth is the first stage; its prereq (translations_dub.txt) must be named
+        assert "translations_dub.txt" in report["error"]
+
+
+# ----------------------------------------------------------------------------
+# burn bar-px / ASS geometry mismatch warning (issue #4)
+# ----------------------------------------------------------------------------
+
+# A minimal bar ASS header carrying a controlled PlayResY. The body is
+# irrelevant to the geometry check — only the [Script Info] header is read.
+_ASS_BAR_TEMPLATE = """[Script Info]
+Title: bilingual bar
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: {play_res_y}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H00000000,0,0,1,2,0,2,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00,0:00:02,Default,,0,0,0,,hello
+"""
+
+
+class TestBurnBarPxAssGeometry:
+    """When burn runs in bottom-bar mode and the bar ASS exists, read its
+    PlayResY (which for a bar build equals frame_height + bar_px) and warn
+    when it differs from 1080 + args.bar_px. Overlay mode and missing-ASS
+    skip the check entirely."""
+
+    def _run_burn(self, root: Path, mode: str = "bottom-bar", bar_px: int = 220,
+                  detach: bool = False):
+        """Invoke cmd_burn in-process, capturing stdout JSON and stderr.
+        Returns (report_or_None, stderr_text)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        err = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "mode": mode, "bar_px": bar_px, "detach": detach,
+        })()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            try:
+                cook.cmd_burn(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        text = buf.getvalue().strip()
+        report = json.loads(text) if text else None
+        return report, err.getvalue()
+
+    def _stage_burn_inputs(self, root: Path, mode: str, ass_play_res_y: int | None):
+        """Stage raw.mp4 + the appropriate ASS. If ass_play_res_y is None,
+        no ASS is staged (to test the missing-ASS path)."""
+        n = "video"
+        (root / "raw").mkdir(parents=True, exist_ok=True)
+        (root / "raw" / f"{n}.raw.mp4").write_bytes(b"x")
+        (root / "subtitle").mkdir(parents=True, exist_ok=True)
+        (root / "cooked").mkdir(parents=True, exist_ok=True)
+        if ass_play_res_y is not None:
+            if mode == "bottom-bar":
+                ass = root / "subtitle" / f"{n}.bilingual.bar.ass"
+            else:
+                ass = root / "subtitle" / f"{n}.bilingual.ass"
+            ass.write_text(_ASS_BAR_TEMPLATE.format(play_res_y=ass_play_res_y),
+                           encoding="utf-8")
+
+    def _stub_ffmpeg(self, monkeypatch, *, succeed=True):
+        """Prevent real ffmpeg runs by stubbing _run_long_task. Burn would
+        normally shell out to ffmpeg; we make it succeed instantly so the
+        geometry check (which runs BEFORE the burn) is the only thing tested."""
+        def fake_run(cmd, cwd, log_file, err_file, detach=False):
+            # pretend the output file was produced
+            if succeed:
+                # the output path is the last positional in the ffmpeg argv
+                out_arg = cmd[-1]
+                from pathlib import Path as _P
+                _P(str(out_arg)).parent.mkdir(parents=True, exist_ok=True)
+                _P(str(out_arg)).write_bytes(b"\x00\x00\x00 mp4")
+            return {"ok": succeed, "detached": False, "returncode": 0 if succeed else 1}
+        monkeypatch.setattr(cook, "_run_long_task", fake_run)
+
+    def test_warns_on_bar_px_mismatch(self, tmp_path: Path, monkeypatch):
+        """bar ASS PlayResY != 1080 + bar_px → warning naming both values."""
+        root = tmp_path / "vid"
+        # ASS built for 1080+200=1280, but burn --bar-px 220 (expects 1300)
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1280)
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "1300" in stderr or "1280" in stderr  # names the values
+        assert "bar-px" in stderr or "bar_px" in stderr  # points to the fix
+        # warning does not fail the burn
+        assert report is None or report.get("ok") is True or self.last_exit == 0
+
+    def test_no_warning_when_playresy_matches(self, tmp_path: Path, monkeypatch):
+        """PlayResY == 1080 + bar_px → no warning, burn proceeds."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)  # 1080+220
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+        assert "1300" not in stderr  # no mismatch banner
+
+    def test_no_geometry_check_in_overlay_mode(self, tmp_path: Path, monkeypatch):
+        """Overlay mode has no bar geometry — check must not run even when the
+        overlay ASS has a PlayResY that would mismatch."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "overlay", ass_play_res_y=999)  # would mismatch
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="overlay", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "999" not in stderr
+
+    def test_missing_ass_keeps_existing_error(self, tmp_path: Path, monkeypatch):
+        """When the bar ASS is absent, the existing 'ASS not found' error is
+        produced unchanged; the geometry check does not run or mask it."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=None)  # no ASS
+        self._stub_ffmpeg(monkeypatch)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert self.last_exit == 1
+        assert report is None  # _die before any JSON for the burn
+        assert "ASS not found" in stderr or "ASS" in stderr
+        # geometry check did not run (no mismatch banner)
+        assert "playresy" not in stderr.lower()

@@ -258,6 +258,33 @@ def _is_relative_file(p: Path) -> bool:
     return p.exists() and p.is_file()
 
 
+def _read_ass_playresy(ass_path: Path) -> int | None:
+    """Read PlayResY from an ASS file's [Script Info] header. Returns None if
+    the file is unreadable or has no PlayResY line. Used by cmd_burn to detect
+    when a bar ASS was generated for a different bar-px than the burn is using.
+
+    Only the header is scanned — the ASS body can be large and is irrelevant.
+    """
+    try:
+        with open(ass_path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    # entered a new section; PlayResY lives in [Script Info],
+                    # so once we leave it (or hit [Events]) we can stop.
+                    if line.lower().startswith("[events") or line.lower().startswith("[v4"):
+                        break
+                    continue
+                # case-insensitive key match; ASS keys are case-insensitive
+                low = line.lower()
+                if low.startswith("playresy:"):
+                    val = line.split(":", 1)[1].strip()
+                    return int(val)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 # ============================================================================
 # Subcommand: doctor
 # ============================================================================
@@ -823,6 +850,75 @@ def _find_dub_script() -> Path:
     _die("full_dub.py not found. Install video-dubbing skill: npx skills add ChHsiching/video-dubbing-skill")
 
 
+# ----------------------------------------------------------------------------
+# Dub stage prerequisites.
+#
+# A single source-of-truth mapping from stage name to the files that must
+# exist (and be non-empty) before that stage's subprocess is launched. Each
+# prerequisite carries a 'produces' hint naming the command the operator
+# should rerun to generate it, so the _die message is actionable.
+#
+# The check fires at entry to _run_dub_stage, before any subprocess (including
+# the detached path) is spawned — so no IndexTTS2/demucs/ffmpeg work begins on
+# a run that would die partway through.
+#
+# Special case: timeline's prerequisite is a DIRECTORY that must contain at
+# least one .wav (the synthesized segments). That is expressed with kind="dir_glob".
+# ----------------------------------------------------------------------------
+
+def _dub_prereqs() -> dict:
+    """Return the stage → prerequisites mapping. Built fresh each call so the
+    paths derive from the (resolved) video root passed to the check."""
+    return {
+        "synth": [
+            {"rel": "transcript/translations_dub.txt", "kind": "file",
+             "produces": "cook dub verify / the upstream dub-prep step"},
+            {"rel": "dubbed/_reference/ref.wav", "kind": "file",
+             "produces": "cook dub separate + the dub-prep step"},
+        ],
+        "timeline": [
+            {"rel": "dubbed/_full/_segments/", "kind": "dir_glob", "glob": "*.wav",
+             "produces": "cook dub synth"},
+        ],
+        "retime": [
+            {"rel": "dubbed/_full/timeline.json", "kind": "file",
+             "produces": "cook dub timeline"},
+        ],
+        "burn": [
+            {"rel": "dubbed/_full/video_adjusted.mp4", "kind": "file",
+             "produces": "cook dub retime"},
+            {"rel": "dubbed/_full/dub.wav", "kind": "file",
+             "produces": "cook dub synth"},
+        ],
+    }
+
+
+def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
+    """Verify all prerequisite files for a dub stage exist and are non-empty.
+    Calls _die with a clear, actionable message on the first missing/empty
+    one. No-op for stages with no prerequisites in the mapping."""
+    prereqs = _dub_prereqs().get(stage)
+    if not prereqs:
+        return
+    for spec in prereqs:
+        rel = spec["rel"]
+        path = root / rel
+        kind = spec["kind"]
+        ok = False
+        if kind == "file":
+            ok = path.is_file() and path.stat().st_size > 0
+        elif kind == "dir_glob":
+            # directory must exist AND contain at least one file matching glob
+            if path.is_dir():
+                ok = any(path.glob(spec.get("glob", "*")))
+        if not ok:
+            produces = spec.get("produces", "the upstream dub step")
+            _die(
+                f"missing {rel} — run {produces}",
+                {"stage": stage, "missing": rel, "produces": produces},
+            )
+
+
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
                    log_name: str | None = None) -> None:
@@ -837,10 +933,18 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
 
     synth/timeline/retime/burn are all routed through here so a single
     `cook dub full --python <venv>` runs the whole pipeline in one environment.
+
+    Before launching the subprocess, the stage-to-prerequisites mapping is
+    consulted; if any required input file is missing or zero bytes, the stage
+    dies with a clear message naming the file and the command that produces it.
+    This fires before any subprocess launch (including the detached path), so
+    no IndexTTS2/demucs/ffmpeg work begins on a doomed run.
     """
+    root = _video_dir(output_root)
+    _check_dub_stage_prerequisites(stage, root, name)
+
     script = _find_dub_script()
     py_bin = python or sys.executable
-    root = _video_dir(output_root)
     log_file = root / "dubbed" / (log_name or f"{stage}.log")
     err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -901,6 +1005,29 @@ def cmd_burn(args: argparse.Namespace) -> None:
         _die(f"raw video not found: {raw_mp4}")
     if not ass.exists():
         _die(f"ASS not found: {ass}. Run 'cook subtitles' first.")
+
+    # Bar-px geometry check (bottom-bar only): the bar ASS's PlayResY is the
+    # frame height plus the bar height it was built for (1080 + bar-px). If the
+    # burn --bar-px differs from what the ASS was generated against, subtitles
+    # will be positioned for a strip of a different size than the one actually
+    # drawn. Warn only — don't error — so the operator can decide.
+    #
+    # Skipped in overlay mode (no bar geometry) and when the bar ASS is absent
+    # (the clearer existence error above takes precedence). The expected-PlayResY
+    # derivation assumes the standard 1080p frame height; supporting other frame
+    # heights would require deriving the frame height from the actual video and
+    # is intentionally out of scope for this change.
+    if args.mode == "bottom-bar":
+        ass_play_res_y = _read_ass_playresy(ass)
+        if ass_play_res_y is not None:
+            expected = 1080 + args.bar_px
+            if ass_play_res_y != expected:
+                _log(
+                    f"cook burn: WARN bar-px geometry mismatch — "
+                    f"ASS PlayResY={ass_play_res_y} but burn expects {expected} "
+                    f"(1080 + bar-px={args.bar_px}). Subtitles may be mispositioned. "
+                    f"Rerun 'cook subtitles --bar-px {args.bar_px}'."
+                )
 
     cmd = [
         "ffmpeg", "-y", "-i", str(raw_mp4),
@@ -1259,6 +1386,19 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
             cooked_dur = _ffprobe_duration(cooked_mp4)
             if raw_dur > 0 and cooked_dur > 0 and abs(raw_dur - cooked_dur) > 2.0:
                 issues.append(f"duration mismatch: raw={raw_dur:.1f}s cooked={cooked_dur:.1f}s")
+        # Cross-check: if a dubbed video exists, its duration should be at least
+        # half the raw video's — a suspiciously short dubbed file means the
+        # dub pipeline truncated audio/video partway. Scoped to the cooked stage
+        # (the dubbed video is a cooked-stage artifact).
+        dubbed_mp4 = _cooked(root, name, ".dubbed.mp4")
+        if dubbed_mp4.exists():
+            raw_dur = _ffprobe_duration(_raw(root, name, ".raw.mp4"))
+            dubbed_dur = _ffprobe_duration(dubbed_mp4)
+            if raw_dur > 0 and dubbed_dur > 0 and dubbed_dur < raw_dur * 0.5:
+                issues.append(
+                    f"dubbed video suspiciously short: raw={raw_dur:.1f}s "
+                    f"dubbed={dubbed_dur:.1f}s"
+                )
 
     report = {
         "ok": not missing and not issues,
