@@ -688,24 +688,27 @@ class TestDubStagePrerequisites:
         assert self.last_exit == 1
         assert "timeline.json" in report["error"]
 
-    # -- burn: needs dubbed/_full/video_adjusted.mp4 and dubbed/_full/dub.wav
+    # -- burn: needs timeline.json (from timeline) + _vsegs/ (from retime)
+    # video_adjusted.mp4 and dub.wav are NOT prereqs — burn produces them itself
+    # (Stage 4: 4a concats vsegs -> video_adjusted.mp4, 4b builds dub.wav).
 
-    def test_burn_fails_when_adjusted_mp4_missing(self, tmp_path: Path):
+    def test_burn_fails_when_timeline_missing(self, tmp_path: Path):
         root = tmp_path / "vid"
-        self._touch(root / "dubbed" / "_full" / "dub.wav")
-        # video_adjusted.mp4 NOT staged
+        self._touch(root / "dubbed" / "_full" / "_vsegs" / "v_0000.mp4")
+        # timeline.json NOT staged
         report = self._run_stage(root, "burn")
         assert self.last_exit == 1
         assert report["ok"] is False
-        assert "video_adjusted.mp4" in report["error"]
+        assert "timeline.json" in report["error"]
 
-    def test_burn_fails_when_dub_wav_missing(self, tmp_path: Path):
+    def test_burn_fails_when_vsegs_missing(self, tmp_path: Path):
         root = tmp_path / "vid"
-        self._touch(root / "dubbed" / "_full" / "video_adjusted.mp4")
-        # dub.wav NOT staged
+        self._touch(root / "dubbed" / "_full" / "timeline.json")
+        # _vsegs/ NOT staged
         report = self._run_stage(root, "burn")
         assert self.last_exit == 1
-        assert "dub.wav" in report["error"]
+        assert report["ok"] is False
+        assert "_vsegs" in report["error"]
 
     # -- error message names the producing command
 
