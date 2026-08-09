@@ -18,20 +18,8 @@ Design principles
 - Exit codes are meaningful: 0 = the subcommand's done criterion passed,
   non-zero = it didn't (agent can branch on this).
 
-Subcommands
------------
-  cook doctor                 — check environment (python/ffmpeg/yt-dlp/node/...)
-  cook download <url> [...]   — yt-dlp download with cookie negotiation
-  cook extract <root> <name>  — ffmpeg audio extraction (16kHz mono WAV)
-  cook transcribe <root> <name> [...] — whisperX transcription (auto-detached)
-  cook subtitles <root> <name> [...]  — shorten+merge+biliteral+ass+cloud-srt
-  cook burn <root> <name> [...]       — ffmpeg subtitle burning (auto-detached)
-  cook cover <root> <name>    — place cover.jpg in cooked/
-  cook verify-align <root> <name>     — DP-align en.srt vs translations.txt
-  cook verify-shipment <root> <name>  — check the full release set is present
-  cook dub separate <root> <name>     — Demucs vocal separation (video-dubbing)
-  cook dub mix <root> <name>          — mix Chinese dub + BGM, mux into video
-  cook dub verify <root> <name>       — verify the dubbed/ shipment is complete
+Run `cook --help` for the subcommand list, and `cook <subcommand> --help` for
+each one's flags (the dub pipeline nests one level deeper: `cook dub --help`).
 """
 from __future__ import annotations
 
@@ -201,6 +189,22 @@ def _detach(cmd: list[str], cwd: Path, log_file: Path, err_file: Path) -> int:
 # ffprobe helpers
 # ----------------------------------------------------------------------------
 
+def _require_ffmpeg() -> None:
+    """Die with an actionable message if ffmpeg is not on PATH. Called at the
+    top of commands that shell out to ffmpeg/ffprobe (extract, burn, download's
+    stream-merge + ffprobe verify, dub mix). Without this the subprocess raises
+    a raw FileNotFoundError traceback; doctor detects the same condition but
+    these commands don't all run doctor first. cook does not install ffmpeg —
+    the user (or the agent) must."""
+    if shutil.which("ffmpeg") is None:
+        _die(
+            "ffmpeg not found on PATH — cook requires it for extract/burn/"
+            "download-verify/dub-mix but cannot install it. Install ffmpeg "
+            "(Windows: winget install ffmpeg or a static build on PATH; macOS: "
+            "brew install ffmpeg; Linux: distro package), then retry. Run "
+            "'cook doctor' to re-check all tools."
+        )
+
 def _ffprobe_duration(path: Path) -> float:
     """Return media duration in seconds, or 0.0 if unreadable."""
     try:
@@ -344,7 +348,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         report["tools"]["torch"] = {"installed": False}
 
     if not report["tools"]["ffmpeg"]["installed"]:
-        report["issues"].append("ffmpeg not on PATH — required for extract/burn/cover")
+        report["issues"].append("ffmpeg not on PATH — required for extract/burn/download-verify/dub-mix")
 
     _emit_json(report)
 
@@ -370,6 +374,8 @@ def cmd_download(args: argparse.Namespace) -> None:
         import yt_dlp
     except ImportError:
         _die("yt-dlp not installed. Run: pip install video-cook[download]")
+
+    _require_ffmpeg()  # needed to merge separate video/audio streams + ffprobe verify
 
     url = args.url
     cwd = Path.cwd()
@@ -586,6 +592,7 @@ def _browser_profile_exists(browser: str) -> bool:
 
 def cmd_extract(args: argparse.Namespace) -> None:
     """Extract 16kHz mono WAV from the raw mp4."""
+    _require_ffmpeg()
     root = _video_dir(args.output_root)
     raw_mp4 = _raw(root, args.name, ".raw.mp4")
     wav = _transcript(root, args.name, ".audio.wav")
@@ -984,6 +991,7 @@ def cmd_burn(args: argparse.Namespace) -> None:
     """Burn subtitles into video via ffmpeg. Auto-detaches. Uses subprocess
     list-form (never shell=True) so backslashes and drive letters in Windows
     paths can't break the ass filter — this is the fix for B4."""
+    _require_ffmpeg()
     root = _video_dir(args.output_root)
     name = args.name
     raw_mp4 = _raw(root, name, ".raw.mp4")
@@ -1527,6 +1535,7 @@ def cmd_dub_separate(args: argparse.Namespace) -> None:
 def cmd_dub_mix(args: argparse.Namespace) -> None:
     """Mix the Chinese dub (dub.wav) with the original BGM (no_vocals.wav),
     then mux into the cooked video. Produces <name>.dubbed.mp4 under dubbed/."""
+    _require_ffmpeg()
     root = _video_dir(args.output_root)
     name = args.name
     dubbed_dir = _dubbed_dir(root)
@@ -1826,8 +1835,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="don't truncate long fields (descriptions can be 10KB+)")
     pss.set_defaults(func=cmd_show_source)
 
-    # dub group (video-dubbing skill — Chinese voiceover)
-    # Nested form: `cook dub separate`, `cook dub mix`, `cook dub verify`.
+    # dub group (video-dubbing skill — Chinese voiceover). Nested subcommands
+    # registered below; see `cook dub --help` for the live list.
     pdub = sub.add_parser("dub", help="video-dubbing skill: Chinese voiceover pipeline")
     dub_sub = pdub.add_subparsers(dest="dub_cmd", required=True)
 

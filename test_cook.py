@@ -819,6 +819,8 @@ class TestBurnBarPxAssGeometry:
         """Prevent real ffmpeg runs by stubbing _run_long_task. Burn would
         normally shell out to ffmpeg; we make it succeed instantly so the
         geometry check (which runs BEFORE the burn) is the only thing tested."""
+        monkeypatch.setattr(cook.shutil, "which",
+                            lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
         def fake_run(cmd, cwd, log_file, err_file, detach=False):
             # pretend the output file was produced
             if succeed:
