@@ -885,10 +885,10 @@ def _dub_prereqs() -> dict:
              "produces": "cook dub timeline"},
         ],
         "burn": [
-            {"rel": "dubbed/_full/video_adjusted.mp4", "kind": "file",
+            {"rel": "dubbed/_full/timeline.json", "kind": "file",
+             "produces": "cook dub timeline"},
+            {"rel": "dubbed/_full/_vsegs/", "kind": "dir_glob", "glob": "*.mp4",
              "produces": "cook dub retime"},
-            {"rel": "dubbed/_full/dub.wav", "kind": "file",
-             "produces": "cook dub synth"},
         ],
     }
 
