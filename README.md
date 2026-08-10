@@ -55,23 +55,9 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 
 Every command prints a JSON object on stdout (machine-readable; agents parse this) and human-readable progress on stderr. Exit codes are meaningful: 0 = done criterion passed, non-zero = it didn't.
 
-## Usage from a skill
+## How skills use cook
 
-The skill docs call cook as a subprocess and branch on its exit code. Example skeleton from video-subtitle:
-
-```
-Step 1: cook extract <root> <name>           → exit 0 = done
-Step 2: cook transcribe <root> <name>        → exit 0 = launched, poll log until "[transcribe] done."
-Step 3: (agent translates → writes translations.txt)
-        cook verify-align <root> <name>      → exit 0 = aligned, proceed
-Step 4: cook subtitles <root> <name> --mode bottom-bar --bar-px 180
-Step 5: cook burn <root> <name> --mode bottom-bar --bar-px 180
-Step 6: (agent writes upload.md)
-        cook cover <root> <name>
-Step 7: (agent writes README.md)
-```
-
-The router (`video-cooking`) calls `cook verify-shipment` as the final gate before reporting the pipeline done.
+cook is the deterministic executor for the [video-cooking](https://github.com/ChHsiching/video-cooking-skill) skill pipeline. Skills call cook as a subprocess and branch on its exit code; the router (`video-cooking`) calls `cook verify-shipment` as the final gate. The pipeline steps — which cook subcommand runs when, what the agent does in between, the ASR/translation quality gates — live in each skill's SKILL.md, not here. This README covers cook itself: what it is, how to install it, what each subcommand does.
 
 ## Bugs that cook fixes
 
