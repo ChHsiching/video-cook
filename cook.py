@@ -51,12 +51,17 @@ def _log(msg: str) -> None:
 
 
 def _die(msg: str, obj: dict[str, Any] | None = None) -> None:
-    """Log an error and exit non-zero. Optionally emit a JSON object first."""
+    """Log an error and exit non-zero. Optionally emit a JSON object first.
+
+    The final COOK-RESULT line survives `| tail` pipelines (whose exit code
+    is tail's, not cook's) — agents reading only the tail still see the
+    verdict."""
     _log(f"cook: error: {msg}")
     if obj is not None:
         obj.setdefault("ok", False)
         obj.setdefault("error", msg)
         _emit_json(obj)
+    print(f"COOK-RESULT: FAIL — {msg}", flush=True)
     sys.exit(1)
 
 
@@ -435,9 +440,13 @@ def cmd_download(args: argparse.Namespace) -> None:
     _log(f"cook download: output_root={output_root}, name={name}")
 
     # --- Phase 3: real download (video + thumbnail + json in one call) ---
-    format_spec = "bestvideo+bestaudio"
+    # The trailing "/best" matters: sources without separate video/audio
+    # streams (HLS-only, incl. YouTube's auto-dubbed multi-audio delivery)
+    # have nothing for bestvideo+bestaudio to grab, and without the muxed
+    # fallback the download dies with "Requested format is not available".
+    format_spec = "bestvideo+bestaudio/best"
     if args.quality:
-        format_spec = f"bv*[height<={args.quality}]+ba/b[height<={args.quality}]"
+        format_spec = f"bv*[height<={args.quality}]+ba/b[height<={args.quality}]/b"
 
     out_tpl = str(raw_dir / f"{name}.raw.%(ext)s")
     json_path = raw_dir / f"{name}.source.json"
@@ -505,6 +514,47 @@ def cmd_download(args: argparse.Namespace) -> None:
     if duration <= 0:
         _die(f"ffprobe reports duration <= 0 for {raw_mp4}")
 
+    # --- Phase 5b: spot-check the cargo ---
+    # yt-dlp picks among possibly dozens of streams (auto-dubbed sources carry
+    # 20+ audio-language variants per resolution); its sort prefers the
+    # original track, but nothing asserted what actually landed. Probe the
+    # file and warn on mismatches — resolution/fps/bitrate are facts for the
+    # record, the language check is the one that saves a 14h pipeline from
+    # transcribing a dub track.
+    try:
+        cargo_probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,width,height,avg_frame_rate,bit_rate:stream_tags=language",
+             "-of", "json", str(raw_mp4)],
+            capture_output=True, text=True)
+        pdata = json.loads(cargo_probe.stdout or "{}")
+        vstream = next((s for s in pdata.get("streams", [])
+                        if s.get("codec_type") == "video"), {})
+        astream = next((s for s in pdata.get("streams", [])
+                        if s.get("codec_type") == "audio"), {})
+        cargo = {
+            "width": vstream.get("width"), "height": vstream.get("height"),
+            "fps": vstream.get("avg_frame_rate"),
+            "video_bitrate": vstream.get("bit_rate"),
+            "audio_language": (astream.get("tags") or {}).get("language"),
+        }
+    except Exception as e:
+        cargo = {"probe_error": str(e)}
+    cargo_warnings = []
+    height = cargo.get("height")
+    if args.quality and isinstance(height, int) and height > args.quality + 1:
+        cargo_warnings.append(
+            f"downloaded height {height} exceeds requested cap {args.quality}")
+    orig_lang = (info.get("language") or "").split("-")[0].lower()
+    got_lang = (cargo.get("audio_language") or "").split("-")[0].lower()
+    if orig_lang and got_lang and got_lang != orig_lang:
+        cargo_warnings.append(
+            f"audio language '{got_lang}' != original '{orig_lang}' — "
+            "a dub track may have been grabbed instead of the original")
+    if cargo_warnings:
+        for w in cargo_warnings:
+            _log(f"cook download: WARNING {w}")
+
     files = []
     for p in raw_dir.iterdir():
         if p.is_file():
@@ -524,7 +574,11 @@ def cmd_download(args: argparse.Namespace) -> None:
         "source_json_present": json_path.exists(),
         "cookie_source": probe_opts.get("cookiefile")
                          or probe_opts.get("cookiesfrombrowser", (None,))[0],
+        "cargo": cargo,
+        "cargo_warnings": cargo_warnings,
     })
+    if cargo_warnings:
+        print("COOK-RESULT: OK with warnings — " + "; ".join(cargo_warnings), flush=True)
 
 
 def _slugify(s: str) -> str:
