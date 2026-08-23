@@ -847,13 +847,20 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     shutil.copyfile(en_merged, cloud_en)
     _log(f"cook subtitles: cloud-srt copied from merged (zh={zh_merged.name}, en={en_merged.name})")
 
-    # length-check the produced files
+    # length-check the produced files — in DISPLAY WIDTH units (CJK=2,
+    # ASCII=1), matching what shorten/merge-short actually split by. Char
+    # counts false-positived on mixed zh+en lines (an English course name
+    # inflates the char count at half the width) and on EN cues that wrap
+    # fine at 2 lines. Thresholds mirror the pipeline's own limits: zh 56
+    # width x the 1.15 mild-overrun exemption, en 160 width (MAX_EN).
+    def _wlen(s: str) -> int:
+        return sum(2 if ord(c) > 127 else 1 for c in s)
     issues = []
-    for srt_path, limit, label in [(cloud_zh, 45, "zh"), (cloud_en, 90, "en")]:
+    for srt_path, limit, label in [(cloud_zh, 64, "zh"), (cloud_en, 160, "en")]:
         cues = _read_srt_cues(srt_path)
-        over = [(ts, body) for ts, body in cues if len(body) > limit]
+        over = [(ts, body) for ts, body in cues if _wlen(body) > limit]
         if over:
-            issues.append(f"{label}.srt has {len(over)} cues over {limit} chars")
+            issues.append(f"{label}.srt has {len(over)} cues over {limit} display-width units")
 
     _emit_json({
         "ok": True,
