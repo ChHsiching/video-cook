@@ -63,7 +63,7 @@ cook is the deterministic executor for the [video-cooking](https://github.com/Ch
 
 | Bug in the old skill docs | How cook fixes it |
 |---|---|
-| `--dump-json > file.json` silently swallowed downloads | cook uses `print_to_file` (yt-dlp's native JSON-to-file option) |
+| `--dump-json > file.json` silently swallowed downloads | cook writes `source.json` itself from the probe result (no shell redirection involved) |
 | Thumbnail came out as `<name>.raw.jpg` not `<name>.jpg` | cook renames it after download |
 | Windows `C:` paths broke ffmpeg `ass` filter | cook uses subprocess list-form (never shell), runs from subtitle/ dir with bare filename |
 | `subtitles.py split` leaked single-language cues across zh.srt/en.srt | cook copies `*.merged.srt` to cloud-srt instead of splitting bilingual.srt |
