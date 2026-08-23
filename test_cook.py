@@ -887,8 +887,9 @@ class TestLengthIssuesWidthGate:
     def test_zh_mixed_line_at_64_width_passes(self):
         # 16 CJK (32 width) + 32 ASCII (32 width) = 64 width, 48 chars —
         # would FAIL the old 45-char gate (the original false positive)
-        line = "我是个老师最近在教一门课叫" + "a" * 31 + "!"
+        line = "我" * 16 + "a" * 32
         assert cook._wlen(line) == 64
+        assert len(line) == 48
         issues = cook._length_issues([(0.0, line)], [])
         assert issues == []
 
