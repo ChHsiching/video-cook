@@ -1767,7 +1767,8 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 
 def cmd_dub_synth(args: argparse.Namespace) -> None:
     """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2 (single-threaded).
-    Produces dubbed/_full/_segments/sent_NNNN.wav. Slow on CPU (~7h for 140 cues)."""
+    Produces dubbed/_full/_segments/sent_NNNN.wav. Cost is per cue: ~3.5 min/cue
+    (~8h for 141 cues — see video-dubbing SKILL.md Step 4)."""
     _run_dub_stage("synth", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    detach=getattr(args, "detach", False),
