@@ -371,8 +371,9 @@ def cmd_download(args: argparse.Namespace) -> None:
     """Download video + source.json + thumbnail, with cookie negotiation.
 
     Wraps yt-dlp so the agent never hand-assembles the long command. Fixes the
-    known traps: uses --print-to-file (not stdout redirect) for JSON, renames
-    the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
+    known traps: writes source.json itself from the probe result (no stdout
+    redirect, no yt-dlp print_to_file — both have silently eaten output),
+    renames the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
     internally rather than asking the agent to drive it.
     """
     try:
