@@ -53,15 +53,15 @@ def _log(msg: str) -> None:
 def _die(msg: str, obj: dict[str, Any] | None = None) -> None:
     """Log an error and exit non-zero. Optionally emit a JSON object first.
 
-    The final COOK-RESULT line survives `| tail` pipelines (whose exit code
-    is tail's, not cook's) — agents reading only the tail still see the
-    verdict."""
+    The final COOK-RESULT line goes to stderr (stdout must stay pure JSON
+    for agents/tests); stderr bypasses `| tail` pipes, so the verdict still
+    reaches the terminal even when the exit code is masked by the pipe."""
     _log(f"cook: error: {msg}")
     if obj is not None:
         obj.setdefault("ok", False)
         obj.setdefault("error", msg)
         _emit_json(obj)
-    print(f"COOK-RESULT: FAIL — {msg}", flush=True)
+    print(f"COOK-RESULT: FAIL — {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
 
@@ -578,7 +578,8 @@ def cmd_download(args: argparse.Namespace) -> None:
         "cargo_warnings": cargo_warnings,
     })
     if cargo_warnings:
-        print("COOK-RESULT: OK with warnings — " + "; ".join(cargo_warnings), flush=True)
+        print("COOK-RESULT: OK with warnings — " + "; ".join(cargo_warnings),
+              file=sys.stderr, flush=True)
 
 
 def _slugify(s: str) -> str:
