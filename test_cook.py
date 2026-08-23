@@ -876,3 +876,35 @@ class TestBurnBarPxAssGeometry:
         assert "ASS not found" in stderr or "ASS" in stderr
         # geometry check did not run (no mismatch banner)
         assert "playresy" not in stderr.lower()
+
+
+class TestLengthIssuesWidthGate:
+    """Pin the width-based length gate (zh 64 / en 184 display-width units).
+    A regression back to char-counting (the old 45/90 gates) must fail these:
+    mixed zh+en lines score half their char count in width, and EN cues up to
+    184 are legal under shorten's x1.15 exemption."""
+
+    def test_zh_mixed_line_at_64_width_passes(self):
+        # 16 CJK (32 width) + 32 ASCII (32 width) = 64 width, 48 chars —
+        # would FAIL the old 45-char gate (the original false positive)
+        line = "我是个老师最近在教一门课叫" + "a" * 31 + "!"
+        assert cook._wlen(line) == 64
+        issues = cook._length_issues([(0.0, line)], [])
+        assert issues == []
+
+    def test_zh_over_64_width_flags(self):
+        line = "我" * 33  # 66 width
+        issues = cook._length_issues([(0.0, line)], [])
+        assert len(issues) == 1 and "zh" in issues[0] and "display-width" in issues[0]
+
+    def test_en_at_184_passes_at_185_flags(self):
+        ok = "a" * 184   # shorten's x1.15 exemption ceiling (160 x 1.15)
+        bad = "a" * 185
+        assert cook._length_issues([], [(0.0, ok)]) == []
+        issues = cook._length_issues([], [(0.0, bad)])
+        assert len(issues) == 1 and "en" in issues[0] and "184" in issues[0]
+
+    def test_en_161_legal_under_exemption_not_flagged(self):
+        # the round-3 defect: 161-184 cues survive shorten untouched and
+        # must not surface as an unfixable issue
+        assert cook._length_issues([], [(0.0, "a" * 170)]) == []

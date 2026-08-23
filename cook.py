@@ -14,7 +14,7 @@ Design principles
 - Heavy third-party deps (yt-dlp, whisperx) are imported lazily inside the
   subcommands that need them, so `cook verify-shipment` works even if the
   user hasn't installed whisperx.
-- Long tasks (transcribe, burn) auto-detach so they survive shell timeouts.
+- Long tasks (transcribe, burn, dub) run in the foreground by default; --detach opts out for shell-timeout survival.
 - Exit codes are meaningful: 0 = the subcommand's done criterion passed,
   non-zero = it didn't (agent can branch on this).
 
@@ -786,6 +786,27 @@ def _detect_device_compute() -> tuple[str, str]:
 # Subcommand: subtitles — shorten + merge-short + biliteral + ass + cloud-srt
 # ============================================================================
 
+def _wlen(s: str) -> int:
+    """Display width: CJK/full-width = 2, ASCII = 1 (mirrors subtitles.wlen)."""
+    return sum(2 if ord(c) > 127 else 1 for c in s)
+
+
+def _length_issues(zh_cues, en_cues):
+    """Length-gate the merged SRTs in DISPLAY WIDTH units, matching what
+    shorten/merge-short actually split by. Char counts false-positived on
+    mixed zh+en lines (an English course name inflates the char count at
+    half the width) and on EN cues that wrap fine at 2 lines. Thresholds
+    mirror the pipeline's own ceilings incl. shorten's x1.15 mild-overrun
+    exemption: zh 56x1.15=64, en 160x1.15=184 — a legal-but-exempt cue
+    must not surface as an unfixable issue."""
+    issues = []
+    for cues, limit, label in [(zh_cues, 64, "zh"), (en_cues, 184, "en")]:
+        over = [body for _, body in cues if _wlen(body) > limit]
+        if over:
+            issues.append(f"{label}.srt has {len(over)} cues over {limit} display-width units")
+    return issues
+
+
 def cmd_subtitles(args: argparse.Namespace) -> None:
     """Run the full subtitle-processing pipeline in one shot, including
     producing cloud-srt/ by COPYING the per-language merged SRTs (NOT by
@@ -847,20 +868,8 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     shutil.copyfile(en_merged, cloud_en)
     _log(f"cook subtitles: cloud-srt copied from merged (zh={zh_merged.name}, en={en_merged.name})")
 
-    # length-check the produced files — in DISPLAY WIDTH units (CJK=2,
-    # ASCII=1), matching what shorten/merge-short actually split by. Char
-    # counts false-positived on mixed zh+en lines (an English course name
-    # inflates the char count at half the width) and on EN cues that wrap
-    # fine at 2 lines. Thresholds mirror the pipeline's own limits: zh 56
-    # width x the 1.15 mild-overrun exemption, en 160 width (MAX_EN).
-    def _wlen(s: str) -> int:
-        return sum(2 if ord(c) > 127 else 1 for c in s)
-    issues = []
-    for srt_path, limit, label in [(cloud_zh, 64, "zh"), (cloud_en, 160, "en")]:
-        cues = _read_srt_cues(srt_path)
-        over = [(ts, body) for ts, body in cues if _wlen(body) > limit]
-        if over:
-            issues.append(f"{label}.srt has {len(over)} cues over {limit} display-width units")
+    # length-check the produced files via the shared width-based gate
+    issues = _length_issues(_read_srt_cues(cloud_zh), _read_srt_cues(cloud_en))
 
     _emit_json({
         "ok": True,
@@ -1025,12 +1034,17 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     if detach:
         pid = _run_long_task(cmd, cwd=root, log_file=log_file,
                              err_file=err_file, detach=True)["pid"]
+        # full_dub numbers its stages (Stage 1=synth..4=burn) — the marker
+        # must quote the literal the log actually prints ("Stage 1 DONE:
+        # N cues synthesized"), or a poller waits forever on a string that
+        # never appears.
+        _STAGE_NUM = {"synth": 1, "timeline": 2, "retime": 3, "burn": 4}
         _emit_json({
             "ok": True, "detached": True, "pid": pid, "stage": stage,
             "python": py_bin,
             "log": str(log_file.relative_to(root)),
             "err_log": str(err_file.relative_to(root)),
-            "done_marker": f"Stage {stage} DONE",
+            "done_marker": f"Stage {_STAGE_NUM[stage]} DONE",
         })
         return
 
@@ -1050,7 +1064,8 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
 # ============================================================================
 
 def cmd_burn(args: argparse.Namespace) -> None:
-    """Burn subtitles into video via ffmpeg. Auto-detaches. Uses subprocess
+    """Burn subtitles into video via ffmpeg. Foreground by default
+    (--detach opts out). Uses subprocess
     list-form (never shell=True) so backslashes and drive letters in Windows
     paths can't break the ass filter — this is the fix for B4."""
     _require_ffmpeg()
@@ -1508,7 +1523,8 @@ def _move_separated_stems(sep_root: Path, model: str, stem_name: str,
 # ============================================================================
 
 def cmd_dub_separate(args: argparse.Namespace) -> None:
-    """Separate vocals from the raw video via Demucs. Auto-detaches for long
+    """Separate vocals from the raw video via Demucs. Foreground by default;
+    --detach opts out for long
     videos (Demucs on CPU is ~1.5× audio duration). Produces vocals.wav +
     no_vocals.wav under dubbed/."""
     root = _video_dir(args.output_root)
