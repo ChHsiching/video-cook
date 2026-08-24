@@ -45,9 +45,9 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 | `cook doctor` | Check environment (ffmpeg/node/yt-dlp/whisperx/torch+CUDA) | Skill's "Environment reuse" prose |
 | `cook download <url>` | yt-dlp download + cookie negotiation + thumbnail rename + ffprobe verify | video-download Steps 1-3 |
 | `cook extract <root> <name>` | ffmpeg 16kHz mono WAV extraction | video-subtitle Step 1 |
-| `cook transcribe <root> <name>` | whisperX transcription, auto-detects CUDA, auto-detaches | video-subtitle Step 2 |
+| `cook transcribe <root> <name>` | whisperX transcription, auto-detects CUDA, foreground by default (`--detach` opts out) | video-subtitle Step 2 |
 | `cook subtitles <root> <name>` | shorten → merge-short → biliteral → ASS + cloud-srt in one shot | video-subtitle Step 4 + cloud-srt |
-| `cook burn <root> <name>` | ffmpeg subtitle burning, auto-detaches, subprocess list-form | video-subtitle Step 5 |
+| `cook burn <root> <name>` | ffmpeg subtitle burning, foreground by default (`--detach` opts out), subprocess list-form | video-subtitle Step 5 |
 | `cook cover <root> <name>` | Place `cover.jpg` in `cooked/` (reuses raw thumbnail) | video-subtitle Step 6 cover task |
 | `cook show-source <root> <name>` | Extract key fields (title/uploader/links/description) from source.json | (new — surfaces the source context for translation + upload metadata) |
 | `cook verify-align <root> <name>` | DP-align `en.srt` vs `translations.txt`, catch missing/drifted translations | (new — no prior equivalent) |
@@ -63,7 +63,7 @@ cook is the deterministic executor for the [video-cooking](https://github.com/Ch
 
 | Bug in the old skill docs | How cook fixes it |
 |---|---|
-| `--dump-json > file.json` silently swallowed downloads | cook uses `print_to_file` (yt-dlp's native JSON-to-file option) |
+| `--dump-json > file.json` silently swallowed downloads | cook writes `source.json` itself from the probe result (no shell redirection involved) |
 | Thumbnail came out as `<name>.raw.jpg` not `<name>.jpg` | cook renames it after download |
 | Windows `C:` paths broke ffmpeg `ass` filter | cook uses subprocess list-form (never shell), runs from subtitle/ dir with bare filename |
 | `subtitles.py split` leaked single-language cues across zh.srt/en.srt | cook copies `*.merged.srt` to cloud-srt instead of splitting bilingual.srt |

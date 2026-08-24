@@ -14,7 +14,7 @@ Design principles
 - Heavy third-party deps (yt-dlp, whisperx) are imported lazily inside the
   subcommands that need them, so `cook verify-shipment` works even if the
   user hasn't installed whisperx.
-- Long tasks (transcribe, burn) auto-detach so they survive shell timeouts.
+- Long tasks (transcribe, burn, dub) run in the foreground by default; --detach opts out for shell-timeout survival.
 - Exit codes are meaningful: 0 = the subcommand's done criterion passed,
   non-zero = it didn't (agent can branch on this).
 
@@ -51,12 +51,17 @@ def _log(msg: str) -> None:
 
 
 def _die(msg: str, obj: dict[str, Any] | None = None) -> None:
-    """Log an error and exit non-zero. Optionally emit a JSON object first."""
+    """Log an error and exit non-zero. Optionally emit a JSON object first.
+
+    The final COOK-RESULT line goes to stderr (stdout must stay pure JSON
+    for agents/tests); stderr bypasses `| tail` pipes, so the verdict still
+    reaches the terminal even when the exit code is masked by the pipe."""
     _log(f"cook: error: {msg}")
     if obj is not None:
         obj.setdefault("ok", False)
         obj.setdefault("error", msg)
         _emit_json(obj)
+    print(f"COOK-RESULT: FAIL — {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
 
@@ -366,8 +371,9 @@ def cmd_download(args: argparse.Namespace) -> None:
     """Download video + source.json + thumbnail, with cookie negotiation.
 
     Wraps yt-dlp so the agent never hand-assembles the long command. Fixes the
-    known traps: uses --print-to-file (not stdout redirect) for JSON, renames
-    the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
+    known traps: writes source.json itself from the probe result (no stdout
+    redirect, no yt-dlp print_to_file — both have silently eaten output),
+    renames the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
     internally rather than asking the agent to drive it.
     """
     try:
@@ -435,9 +441,13 @@ def cmd_download(args: argparse.Namespace) -> None:
     _log(f"cook download: output_root={output_root}, name={name}")
 
     # --- Phase 3: real download (video + thumbnail + json in one call) ---
-    format_spec = "bestvideo+bestaudio"
+    # The trailing "/best" matters: sources without separate video/audio
+    # streams (HLS-only, incl. YouTube's auto-dubbed multi-audio delivery)
+    # have nothing for bestvideo+bestaudio to grab, and without the muxed
+    # fallback the download dies with "Requested format is not available".
+    format_spec = "bestvideo+bestaudio/best"
     if args.quality:
-        format_spec = f"bv*[height<={args.quality}]+ba/b[height<={args.quality}]"
+        format_spec = f"bv*[height<={args.quality}]+ba/b[height<={args.quality}]/b"
 
     out_tpl = str(raw_dir / f"{name}.raw.%(ext)s")
     json_path = raw_dir / f"{name}.source.json"
@@ -505,6 +515,47 @@ def cmd_download(args: argparse.Namespace) -> None:
     if duration <= 0:
         _die(f"ffprobe reports duration <= 0 for {raw_mp4}")
 
+    # --- Phase 5b: spot-check the cargo ---
+    # yt-dlp picks among possibly dozens of streams (auto-dubbed sources carry
+    # 20+ audio-language variants per resolution); its sort prefers the
+    # original track, but nothing asserted what actually landed. Probe the
+    # file and warn on mismatches — resolution/fps/bitrate are facts for the
+    # record, the language check is the one that saves a 14h pipeline from
+    # transcribing a dub track.
+    try:
+        cargo_probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,width,height,avg_frame_rate,bit_rate:stream_tags=language",
+             "-of", "json", str(raw_mp4)],
+            capture_output=True, text=True)
+        pdata = json.loads(cargo_probe.stdout or "{}")
+        vstream = next((s for s in pdata.get("streams", [])
+                        if s.get("codec_type") == "video"), {})
+        astream = next((s for s in pdata.get("streams", [])
+                        if s.get("codec_type") == "audio"), {})
+        cargo = {
+            "width": vstream.get("width"), "height": vstream.get("height"),
+            "fps": vstream.get("avg_frame_rate"),
+            "video_bitrate": vstream.get("bit_rate"),
+            "audio_language": (astream.get("tags") or {}).get("language"),
+        }
+    except Exception as e:
+        cargo = {"probe_error": str(e)}
+    cargo_warnings = []
+    height = cargo.get("height")
+    if args.quality and isinstance(height, int) and height > args.quality + 1:
+        cargo_warnings.append(
+            f"downloaded height {height} exceeds requested cap {args.quality}")
+    orig_lang = (info.get("language") or "").split("-")[0].lower()
+    got_lang = (cargo.get("audio_language") or "").split("-")[0].lower()
+    if orig_lang and got_lang and got_lang != orig_lang:
+        cargo_warnings.append(
+            f"audio language '{got_lang}' != original '{orig_lang}' — "
+            "a dub track may have been grabbed instead of the original")
+    if cargo_warnings:
+        for w in cargo_warnings:
+            _log(f"cook download: WARNING {w}")
+
     files = []
     for p in raw_dir.iterdir():
         if p.is_file():
@@ -524,7 +575,12 @@ def cmd_download(args: argparse.Namespace) -> None:
         "source_json_present": json_path.exists(),
         "cookie_source": probe_opts.get("cookiefile")
                          or probe_opts.get("cookiesfrombrowser", (None,))[0],
+        "cargo": cargo,
+        "cargo_warnings": cargo_warnings,
     })
+    if cargo_warnings:
+        print("COOK-RESULT: OK with warnings — " + "; ".join(cargo_warnings),
+              file=sys.stderr, flush=True)
 
 
 def _slugify(s: str) -> str:
@@ -731,6 +787,27 @@ def _detect_device_compute() -> tuple[str, str]:
 # Subcommand: subtitles — shorten + merge-short + biliteral + ass + cloud-srt
 # ============================================================================
 
+def _wlen(s: str) -> int:
+    """Display width: CJK/full-width = 2, ASCII = 1 (mirrors subtitles.wlen)."""
+    return sum(2 if ord(c) > 127 else 1 for c in s)
+
+
+def _length_issues(zh_cues, en_cues):
+    """Length-gate the merged SRTs in DISPLAY WIDTH units, matching what
+    shorten/merge-short actually split by. Char counts false-positived on
+    mixed zh+en lines (an English course name inflates the char count at
+    half the width) and on EN cues that wrap fine at 2 lines. Thresholds
+    mirror the pipeline's own ceilings incl. shorten's x1.15 mild-overrun
+    exemption: zh 56x1.15=64, en 160x1.15=184 — a legal-but-exempt cue
+    must not surface as an unfixable issue."""
+    issues = []
+    for cues, limit, label in [(zh_cues, 64, "zh"), (en_cues, 184, "en")]:
+        over = [body for _, body in cues if _wlen(body) > limit]
+        if over:
+            issues.append(f"{label}.srt has {len(over)} cues over {limit} display-width units")
+    return issues
+
+
 def cmd_subtitles(args: argparse.Namespace) -> None:
     """Run the full subtitle-processing pipeline in one shot, including
     producing cloud-srt/ by COPYING the per-language merged SRTs (NOT by
@@ -792,13 +869,8 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     shutil.copyfile(en_merged, cloud_en)
     _log(f"cook subtitles: cloud-srt copied from merged (zh={zh_merged.name}, en={en_merged.name})")
 
-    # length-check the produced files
-    issues = []
-    for srt_path, limit, label in [(cloud_zh, 45, "zh"), (cloud_en, 90, "en")]:
-        cues = _read_srt_cues(srt_path)
-        over = [(ts, body) for ts, body in cues if len(body) > limit]
-        if over:
-            issues.append(f"{label}.srt has {len(over)} cues over {limit} chars")
+    # length-check the produced files via the shared width-based gate
+    issues = _length_issues(_read_srt_cues(cloud_zh), _read_srt_cues(cloud_en))
 
     _emit_json({
         "ok": True,
@@ -963,12 +1035,17 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     if detach:
         pid = _run_long_task(cmd, cwd=root, log_file=log_file,
                              err_file=err_file, detach=True)["pid"]
+        # full_dub numbers its stages (Stage 1=synth..4=burn) — the marker
+        # must quote the literal the log actually prints ("Stage 1 DONE:
+        # N cues synthesized"), or a poller waits forever on a string that
+        # never appears.
+        _STAGE_NUM = {"synth": 1, "timeline": 2, "retime": 3, "burn": 4}
         _emit_json({
             "ok": True, "detached": True, "pid": pid, "stage": stage,
             "python": py_bin,
             "log": str(log_file.relative_to(root)),
             "err_log": str(err_file.relative_to(root)),
-            "done_marker": f"Stage {stage} DONE",
+            "done_marker": f"Stage {_STAGE_NUM[stage]} DONE",
         })
         return
 
@@ -988,7 +1065,8 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
 # ============================================================================
 
 def cmd_burn(args: argparse.Namespace) -> None:
-    """Burn subtitles into video via ffmpeg. Auto-detaches. Uses subprocess
+    """Burn subtitles into video via ffmpeg. Foreground by default
+    (--detach opts out). Uses subprocess
     list-form (never shell=True) so backslashes and drive letters in Windows
     paths can't break the ass filter — this is the fix for B4."""
     _require_ffmpeg()
@@ -1446,7 +1524,8 @@ def _move_separated_stems(sep_root: Path, model: str, stem_name: str,
 # ============================================================================
 
 def cmd_dub_separate(args: argparse.Namespace) -> None:
-    """Separate vocals from the raw video via Demucs. Auto-detaches for long
+    """Separate vocals from the raw video via Demucs. Foreground by default;
+    --detach opts out for long
     videos (Demucs on CPU is ~1.5× audio duration). Produces vocals.wav +
     no_vocals.wav under dubbed/."""
     root = _video_dir(args.output_root)
@@ -1689,7 +1768,8 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 
 def cmd_dub_synth(args: argparse.Namespace) -> None:
     """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2 (single-threaded).
-    Produces dubbed/_full/_segments/sent_NNNN.wav. Slow on CPU (~7h for 140 cues)."""
+    Produces dubbed/_full/_segments/sent_NNNN.wav. Cost is per cue: ~3.5 min/cue
+    (~8h for 141 cues — see video-dubbing SKILL.md Step 4)."""
     _run_dub_stage("synth", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    detach=getattr(args, "detach", False),
