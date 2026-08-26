@@ -24,6 +24,7 @@ each one's flags (the dub pipeline nests one level deeper: `cook dub --help`).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -298,6 +299,14 @@ def _read_ass_playresy(ass_path: Path) -> int | None:
 # Subcommand: doctor
 # ============================================================================
 
+def _sb_guard_patched(src: str) -> bool:
+    """True if speechbrain's importutils source normalizes backslashes in the
+    inspect.py probe guard (the Windows fix). Upstream's unpatched form is
+    `importer_frame.filename.endswith("/inspect.py")` — backslash paths never
+    match, so the guard never fires."""
+    return "filename.replace" in src
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Check the environment. Reports what's available; does not fail —
     the agent reads the JSON and decides what to ask the user to install."""
@@ -338,6 +347,29 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     except ImportError:
         report["tools"]["whisperx"] = {"installed": False}
         report["issues"].append("whisperx not found — pip install video-cook[transcribe]")
+
+    # speechbrain lazy-import guard (Windows): whisperx >= 3.8 + pyannote >= 4
+    # pull in speechbrain, whose LazyModule probe guard matches only
+    # forward-slash "inspect.py" paths. On Windows (backslash paths) the guard
+    # never fires, a probe during model load triggers the k2_fsa lazy import,
+    # and `cook transcribe` dies with "No module named 'k2'". Detect whether
+    # the installed copy is patched.
+    try:
+        import speechbrain.utils.importutils as _sb_iu
+        src = Path(_sb_iu.__file__).read_text(encoding="utf-8", errors="replace")
+        patched = _sb_guard_patched(src)
+        report["tools"]["speechbrain"] = {
+            "installed": True, "windows_inspect_guard": "patched" if patched else "unpatched",
+        }
+        if not patched:
+            report["issues"].append(
+                "speechbrain inspect-guard unpatched — cook transcribe will crash "
+                "on Windows with ImportError (No module named 'k2'); patch "
+                "site-packages/speechbrain/utils/importutils.py: normalize "
+                "backslashes in the importer_frame.filename check"
+            )
+    except ImportError:
+        pass  # older whisperx stacks do not pull speechbrain; nothing to check
 
     try:
         import torch
@@ -382,6 +414,10 @@ def cmd_download(args: argparse.Namespace) -> None:
         _die("yt-dlp not installed. Run: pip install video-cook[download]")
 
     _require_ffmpeg()  # needed to merge separate video/audio streams + ffprobe verify
+
+    if args.quality is not None and args.quality < 120:
+        _die(f"--quality {args.quality} is not a sane height cap (expect >= 120); "
+             "pass e.g. --quality 1080", obj={"stage": "download"})
 
     url = args.url
     cwd = Path.cwd()
@@ -543,7 +579,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         cargo = {"probe_error": str(e)}
     cargo_warnings = []
     height = cargo.get("height")
-    if args.quality and isinstance(height, int) and height > args.quality + 1:
+    if args.quality is not None and isinstance(height, int) and height > args.quality + 1:
         cargo_warnings.append(
             f"downloaded height {height} exceeds requested cap {args.quality}")
     orig_lang = (info.get("language") or "").split("-")[0].lower()
@@ -583,12 +619,28 @@ def cmd_download(args: argparse.Namespace) -> None:
               file=sys.stderr, flush=True)
 
 
+# Windows MAX_PATH (260 chars) headroom: the stem appears twice per path —
+# once as the video dir name, once in every raw/ filename — and yt-dlp's
+# fragment downloads append long suffixes (.raw.fhls-audio-128000-Audio.mp4
+# .part-FragNNNN.part). Auto-derived stems are capped; a truncated stem gets
+# a 5-char hash tail so distinct long titles stay distinct.
+_MAX_STEM = 48
+
+
 def _slugify(s: str) -> str:
-    """Lowercase, keep alnum, replace runs of separators with a single dash."""
+    """Lowercase, keep alnum, replace runs of separators with a single dash.
+
+    Result is capped at _MAX_STEM chars; when capping drops characters, the
+    tail is replaced with a short sha1 of the full slug (deterministic — the
+    same title always maps to the same name)."""
     s = s.lower().strip()
     s = re.sub(r"[^\w\s-]", "", s)         # drop punctuation (unicode-aware)
     s = re.sub(r"[\s_-]+", "-", s)          # collapse separators
-    return s.strip("-") or "video"
+    s = s.strip("-") or "video"
+    if len(s) > _MAX_STEM:
+        digest = hashlib.sha1(s.encode("utf-8")).hexdigest()[:5]
+        s = s[: _MAX_STEM - 6].rstrip("-") + "-" + digest
+    return s
 
 
 def _negotiate_cookie(url: str, user_specified: str | None) -> str | None:
@@ -1000,7 +1052,7 @@ def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
 
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
-                   log_name: str | None = None) -> None:
+                   log_name: str | None = None, extra_args: list[str] | None = None) -> None:
     """Run one full_dub.py stage as a subprocess under the chosen interpreter.
 
     This is the fix for the IndexTTS2 environment split: full_dub.py needs
@@ -1028,7 +1080,7 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [py_bin, str(script), stage, str(root), name]
+    cmd = [py_bin, str(script), stage, str(root), name] + (extra_args or [])
     label = f"cook dub {stage}"
     _log(f"{label}: stage={stage} python={py_bin} ({'detached' if detach else 'foreground'})")
 
@@ -1446,6 +1498,20 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
 
     # cross-checks (issues, not hard missing)
     issues = []
+    # Author-dir detection: the classic invocation mistake is passing the
+    # author dir (one level up) as output_root — everything then reads as
+    # missing. If nothing was found AND the passed dir contains child dirs
+    # that each hold a raw/ folder, name the mistake instead of a bare list.
+    if missing and not present and root.is_dir():
+        video_dirs = sorted(
+            d.name for d in root.iterdir() if d.is_dir() and (d / "raw").is_dir()
+        )
+        if video_dirs:
+            issues.append(
+                "output_root appears to be the AUTHOR dir — output_root must be "
+                "the per-video dir (<author>/<video-name>); video dirs found "
+                "underneath: " + ", ".join(video_dirs[:5])
+            )
     # raw stage: source.json must be valid JSON with a title (not the 3-byte
     # "NA" that yt-dlp's broken %(all)j template used to write), and the
     # thumbnail must be a real jpg (not a webp that conversion failed on).
@@ -1795,9 +1861,27 @@ def cmd_dub_retime(args: argparse.Namespace) -> None:
 def cmd_dub_burn(args: argparse.Namespace) -> None:
     """Stage 4: concat segments + place audio + generate subtitles (shorten +
     merge-short + ass) + burn into cooked/<name>.dubbed.mp4. Also copies the
-    upload subtitle to cloud-srt/zh.dub.srt."""
+    upload subtitle to cloud-srt/zh.dub.srt.
+
+    --keep-subs skips the subtitle regeneration and reuses the files already
+    in dubbed/_full/ — the recovery path after a post-burn quality-gate fix
+    (dubbing SKILL.md Step 7) edited
+    dubbing.bilingual.srt or the merged SRTs by hand (regenerating would wipe
+    those edits). The ASS is still rebuilt from the on-disk bilingual SRT."""
+    if getattr(args, "keep_subs", False):
+        # The flag is honored by full_dub.py, resolved from the INSTALLED
+        # video-dubbing skill — which may still be an older copy that ignores
+        # extra argv and silently regenerates (wiping the hand edits the
+        # flag exists to protect). Probe before burning anything.
+        script_src = Path(_find_dub_script()).read_text(encoding="utf-8", errors="replace")
+        if "keep_subs" not in script_src:
+            _die("--keep-subs needs a full_dub.py that supports it — the installed "
+                 "video-dubbing skill is older. Update it "
+                 "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.",
+                 obj={"stage": "burn", "flag": "--keep-subs"})
     _run_dub_stage("burn", args.output_root, args.name,
-                   python=getattr(args, "python", None))
+                   python=getattr(args, "python", None),
+                   extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
@@ -1836,7 +1920,7 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("url")
     pd.add_argument("--author", help="override <author> path segment")
     pd.add_argument("--name", help="override <video-name> and <name> stem")
-    pd.add_argument("--quality", help="cap height, e.g. 1080")
+    pd.add_argument("--quality", type=int, help="cap height in pixels, e.g. 1080")
     pd.add_argument("--cookies-from-browser", help="skip negotiation, use this browser")
     pd.add_argument("--cookies", help="path to a Netscape cookies.txt file for auth "
                      "(takes precedence over --cookies-from-browser)")
@@ -1984,6 +2068,10 @@ def build_parser() -> argparse.ArgumentParser:
     pdbn = dub_sub.add_parser("burn",
                               help="Stage 4: concat + audio + subtitles + burn → cooked/<name>.dubbed.mp4")
     _add_dub_common(pdbn)
+    pdbn.add_argument("--keep-subs", dest="keep_subs", action="store_true",
+                      help="Skip subtitle regeneration and reuse the files in "
+                           "dubbed/_full/ (recovery after editing them by hand); "
+                           "the ASS is still rebuilt from the on-disk bilingual SRT")
     pdbn.set_defaults(func=cmd_dub_burn)
 
     pdfl = dub_sub.add_parser("full",
