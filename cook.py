@@ -415,6 +415,10 @@ def cmd_download(args: argparse.Namespace) -> None:
 
     _require_ffmpeg()  # needed to merge separate video/audio streams + ffprobe verify
 
+    if args.quality is not None and args.quality < 120:
+        _die(f"--quality {args.quality} is not a sane height cap (expect >= 120); "
+             "pass e.g. --quality 1080", obj={"stage": "download"})
+
     url = args.url
     cwd = Path.cwd()
 
@@ -575,7 +579,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         cargo = {"probe_error": str(e)}
     cargo_warnings = []
     height = cargo.get("height")
-    if args.quality and isinstance(height, int) and height > args.quality + 1:
+    if args.quality is not None and isinstance(height, int) and height > args.quality + 1:
         cargo_warnings.append(
             f"downloaded height {height} exceeds requested cap {args.quality}")
     orig_lang = (info.get("language") or "").split("-")[0].lower()
@@ -1872,7 +1876,8 @@ def cmd_dub_burn(args: argparse.Namespace) -> None:
         if "keep_subs" not in script_src:
             _die("--keep-subs needs a full_dub.py that supports it — the installed "
                  "video-dubbing skill is older. Update it "
-                 "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.")
+                 "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.",
+                 obj={"stage": "burn", "flag": "--keep-subs"})
     _run_dub_stage("burn", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
