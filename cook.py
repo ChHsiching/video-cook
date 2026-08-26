@@ -24,6 +24,7 @@ each one's flags (the dub pipeline nests one level deeper: `cook dub --help`).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -298,6 +299,14 @@ def _read_ass_playresy(ass_path: Path) -> int | None:
 # Subcommand: doctor
 # ============================================================================
 
+def _sb_guard_patched(src: str) -> bool:
+    """True if speechbrain's importutils source normalizes backslashes in the
+    inspect.py probe guard (the Windows fix). Upstream's unpatched form is
+    `importer_frame.filename.endswith("/inspect.py")` — backslash paths never
+    match, so the guard never fires."""
+    return "filename.replace" in src
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Check the environment. Reports what's available; does not fail —
     the agent reads the JSON and decides what to ask the user to install."""
@@ -338,6 +347,29 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     except ImportError:
         report["tools"]["whisperx"] = {"installed": False}
         report["issues"].append("whisperx not found — pip install video-cook[transcribe]")
+
+    # speechbrain lazy-import guard (Windows): whisperx >= 3.8 + pyannote >= 4
+    # pull in speechbrain, whose LazyModule probe guard matches only
+    # forward-slash "inspect.py" paths. On Windows (backslash paths) the guard
+    # never fires, a probe during model load triggers the k2_fsa lazy import,
+    # and `cook transcribe` dies with "No module named 'k2'". Detect whether
+    # the installed copy is patched.
+    try:
+        import speechbrain.utils.importutils as _sb_iu
+        src = Path(_sb_iu.__file__).read_text(encoding="utf-8", errors="replace")
+        patched = _sb_guard_patched(src)
+        report["tools"]["speechbrain"] = {
+            "installed": True, "windows_inspect_guard": "patched" if patched else "unpatched",
+        }
+        if not patched:
+            report["issues"].append(
+                "speechbrain inspect-guard unpatched — cook transcribe will crash "
+                "on Windows with ImportError (No module named 'k2'); patch "
+                "site-packages/speechbrain/utils/importutils.py: normalize "
+                "backslashes in the importer_frame.filename check"
+            )
+    except ImportError:
+        pass  # older whisperx stacks do not pull speechbrain; nothing to check
 
     try:
         import torch
@@ -583,12 +615,28 @@ def cmd_download(args: argparse.Namespace) -> None:
               file=sys.stderr, flush=True)
 
 
+# Windows MAX_PATH (260 chars) headroom: the stem appears twice per path —
+# once as the video dir name, once in every raw/ filename — and yt-dlp's
+# fragment downloads append long suffixes (.raw.fhls-audio-128000-Audio.mp4
+# .part-FragNNNN.part). Auto-derived stems are capped; a truncated stem gets
+# a 5-char hash tail so distinct long titles stay distinct.
+_MAX_STEM = 48
+
+
 def _slugify(s: str) -> str:
-    """Lowercase, keep alnum, replace runs of separators with a single dash."""
+    """Lowercase, keep alnum, replace runs of separators with a single dash.
+
+    Result is capped at _MAX_STEM chars; when capping drops characters, the
+    tail is replaced with a short sha1 of the full slug (deterministic — the
+    same title always maps to the same name)."""
     s = s.lower().strip()
     s = re.sub(r"[^\w\s-]", "", s)         # drop punctuation (unicode-aware)
     s = re.sub(r"[\s_-]+", "-", s)          # collapse separators
-    return s.strip("-") or "video"
+    s = s.strip("-") or "video"
+    if len(s) > _MAX_STEM:
+        digest = hashlib.sha1(s.encode("utf-8")).hexdigest()[:5]
+        s = s[: _MAX_STEM - 6].rstrip("-") + "-" + digest
+    return s
 
 
 def _negotiate_cookie(url: str, user_specified: str | None) -> str | None:
@@ -1446,6 +1494,20 @@ def cmd_verify_shipment(args: argparse.Namespace) -> None:
 
     # cross-checks (issues, not hard missing)
     issues = []
+    # Author-dir detection: the classic invocation mistake is passing the
+    # author dir (one level up) as output_root — everything then reads as
+    # missing. If nothing was found AND the passed dir contains child dirs
+    # that each hold a raw/ folder, name the mistake instead of a bare list.
+    if missing and not present and root.is_dir():
+        video_dirs = sorted(
+            d.name for d in root.iterdir() if d.is_dir() and (d / "raw").is_dir()
+        )
+        if video_dirs:
+            issues.append(
+                "output_root appears to be the AUTHOR dir — output_root must be "
+                "the per-video dir (<author>/<video-name>); video dirs found "
+                "underneath: " + ", ".join(video_dirs[:5])
+            )
     # raw stage: source.json must be valid JSON with a title (not the 3-byte
     # "NA" that yt-dlp's broken %(all)j template used to write), and the
     # thumbnail must be a real jpg (not a webp that conversion failed on).
@@ -1836,7 +1898,7 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("url")
     pd.add_argument("--author", help="override <author> path segment")
     pd.add_argument("--name", help="override <video-name> and <name> stem")
-    pd.add_argument("--quality", help="cap height, e.g. 1080")
+    pd.add_argument("--quality", type=int, help="cap height in pixels, e.g. 1080")
     pd.add_argument("--cookies-from-browser", help="skip negotiation, use this browser")
     pd.add_argument("--cookies", help="path to a Netscape cookies.txt file for auth "
                      "(takes precedence over --cookies-from-browser)")

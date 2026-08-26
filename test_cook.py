@@ -909,3 +909,95 @@ class TestLengthIssuesWidthGate:
         # the round-3 defect: 161-184 cues survive shorten untouched and
         # must not surface as an unfixable issue
         assert cook._length_issues([], [(0.0, "a" * 170)]) == []
+
+
+# ----------------------------------------------------------------------------
+# 0.6.1 hardening: stem cap (MAX_PATH), --quality int, author-dir hint,
+# speechbrain guard detection
+# ----------------------------------------------------------------------------
+
+class TestSlugifyStemCap:
+    def test_long_title_capped_at_48(self):
+        slug = cook._slugify("matt-pocock-just-saw-a-comment-saying-that-ive-"
+                             "never-made-a-proper-overview-of-everything")
+        assert len(slug) <= cook._MAX_STEM
+        # truncation keeps a 5-char hash tail: prefix-xxxxx
+        assert slug.endswith("-" + slug[-5:])
+        assert set(slug[-5:]) <= set("0123456789abcdef")
+
+    def test_cap_is_deterministic(self):
+        long_title = "a" * 120
+        assert cook._slugify(long_title) == cook._slugify(long_title)
+
+    def test_same_prefix_distinct_titles_stay_distinct(self):
+        # two long titles sharing a 60-char prefix must not collide
+        a = cook._slugify("x" * 60 + "alpha-part-of-the-title")
+        b = cook._slugify("x" * 60 + "beta-part-of-the-title")
+        assert a != b
+
+    def test_short_titles_untouched(self):
+        assert cook._slugify("Hello, World!") == "hello-world"
+
+
+class TestQualityParserInt:
+    def test_quality_parses_as_int(self):
+        args = cook.build_parser().parse_args(
+            ["download", "https://example.com/v", "--quality", "1080"])
+        assert args.quality == 1080
+        assert isinstance(args.quality, int)
+
+    def test_quality_rejects_non_numeric(self):
+        import pytest as _pytest
+        with _pytest.raises(SystemExit):
+            cook.build_parser().parse_args(
+                ["download", "https://example.com/v", "--quality", "hd"])
+
+
+class TestVerifyShipmentAuthorDirHint:
+    def _run(self, root: Path) -> dict:
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": "video",
+                              "stage": None})()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_verify_shipment(args)
+            except SystemExit as e:
+                self.last_exit = e.code
+        return json.loads(buf.getvalue())
+
+    def test_author_dir_gets_targeted_hint(self, tmp_path: Path):
+        # an author dir holding one complete-looking video dir underneath:
+        # passing the author dir itself makes everything read as missing
+        author = tmp_path / "matt-pocock"
+        video = author / "some-video-name"
+        (video / "raw").mkdir(parents=True)
+        (video / "raw" / "some-video-name.raw.mp4").write_bytes(b"x")
+        report = self._run(author)
+        assert report["ok"] is False
+        assert any("AUTHOR dir" in i and "some-video-name" in i
+                   for i in report["issues"])
+
+    def test_empty_dir_no_false_hint(self, tmp_path: Path):
+        # a per-video dir that is simply empty must not raise or hint
+        root = tmp_path / "vid"
+        root.mkdir()
+        report = self._run(root)
+        assert report["ok"] is False
+        assert report["issues"] == []
+
+
+class TestSpeechbrainGuardDetection:
+    UNPATCHED = ('        if importer_frame is not None and '
+                 'importer_frame.filename.endswith(\n            "/inspect.py"\n        ):\n')
+
+    PATCHED = ('        if importer_frame is not None and '
+               'importer_frame.filename.replace(\n            "\\\\", "/"\n        '
+               ').endswith("/inspect.py"):\n')
+
+    def test_unpatched_source_detected(self):
+        assert cook._sb_guard_patched(self.UNPATCHED) is False
+
+    def test_patched_source_detected(self):
+        assert cook._sb_guard_patched(self.PATCHED) is True
