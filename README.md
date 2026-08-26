@@ -42,7 +42,7 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 
 | Command | What it does | Replaces (manual steps) |
 |---|---|---|
-| `cook doctor` | Check environment (ffmpeg/node/yt-dlp/whisperx/torch+CUDA) | Skill's "Environment reuse" prose |
+| `cook doctor` | Check environment (ffmpeg/node/yt-dlp/whisperx/torch+CUDA/speechbrain Windows-guard) | Skill's "Environment reuse" prose |
 | `cook download <url>` | yt-dlp download + cookie negotiation + thumbnail rename + ffprobe verify | video-download Steps 1-3 |
 | `cook extract <root> <name>` | ffmpeg 16kHz mono WAV extraction | video-subtitle Step 1 |
 | `cook transcribe <root> <name>` | whisperX transcription, auto-detects CUDA, foreground by default (`--detach` opts out) | video-subtitle Step 2 |

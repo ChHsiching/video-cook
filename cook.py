@@ -1863,6 +1863,16 @@ def cmd_dub_burn(args: argparse.Namespace) -> None:
     in dubbed/_full/ — the recovery path after a Gate C fix edited
     dubbing.bilingual.srt or the merged SRTs by hand (regenerating would wipe
     those edits). The ASS is still rebuilt from the on-disk bilingual SRT."""
+    if getattr(args, "keep_subs", False):
+        # The flag is honored by full_dub.py, resolved from the INSTALLED
+        # video-dubbing skill — which may still be an older copy that ignores
+        # extra argv and silently regenerates (wiping the hand edits the
+        # flag exists to protect). Probe before burning anything.
+        script_src = Path(_find_dub_script()).read_text(encoding="utf-8", errors="replace")
+        if "keep_subs" not in script_src:
+            _die("--keep-subs needs a full_dub.py that supports it — the installed "
+                 "video-dubbing skill is older. Update it "
+                 "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.")
     _run_dub_stage("burn", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
