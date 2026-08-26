@@ -407,17 +407,19 @@ def cmd_download(args: argparse.Namespace) -> None:
     redirect, no yt-dlp print_to_file — both have silently eaten output),
     renames the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
     internally rather than asking the agent to drive it.
+    A bad CLI value should fail before any dependency is touched, so the
+    quality sanity check sits above the import/ffmpeg gates.
     """
+    if args.quality is not None and args.quality < 120:
+        _die(f"--quality {args.quality} is not a sane height cap (expect >= 120); "
+             "pass e.g. --quality 1080", obj={"stage": "download"})
+
     try:
         import yt_dlp
     except ImportError:
         _die("yt-dlp not installed. Run: pip install video-cook[download]")
 
     _require_ffmpeg()  # needed to merge separate video/audio streams + ffprobe verify
-
-    if args.quality is not None and args.quality < 120:
-        _die(f"--quality {args.quality} is not a sane height cap (expect >= 120); "
-             "pass e.g. --quality 1080", obj={"stage": "download"})
 
     url = args.url
     cwd = Path.cwd()
