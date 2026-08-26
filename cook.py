@@ -1048,7 +1048,7 @@ def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
 
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
-                   log_name: str | None = None) -> None:
+                   log_name: str | None = None, extra_args: list[str] | None = None) -> None:
     """Run one full_dub.py stage as a subprocess under the chosen interpreter.
 
     This is the fix for the IndexTTS2 environment split: full_dub.py needs
@@ -1076,7 +1076,7 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [py_bin, str(script), stage, str(root), name]
+    cmd = [py_bin, str(script), stage, str(root), name] + (extra_args or [])
     label = f"cook dub {stage}"
     _log(f"{label}: stage={stage} python={py_bin} ({'detached' if detach else 'foreground'})")
 
@@ -1857,9 +1857,15 @@ def cmd_dub_retime(args: argparse.Namespace) -> None:
 def cmd_dub_burn(args: argparse.Namespace) -> None:
     """Stage 4: concat segments + place audio + generate subtitles (shorten +
     merge-short + ass) + burn into cooked/<name>.dubbed.mp4. Also copies the
-    upload subtitle to cloud-srt/zh.dub.srt."""
+    upload subtitle to cloud-srt/zh.dub.srt.
+
+    --keep-subs skips the subtitle regeneration and reuses the files already
+    in dubbed/_full/ — the recovery path after a Gate C fix edited
+    dubbing.bilingual.srt or the merged SRTs by hand (regenerating would wipe
+    those edits). The ASS is still rebuilt from the on-disk bilingual SRT."""
     _run_dub_stage("burn", args.output_root, args.name,
-                   python=getattr(args, "python", None))
+                   python=getattr(args, "python", None),
+                   extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
@@ -2046,6 +2052,10 @@ def build_parser() -> argparse.ArgumentParser:
     pdbn = dub_sub.add_parser("burn",
                               help="Stage 4: concat + audio + subtitles + burn → cooked/<name>.dubbed.mp4")
     _add_dub_common(pdbn)
+    pdbn.add_argument("--keep-subs", dest="keep_subs", action="store_true",
+                      help="Skip subtitle regeneration and reuse the files in "
+                           "dubbed/_full/ (recovery after editing them by hand); "
+                           "the ASS is still rebuilt from the on-disk bilingual SRT")
     pdbn.set_defaults(func=cmd_dub_burn)
 
     pdfl = dub_sub.add_parser("full",
