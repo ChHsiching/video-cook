@@ -1864,7 +1864,8 @@ def cmd_dub_burn(args: argparse.Namespace) -> None:
     upload subtitle to cloud-srt/zh.dub.srt.
 
     --keep-subs skips the subtitle regeneration and reuses the files already
-    in dubbed/_full/ — the recovery path after a Gate C fix edited
+    in dubbed/_full/ — the recovery path after a post-burn quality-gate fix
+    (dubbing SKILL.md Step 7) edited
     dubbing.bilingual.srt or the merged SRTs by hand (regenerating would wipe
     those edits). The ASS is still rebuilt from the on-disk bilingual SRT."""
     if getattr(args, "keep_subs", False):

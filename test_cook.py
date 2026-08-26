@@ -1001,3 +1001,27 @@ class TestSpeechbrainGuardDetection:
 
     def test_patched_source_detected(self):
         assert cook._sb_guard_patched(self.PATCHED) is True
+
+
+class TestQualityGuardR2:
+    """0.6.1 round-2 additions: the early sanity guard and the height
+    warning must BOTH exist (an editing accident once replaced the latter)."""
+
+    def test_early_guard_rejects_below_120(self, tmp_path):
+        args = type("A", (), {"url": "https://x", "quality": 119,
+                              "cookies": None, "cookies_from_browser": None,
+                              "author": None, "name": None})()
+        import io, contextlib
+        import pytest as _pytest
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with _pytest.raises(SystemExit) as ei:
+                cook.cmd_download(args)
+        assert ei.value.code != 0
+        report = json.loads(buf.getvalue())
+        assert report["ok"] is False and "sane height cap" in report["error"]
+
+    def test_both_quality_checks_exist_in_source(self):
+        src = Path(cook.__file__).read_text(encoding="utf-8")
+        assert "args.quality < 120" in src            # early sanity guard
+        assert "args.quality + 1" in src              # post-download compare
