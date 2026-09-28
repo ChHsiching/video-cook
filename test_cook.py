@@ -609,9 +609,7 @@ class TestDubStagePrerequisites:
         })()
         cmd = {
             "synth": cook.cmd_dub_synth,
-            "timeline": cook.cmd_dub_timeline,
-            "retime": cook.cmd_dub_retime,
-            "burn": cook.cmd_dub_burn,
+            "assemble": cook.cmd_dub_assemble,
         }[stage]
         with contextlib.redirect_stdout(buf):
             try:
@@ -654,61 +652,22 @@ class TestDubStagePrerequisites:
         assert self.last_exit == 1
         assert "ref.wav" in report["error"]
 
-    # -- timeline: needs dubbed/_full/_segments/ with at least one .wav
+    # -- assemble: needs dubbed/_full/_segments/ with at least one .wav
 
-    def test_timeline_fails_when_segments_dir_missing(self, tmp_path: Path):
+    def test_assemble_fails_when_segments_dir_missing(self, tmp_path: Path):
         root = tmp_path / "vid"
         # _segments/ dir not created at all
-        report = self._run_stage(root, "timeline")
+        report = self._run_stage(root, "assemble")
         assert self.last_exit == 1
         assert report["ok"] is False
         assert "_segments" in report["error"]
 
-    def test_timeline_fails_when_segments_dir_empty(self, tmp_path: Path):
+    def test_assemble_fails_when_segments_dir_empty(self, tmp_path: Path):
         root = tmp_path / "vid"
         self._touch(root / "dubbed" / "_full" / "_segments" / ".keep")  # no .wav
-        report = self._run_stage(root, "timeline")
+        report = self._run_stage(root, "assemble")
         assert self.last_exit == 1
         assert "_segments" in report["error"]
-
-    # -- retime: needs dubbed/_full/timeline.json
-
-    def test_retime_fails_when_timeline_missing(self, tmp_path: Path):
-        root = tmp_path / "vid"
-        # timeline.json NOT staged
-        report = self._run_stage(root, "retime")
-        assert self.last_exit == 1
-        assert report["ok"] is False
-        assert "timeline.json" in report["error"]
-
-    def test_retime_fails_when_timeline_empty(self, tmp_path: Path):
-        root = tmp_path / "vid"
-        self._touch(root / "dubbed" / "_full" / "timeline.json", content=b"")
-        report = self._run_stage(root, "retime")
-        assert self.last_exit == 1
-        assert "timeline.json" in report["error"]
-
-    # -- burn: needs timeline.json (from timeline) + _vsegs/ (from retime)
-    # video_adjusted.mp4 and dub.wav are NOT prereqs — burn produces them itself
-    # (Stage 4: 4a concats vsegs -> video_adjusted.mp4, 4b builds dub.wav).
-
-    def test_burn_fails_when_timeline_missing(self, tmp_path: Path):
-        root = tmp_path / "vid"
-        self._touch(root / "dubbed" / "_full" / "_vsegs" / "v_0000.mp4")
-        # timeline.json NOT staged
-        report = self._run_stage(root, "burn")
-        assert self.last_exit == 1
-        assert report["ok"] is False
-        assert "timeline.json" in report["error"]
-
-    def test_burn_fails_when_vsegs_missing(self, tmp_path: Path):
-        root = tmp_path / "vid"
-        self._touch(root / "dubbed" / "_full" / "timeline.json")
-        # _vsegs/ NOT staged
-        report = self._run_stage(root, "burn")
-        assert self.last_exit == 1
-        assert report["ok"] is False
-        assert "_vsegs" in report["error"]
 
     # -- error message names the producing command
 
@@ -718,8 +677,8 @@ class TestDubStagePrerequisites:
         # synth stage, both prereqs missing
         report = self._run_stage(root, "synth")
         msg = report["error"]
-        # must mention cook (rerun hint) — covers the "run X" guidance
-        assert "cook dub" in msg or "dub verify" in msg or "cook" in msg, msg
+        # must tell the operator where the missing file comes from
+        assert "Step 3" in msg or "cook dub" in msg, msg
 
     # -- full pipeline inherits checks (first missing prereq aborts)
 

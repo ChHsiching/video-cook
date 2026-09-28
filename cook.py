@@ -995,7 +995,7 @@ def _find_dub_script() -> Path:
 # the detached path) is spawned — so no IndexTTS2/demucs/ffmpeg work begins on
 # a run that would die partway through.
 #
-# Special case: timeline's prerequisite is a DIRECTORY that must contain at
+# Special case: assemble's prerequisite is a DIRECTORY that must contain at
 # least one .wav (the synthesized segments). That is expressed with kind="dir_glob".
 # ----------------------------------------------------------------------------
 
@@ -1009,19 +1009,9 @@ def _dub_prereqs() -> dict:
             {"rel": "dubbed/_reference/ref.wav", "kind": "file",
              "produces": "cook dub separate + the dub-prep step"},
         ],
-        "timeline": [
+        "assemble": [
             {"rel": "dubbed/_full/_segments/", "kind": "dir_glob", "glob": "*.wav",
              "produces": "cook dub synth"},
-        ],
-        "retime": [
-            {"rel": "dubbed/_full/timeline.json", "kind": "file",
-             "produces": "cook dub timeline"},
-        ],
-        "burn": [
-            {"rel": "dubbed/_full/timeline.json", "kind": "file",
-             "produces": "cook dub timeline"},
-            {"rel": "dubbed/_full/_vsegs/", "kind": "dir_glob", "glob": "*.mp4",
-             "produces": "cook dub retime"},
         ],
     }
 
@@ -1064,7 +1054,7 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     subprocess with `--python <venv>/python`, the stage runs in an interpreter
     that CAN import indextts, demucs, and torch.
 
-    synth/timeline/retime/burn are all routed through here so a single
+    synth/assemble are both routed through here so a single
     `cook dub full --python <venv>` runs the whole pipeline in one environment.
 
     Before launching the subprocess, the stage-to-prerequisites mapping is
@@ -1089,11 +1079,11 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     if detach:
         pid = _run_long_task(cmd, cwd=root, log_file=log_file,
                              err_file=err_file, detach=True)["pid"]
-        # full_dub numbers its stages (Stage 1=synth..4=burn) — the marker
+        # full_dub numbers its stages (Stage 1=synth, 2=assemble) — the marker
         # must quote the literal the log actually prints ("Stage 1 DONE:
         # N cues synthesized"), or a poller waits forever on a string that
         # never appears.
-        _STAGE_NUM = {"synth": 1, "timeline": 2, "retime": 3, "burn": 4}
+        _STAGE_NUM = {"synth": 1, "assemble": 2}
         _emit_json({
             "ok": True, "detached": True, "pid": pid, "stage": stage,
             "python": py_bin,
@@ -1679,97 +1669,6 @@ def cmd_dub_separate(args: argparse.Namespace) -> None:
     })
 
 
-def cmd_dub_mix(args: argparse.Namespace) -> None:
-    """Mix the Chinese dub (dub.wav) with the original BGM (no_vocals.wav),
-    then mux into the cooked video. Produces <name>.dubbed.mp4 under dubbed/."""
-    _require_ffmpeg()
-    root = _video_dir(args.output_root)
-    name = args.name
-    dubbed_dir = _dubbed_dir(root)
-
-    dub_wav = dubbed_dir / "dub.wav"
-    no_vocals = dubbed_dir / "no_vocals.wav"
-    # Use the cooked mp4 (with burned subtitles) as the video source.
-    cooked_mp4 = _cooked(root, name, ".cooked.mp4")
-    cooked_bar_mp4 = _cooked(root, name, ".cooked.bar.mp4")
-    video_src = cooked_bar_mp4 if cooked_bar_mp4.exists() and not cooked_mp4.exists() else cooked_mp4
-
-    if not dub_wav.exists():
-        _die(f"dub.wav not found: {dub_wav}. Run dub_audio.py (Step 4) first.")
-    if not no_vocals.exists():
-        _die(f"no_vocals.wav not found: {no_vocals}. Run 'cook dub separate' first.")
-    if not video_src.exists():
-        _die(f"cooked video not found: {video_src}. Run video-subtitle first.")
-
-    out = _dubbed(root, name, ".dubbed.mp4")
-    mixed_wav = dubbed_dir / "_mixed.wav"
-
-    # Detect whether no_vocals.wav actually contains BGM. Measure its RMS level
-    # — if below -50dB, the source video has no background music (pure-talk),
-    # so there's nothing to preserve. Mixing -50dB silence into the dub is a
-    # wasted step that adds nothing audible.
-    bg_rms_db = _measure_rms_db(no_vocals)
-    has_bgm = bg_rms_db > -50.0
-    _log(f"cook dub mix: no_vocals RMS={bg_rms_db:.1f}dB, has_bgm={has_bgm}")
-
-    if has_bgm:
-        # Mix dub + ducked BGM. Convert dB to linear gain. -18dB -> 0.125x.
-        bg_gain = 10 ** (args.bg_gain / 20.0)
-        mix_filter = (
-            f"[0:a]volume=1.0[dub];"
-            f"[1:a]volume={bg_gain:.4f}[bg];"
-            f"[dub][bg]amix=inputs=2:duration=longest:normalize=0[aout]"
-        )
-        r = subprocess.run(
-            ["ffmpeg", "-y",
-             "-i", str(dub_wav),
-             "-i", str(no_vocals),
-             "-filter_complex", mix_filter, "-map", "[aout]",
-             "-ac", "2", "-ar", "44100", str(mixed_wav)],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0 or not mixed_wav.exists():
-            _die(f"ffmpeg mix failed: {r.stderr[-500:]}", {"mixed": str(mixed_wav)})
-    else:
-        # No BGM — use dub.wav directly as the audio track (just resample to
-        # 44100 stereo to match the mux step's expectations).
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(dub_wav),
-             "-ac", "2", "-ar", "44100", str(mixed_wav)],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0 or not mixed_wav.exists():
-            _die(f"ffmpeg dub prep failed: {r.stderr[-500:]}", {"mixed": str(mixed_wav)})
-
-    # Step 2: mux mixed audio into the cooked video (video copied, audio re-encoded to AAC)
-    r = subprocess.run(
-        ["ffmpeg", "-y",
-         "-i", str(video_src),
-         "-i", str(mixed_wav),
-         "-map", "0:v", "-map", "1:a",
-         "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "192k",
-         "-movflags", "+faststart",
-         str(out)],
-        capture_output=True, text=True,
-    )
-    mixed_wav.unlink(missing_ok=True)  # clean up the intermediate
-    if r.returncode != 0 or not out.exists():
-        _die(f"ffmpeg mux failed: {r.stderr[-500:]}", {"out": str(out)})
-
-    raw_dur = _ffprobe_duration(_raw(root, name, ".raw.mp4"))
-    out_dur = _ffprobe_duration(out)
-    _emit_json({
-        "ok": True,
-        "output": str(out.relative_to(root)),
-        "video_source": str(video_src.relative_to(root)),
-        "bg_gain_db": args.bg_gain,
-        "duration": out_dur,
-        "raw_duration": raw_dur,
-        "duration_match": abs(out_dur - raw_dur) < 2.0 if raw_dur > 0 else None,
-    })
-
-
 def cmd_dub_verify(args: argparse.Namespace) -> None:
     """Verify the dubbed/ shipment is complete. Checks files exist and
     durations cross-check. Exit 0 = dub is ready."""
@@ -1787,20 +1686,23 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
         "dub.wav": dubbed_dir / "_full" / "dub.wav",
         "dubbed_mp4": _cooked(root, name, ".dubbed.mp4"),
         "ref.wav": dubbed_dir / "_reference" / "ref.wav",
-        "ref.txt": dubbed_dir / "_reference" / "ref.txt",
+        # ref.txt only exists when extract_reference.py wrote it; the
+        # scan_reference.py path (SKILL.md Step 2) does not produce one.
+        "ref.txt (optional)": dubbed_dir / "_reference" / "ref.txt",
     }
 
     present, missing = [], []
     for label, path in required.items():
+        optional = "optional" in label
         if path.exists() and path.stat().st_size > 0:
             present.append(label)
-        else:
+        elif not optional:
             missing.append(label)
 
     issues = []
     # Cross-check: dubbed.mp4 duration should match raw within 2s
     raw_mp4 = _raw(root, name, ".raw.mp4")
-    dubbed_mp4 = _dubbed(root, name, ".dubbed.mp4")
+    dubbed_mp4 = _cooked(root, name, ".dubbed.mp4")
     if raw_mp4.exists() and dubbed_mp4.exists():
         raw_dur = _ffprobe_duration(raw_mp4)
         dubbed_dur = _ffprobe_duration(dubbed_mp4)
@@ -1828,7 +1730,7 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------------------
-# dub subcommands: synth / timeline / retime / burn / full
+# dub subcommands: synth / assemble / full
 # Thin wrappers over video-dubbing skill's full_dub.py. Each loads the module
 # via importlib and calls the corresponding stage function. Same pattern as
 # cmd_subtitles → subtitles.py.
@@ -1844,61 +1746,56 @@ def cmd_dub_synth(args: argparse.Namespace) -> None:
                    log_name="synth.log")
 
 
-def cmd_dub_timeline(args: argparse.Namespace) -> None:
-    """Stage 2: build the string-of-pearls re-timed timeline.
-    Reads _segments/ + en.full.srt, writes dubbed/_full/timeline.json."""
-    _run_dub_stage("timeline", args.output_root, args.name,
-                   python=getattr(args, "python", None))
-
-
-def cmd_dub_retime(args: argparse.Namespace) -> None:
-    """Stage 3: cut raw video into segments, re-time each (setpts), interpolate
-    slow segments (minterpolate). Produces dubbed/_full/_vsegs/v_NNNN.mp4."""
-    _run_dub_stage("retime", args.output_root, args.name,
-                   python=getattr(args, "python", None),
-                   detach=getattr(args, "detach", False),
-                   log_name="retime.log")
-
-
-def cmd_dub_burn(args: argparse.Namespace) -> None:
-    """Stage 4: concat segments + place audio + generate subtitles (shorten +
-    merge-short + ass) + burn into cooked/<name>.dubbed.mp4. Also copies the
-    upload subtitle to cloud-srt/zh.dub.srt.
+def cmd_dub_assemble(args: argparse.Namespace) -> None:
+    """Stage 2: identity-timeline assembly → cooked/<name>.dubbed.mp4.
+    The video is never re-timed (the dubbed release has exactly the raw
+    duration): each cue's audio is atempo'd into its own original window,
+    cues are placed on the original clock, subtitles are generated on the
+    original clock, and the raw video is burned once (pad + ass + loudnorm).
+    See video-dubbing SKILL.md Step 5.
 
     --keep-subs skips the subtitle regeneration and reuses the files already
     in dubbed/_full/ — the recovery path after a post-burn quality-gate fix
-    (dubbing SKILL.md Step 7) edited
-    dubbing.bilingual.srt or the merged SRTs by hand (regenerating would wipe
-    those edits). The ASS is still rebuilt from the on-disk bilingual SRT."""
+    (dubbing SKILL.md Step 5) edited dubbing.bilingual.srt or the merged
+    SRTs by hand (regenerating would wipe those edits). The ASS is still
+    rebuilt from the on-disk bilingual SRT."""
     if getattr(args, "keep_subs", False):
         # The flag is honored by full_dub.py, resolved from the INSTALLED
         # video-dubbing skill — which may still be an older copy that ignores
         # extra argv and silently regenerates (wiping the hand edits the
-        # flag exists to protect). Probe before burning anything.
+        # flag exists to protect). Probe before assembling anything.
         script_src = Path(_find_dub_script()).read_text(encoding="utf-8", errors="replace")
         if "keep_subs" not in script_src:
             _die("--keep-subs needs a full_dub.py that supports it — the installed "
                  "video-dubbing skill is older. Update it "
                  "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.",
-                 obj={"stage": "burn", "flag": "--keep-subs"})
-    _run_dub_stage("burn", args.output_root, args.name,
+                 obj={"stage": "assemble", "flag": "--keep-subs"})
+    _run_dub_stage("assemble", args.output_root, args.name,
                    python=getattr(args, "python", None),
+                   detach=getattr(args, "detach", False),
+                   log_name="assemble.log",
                    extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
-    """Run all four stages in sequence: synth → timeline → retime → burn.
+    """Run both stages in sequence: synth → assemble.
     Use for a fresh run; resume by running individual stages (cache-aware).
-    synth/retime are the long stages (CPU-bound); detach applies to them."""
+    synth is the long CPU-bound stage; the assemble encode is the other slow one.
+    --detach is rejected here: a detached synth returns immediately, and the
+    assemble prerequisite check (segments must exist) would _die while synth
+    is still running detached — detach the individual stages instead."""
     py = getattr(args, "python", None)
     detach = getattr(args, "detach", False)
-    # synth and retime honor detach (the long stages); timeline/burn are fast.
+    if detach:
+        _die("cook dub full does not support --detach (assemble's prerequisite "
+             "check would fail while synth is still running detached). Run "
+             "'cook dub synth --detach' first, then 'cook dub assemble' when "
+             "the segments are complete.",
+             obj={"stage": "full", "flag": "--detach"})
     _run_dub_stage("synth", args.output_root, args.name, python=py,
                    detach=detach, log_name="synth.log")
-    _run_dub_stage("timeline", args.output_root, args.name, python=py)
-    _run_dub_stage("retime", args.output_root, args.name, python=py,
-                   detach=detach, log_name="retime.log")
-    _run_dub_stage("burn", args.output_root, args.name, python=py)
+    _run_dub_stage("assemble", args.output_root, args.name, python=py,
+                   detach=detach, log_name="assemble.log")
 
 
 # ============================================================================
@@ -2010,8 +1907,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Demucs vocal separation → dubbed/{vocals,no_vocals}.wav")
     pds.add_argument("output_root")
     pds.add_argument("name")
-    pds.add_argument("--model", default="htdemucs_ft",
-                     help="demucs model (default htdemucs_ft; htdemucs is faster, ~1dB worse)")
+    pds.add_argument("--model", default="htdemucs",
+                     help="demucs model (default htdemucs; htdemucs_ft is ~1dB better but a 4-model bag needing ~20GB RAM — OOMs on 32GB machines)")
     pds.add_argument("--shifts", type=int, default=1,
                      help="number of random shifts for artifact reduction (default 1)")
     pds.add_argument("--overlap", type=float, default=0.5,
@@ -2023,24 +1920,16 @@ def build_parser() -> argparse.ArgumentParser:
                           "Foreground mode auto-moves the separated stems to dubbed/.")
     pds.set_defaults(func=cmd_dub_separate)
 
-    pdm = dub_sub.add_parser("mix",
-                             help="mix Chinese dub + original BGM, mux into cooked video")
-    pdm.add_argument("output_root")
-    pdm.add_argument("name")
-    pdm.add_argument("--bg-gain", type=float, default=-18.0,
-                     help="background music gain in dB (default -18; raise for louder BGM)")
-    pdm.set_defaults(func=cmd_dub_mix)
-
     pdv = dub_sub.add_parser("verify",
                              help="verify the dubbed/ shipment is complete")
     pdv.add_argument("output_root")
     pdv.add_argument("name")
     pdv.set_defaults(func=cmd_dub_verify)
 
-    # New pipeline (IndexTTS2 + bi-directional re-timing). Thin wrappers over
+    # Identity-timeline pipeline (IndexTTS2). Thin wrappers over
     # video-dubbing skill's full_dub.py — loaded via importlib at call time.
     # Helper: every dub stage needs --python (for the indextts/demucs venv).
-    # The long stages (synth, retime, and full which runs them) also get --detach.
+    # The long stages (synth, assemble, and full which runs them) also get --detach.
     def _add_dub_common(parser, with_detach=False):
         parser.add_argument("output_root")
         parser.add_argument("name")
@@ -2057,27 +1946,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dub_common(pdsyn, with_detach=True)
     pdsyn.set_defaults(func=cmd_dub_synth)
 
-    pdtl = dub_sub.add_parser("timeline",
-                              help="Stage 2: string-of-pearls timeline → dubbed/_full/timeline.json")
-    _add_dub_common(pdtl)
-    pdtl.set_defaults(func=cmd_dub_timeline)
-
-    pdrt = dub_sub.add_parser("retime",
-                              help="Stage 3: video segments + minterpolate → dubbed/_full/_vsegs/")
-    _add_dub_common(pdrt, with_detach=True)
-    pdrt.set_defaults(func=cmd_dub_retime)
-
-    pdbn = dub_sub.add_parser("burn",
-                              help="Stage 4: concat + audio + subtitles + burn → cooked/<name>.dubbed.mp4")
-    _add_dub_common(pdbn)
-    pdbn.add_argument("--keep-subs", dest="keep_subs", action="store_true",
+    pdas = dub_sub.add_parser("assemble",
+                              help="Stage 2: identity assembly (video never re-timed) → "
+                                   "cooked/<name>.dubbed.mp4")
+    _add_dub_common(pdas, with_detach=True)
+    pdas.add_argument("--keep-subs", dest="keep_subs", action="store_true",
                       help="Skip subtitle regeneration and reuse the files in "
                            "dubbed/_full/ (recovery after editing them by hand); "
                            "the ASS is still rebuilt from the on-disk bilingual SRT")
-    pdbn.set_defaults(func=cmd_dub_burn)
+    pdas.set_defaults(func=cmd_dub_assemble)
 
     pdfl = dub_sub.add_parser("full",
-                              help="Run all 4 stages: synth → timeline → retime → burn")
+                              help="Run both stages: synth → assemble")
     _add_dub_common(pdfl, with_detach=True)
     pdfl.set_defaults(func=cmd_dub_full)
 
