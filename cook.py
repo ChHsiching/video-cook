@@ -1749,7 +1749,8 @@ def cmd_dub_synth(args: argparse.Namespace) -> None:
 def cmd_dub_assemble(args: argparse.Namespace) -> None:
     """Stage 2: identity-timeline assembly → cooked/<name>.dubbed.mp4.
     The video is never re-timed (the dubbed release has exactly the raw
-    duration): each cue's audio is atempo'd into its own original window,
+    duration): audio over its window is compressed to fit, audio shorter
+    keeps its natural pace (never stretched);
     cues are placed on the original clock, subtitles are generated on the
     original clock, and the raw video is burned once (pad + ass + loudnorm).
     See video-dubbing SKILL.md Step 5.
