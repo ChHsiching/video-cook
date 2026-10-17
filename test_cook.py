@@ -1883,7 +1883,8 @@ class TestSynthWorkerStage:
         out = []
         for c in calls:
             if c[0] == "infer":
-                out.append(int(re.search(r"sent_(\d{4})\.wav", c[2]).group(1)))
+                m = re.search(r"sent_(\d{4})", c[2])  # temp names are .tmp-sent_0001-xxxx.wav
+                out.append(int(m.group(1)))
         return out
 
     def test_supervisor_path_unchanged_full_ascending(self, tmp_path, monkeypatch, _restore_sys_path):
@@ -2037,15 +2038,15 @@ class TestSynthAtomicPublish:
         assert len(calls) == 3
         for _text, path in ((c[1], c[2]) for c in calls):
             name = Path(path).name
-            assert name.endswith(".part"), \
+            assert name.endswith(".wav") and ".tmp-" in name, \
                 f"infer wrote a non-temp path: {path}"
             # same-dir sibling of some sent_NNNN.wav (os.replace atomicity
             # precondition) with the final name as its prefix
-            assert name.startswith("sent_") and ".wav.tmp" in name, path
+            assert name.startswith(".tmp-sent_"), path
             assert Path(path).parent == segs, path
         for i in (1, 2, 3):
             self._assert_complete_wav(segs / f"sent_{i:04d}.wav", 2205)
-        assert list(segs.glob("*.part")) == []
+        assert list(segs.glob(".tmp-*")) == []
 
     def test_chunked_long_cue_concats_via_temp_sibling_too(
             self, tmp_path, monkeypatch, _restore_sys_path):
@@ -2075,16 +2076,16 @@ class TestSynthAtomicPublish:
         chunk_calls = [c for c in _fake_tts_calls(pkg) if c[0] == "infer"]
         assert len(chunk_calls) >= 2, "100-char line must chunk"
         for c in chunk_calls:
-            assert Path(c[2]).name.endswith(".part"), \
+            assert Path(c[2]).name.endswith(".wav") and ".tmp-" in c[2], \
                 f"chunk infer wrote a non-temp path: {c[2]}"
             assert Path(c[2]).parent.name == "_chunkcache", c[2]
         assert len(concat_dsts) == 1
-        assert concat_dsts[0].name.endswith(".part"), \
+        assert concat_dsts[0].name.endswith(".wav") and ".tmp-" in concat_dsts[0].name, \
             f"concat wrote a non-temp path: {concat_dsts[0]}"
         work = root / "dubbed" / "_full"
         self._assert_complete_wav(
             work / "_segments" / "sent_0001.wav", 2205 * len(chunk_calls))
-        assert list(work.rglob("*.part")) == []
+        assert list(work.rglob(".tmp-*")) == []
 
     def test_concurrent_writers_never_expose_a_partial_file(
             self, tmp_path, monkeypatch, _restore_sys_path):
@@ -2162,7 +2163,7 @@ class TestSynthAtomicPublish:
             # writer's replace landed last — both wrote complete files)
             with contextlib.closing(wave.open(str(final), "rb")) as w:
                 assert w.getnframes() in (4410, 6615)
-            assert list(final.parent.glob("*.part")) == []
+            assert list(final.parent.glob(".tmp-*")) == []
         finally:
             st["go"].set()
             del builtins._synth_race_state
@@ -4101,3 +4102,23 @@ class TestDubGateContract:
         with pytest.raises(SystemExit) as ei:
             p.parse_args(["dub", "gate", "r", "n", "--rate", "fast"])
         assert ei.value.code != 0
+
+
+class TestPublishTmpSuffix:
+    """Regression: the atomic-publish temp file must keep dst's real
+    suffix (torchaudio infers format from extension — a .part tmp died
+    with "Unsupported format" in the sample90 clip integration run) and
+    must not start with dst's cue prefix (chunk-cache startswith globs
+    would count a lingering temp as a finished chunk)."""
+
+    def test_tmp_keeps_dst_suffix_and_neutral_prefix(self, tmp_path, monkeypatch):
+        mod, _ = _load_full_dub(tmp_path, monkeypatch)
+        dst = tmp_path / "c0009_00.wav"
+        seen = {}
+        def produce(tmp):
+            seen["name"] = Path(tmp).name
+            tmp.write_bytes(b"x" * 2048)
+        mod._publish(dst, produce)
+        assert seen["name"].endswith(".wav")
+        assert not seen["name"].startswith("c0009_")
+        assert dst.read_bytes() == b"x" * 2048

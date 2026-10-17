@@ -230,8 +230,16 @@ def _publish(dst: Path, produce) -> None:
     fails while ANY handle holds dst open (antivirus scans, a concurrent
     skip-check stat, an indexer) — a transient condition, not a rival
     writer, so waiting it out preserves liveness."""
+    # tmp must KEEP dst's real suffix: tts.infer bottoms out in
+    # torchaudio.save, which infers the audio format from the file
+    # extension — a ".part"/".tmpXXXX" suffix dies with
+    # "Unsupported format" (caught by the sample90 clip integration
+    # run, invisible to the fake-TTS unit doubles). And the tmp prefix
+    # must NOT start with dst's cue prefix (e.g. "c0009_"), or a
+    # concurrent writer's startswith-glob over the chunk cache counts
+    # the temp file as a finished chunk.
     fd, tmp_name = tempfile.mkstemp(
-        dir=str(dst.parent), prefix=f"{dst.name}.tmp", suffix=".part")
+        dir=str(dst.parent), prefix=f".tmp-{dst.stem}-", suffix=dst.suffix)
     os.close(fd)
     tmp = Path(tmp_name)
     try:
