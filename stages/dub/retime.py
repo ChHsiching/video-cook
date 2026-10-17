@@ -42,8 +42,12 @@ The chain (calibrated bit-exact against the leerob r12 accepted output):
 The rewritten file's ORIGINAL is backed up next to it as
 dubbing.bilingual.srt.pre_retime before any write.
 
-Usage (called by `cook dub retime`; the model runs in the --python env):
-  python retime.py retime <output-root> <name>
+Usage:
+  python retime.py retime <output-root> <name>     # standalone: `cook dub retime`
+  stage_assemble imports this module and calls stage_retime() in-process
+  (ticket 09: retime is the DEFAULT assembly behavior — see ADR 0002);
+  the model loads lazily inside fw_transcriber, in whichever interpreter
+  is running the stage (the --python env for the cook-launched paths).
 
 Resource rules: exactly one small/int8/cpu model instance, files
 transcribed strictly serially, and nothing larger than a cue pad wav is
@@ -292,6 +296,18 @@ def build_stream(zh_cues: list[dict], char_maps: list[list[float] | None],
 # --------------------------------------------------------------------------
 # Transcription (the only non-pure part; the model lives behind this seam)
 # --------------------------------------------------------------------------
+
+def fw_available() -> bool:
+    """True when faster-whisper is importable in THIS interpreter — the
+    probe the assemble integration (ticket 09) consults to decide between
+    running retime and degrading to the old proportional-split behavior.
+    Importing the package is cheap; the model only loads in fw_transcriber."""
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
 
 def fw_transcriber():
     """Return transcribe(wav_path) -> [(start, end, word), ...].

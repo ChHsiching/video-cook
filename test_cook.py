@@ -3066,6 +3066,349 @@ class TestRetimeCLIMissingFasterWhisper:
         assert "00:00:09,000 --> 00:00:12,000" in (
             work / "dubbing.bilingual.srt").read_text(encoding="utf-8")
         assert not (work / "dubbing.bilingual.srt.pre_retime").exists()
+
+
+class TestRetimeFwAvailable:
+    """fw_available: the import probe the assemble integration (ticket 09)
+    consults to decide between running retime and degrading to the old
+    proportional-split behavior. Pure sys.modules probing — no model."""
+
+    def test_true_when_importable(self, monkeypatch):
+        import types
+        mod = _load_retime()
+        fake_fw = types.ModuleType("faster_whisper")
+        monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+        assert mod.fw_available() is True
+
+    def test_false_when_missing(self, monkeypatch):
+        # sys.modules[name] = None makes `import name` raise ImportError
+        mod = _load_retime()
+        monkeypatch.setitem(sys.modules, "faster_whisper", None)
+        assert mod.fw_available() is False
+
+
+# ----------------------------------------------------------------------------
+# assemble auto-retime (ticket 09): retime is the DEFAULT assembly behavior
+# (ADR 0002) — the bilingual SRT's starts are rewritten onto the dubbed
+# speech's real word times between biliteral and the ASS build. All external
+# effects are faked: ffmpeg/ffprobe never execute (fake subprocess.run), the
+# retime module is an injected double (no model, no real faster-whisper).
+# ----------------------------------------------------------------------------
+
+def _bump_srt_ts(ts: str, by: float = 1.0) -> str:
+    """SRT timestamp + `by` seconds at ms resolution — the fake retime's
+    visible fingerprint on the rewritten bilingual SRT."""
+    h, m, sec = ts.replace(",", ".").split(":")
+    t = int(h) * 3600 + int(m) * 60 + float(sec) + by
+    ms = int(round(t * 1000))
+    hh, ms = divmod(ms, 3600000)
+    mm, ms = divmod(ms, 60000)
+    ss, ms = divmod(ms, 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
+class TestAssembleAutoRetime:
+    """stage_assemble orchestration: default path runs retime (marker
+    "applied", ASS built from the RETIMED file); --no-retime and a missing
+    faster-whisper fall back to the old behavior; --keep-subs never retimes
+    (on-disk subtitle hand edits must survive)."""
+
+    RAW_DUR = 22.2
+
+    @staticmethod
+    def _write_silence(path: Path, dur: float) -> None:
+        import contextlib
+        import wave
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(wave.open(str(path), "wb")) as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(b"\x00" * (int(dur * 22050) * 2))
+
+    def _video(self, tmp_path: Path) -> Path:
+        """2 cues (10-12s, 20-22s), 0.2s synthesized takes each — windows are
+        generous so the fit pass never needs ffmpeg."""
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "English cue one"),
+            (2, "00:00:20,000 --> 00:00:22,000", "English cue two"),
+        ])
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["这是第一句配音", "这是第二句配音"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        segs.mkdir(parents=True, exist_ok=True)
+        for i in (1, 2):
+            self._write_silence(segs / f"sent_{i:04d}.wav", 0.2)
+        return root
+
+    def _fake_subprocess(self):
+        """ffmpeg apad -> REAL stdlib-wave silence of in_dur+pad (the clock
+        math then lands dub.wav exactly on RAW_DUR); the final encode just
+        touches its output; ffprobe answers from canned stdout."""
+        import contextlib
+        import types
+        import wave
+        RAW = self.RAW_DUR
+
+        def run(cmd, capture_output=True, text=True, **kw):
+            if cmd[0] == "ffprobe":
+                out = "1920x1080\n" if "stream=width,height" in cmd else f"{RAW}\n"
+                return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+            if any(str(a).startswith("apad=pad_dur=") for a in cmd):
+                af = next(str(a) for a in cmd if str(a).startswith("apad="))
+                pad = float(af.rsplit("=", 1)[1])
+                src = cmd[cmd.index("-i") + 1]
+                with contextlib.closing(wave.open(str(src), "rb")) as w:
+                    d = w.getnframes() / float(w.getframerate())
+                self._write_silence(Path(cmd[-1]), d + pad)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[-1]).write_bytes(b"fake mp4")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return run
+
+    def _fake_retime_mod(self, available: bool = True):
+        class _FakeRetime:
+            """Test double of stages/dub/retime.py: records the in-process
+            call and rewrites the bilingual SRT starts +1s (the fingerprint
+            the ASS must then carry)."""
+
+            def __init__(s):
+                s.calls = []
+                s.available = available
+
+            def fw_available(s):
+                return s.available
+
+            def stage_retime(s, root, name, transcriber=None):
+                s.calls.append((str(Path(root).resolve()), name))
+                srt = Path(root) / "dubbed" / "_full" / "dubbing.bilingual.srt"
+                text = srt.read_text(encoding="utf-8")
+                text = re.sub(r"(\d{2}:\d{2}:\d{2},\d{3}) -->",
+                              lambda m: _bump_srt_ts(m.group(1)) + " -->", text)
+                srt.write_text(text, encoding="utf-8")
+                return {"ok": True, "anchors": 2, "dwells": 0,
+                        "kept_input": 0, "maps_rejected": 0}
+
+        return _FakeRetime()
+
+    def _run(self, tmp_path, monkeypatch, no_retime=False, keep_subs=False,
+             fw_available=True):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        fake_rt = self._fake_retime_mod(available=fw_available)
+        monkeypatch.setattr(mod, "_import_retime_module", lambda: fake_rt)
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_assemble(str(root), "video", keep_subs=keep_subs,
+                               no_retime=no_retime)
+        return root, buf.getvalue(), fake_rt
+
+    def _marker(self, root: Path) -> dict:
+        return json.loads(
+            (root / "dubbed" / "_full" / "_assemble_retime.json")
+            .read_text(encoding="utf-8"))
+
+    def _ass(self, root: Path) -> str:
+        return (root / "dubbed" / "_full" / "dubbing.cooked.ass"
+                ).read_text(encoding="utf-8")
+
+    def test_default_runs_retime_before_ass_build(self, tmp_path, monkeypatch):
+        """Default path: retime runs in-process exactly once, and the ASS is
+        built from the RETIMED bilingual SRT (fake bumps every start +1s:
+        10.0/20.0 -> 11.0/21.0) — the rewrite sits between biliteral and the
+        ASS build."""
+        root, out, fake_rt = self._run(tmp_path, monkeypatch)
+        assert fake_rt.calls == [(str(root.resolve()), "video")]
+        marker = self._marker(root)
+        assert marker["retime"] == "applied"
+        ass = self._ass(root)
+        assert "0:00:11.00" in ass and "0:00:21.00" in ass
+        assert "0:00:10.00" not in ass
+        assert "Stage 2 DONE" in out
+
+    def test_no_retime_keeps_old_behavior(self, tmp_path, monkeypatch):
+        """--no-retime: retime is NOT called and the product is the old
+        implementation's — the ASS carries the original proportional-split
+        starts (10.0/20.0), with the opt-out warning in the log."""
+        root, out, fake_rt = self._run(tmp_path, monkeypatch, no_retime=True)
+        assert fake_rt.calls == []
+        assert self._marker(root)["retime"] == "skipped"
+        ass = self._ass(root)
+        assert "0:00:10.00" in ass and "0:00:20.00" in ass
+        assert "0:00:11.00" not in ass
+        assert "字幕按比例摊开（旧行为），长句可能漂移" in out
+
+    def test_missing_fw_degrades_with_explicit_warning(self, tmp_path, monkeypatch):
+        """faster-whisper not importable in the running interpreter: retime
+        is skipped, the old behavior ships, and the log carries the explicit
+        degraded warning naming the old behavior and its drift risk."""
+        root, out, fake_rt = self._run(tmp_path, monkeypatch, fw_available=False)
+        assert fake_rt.calls == []
+        marker = self._marker(root)
+        assert marker["retime"] == "degraded"
+        assert "faster-whisper" in marker["reason"]
+        assert "0:00:10.00" in self._ass(root)
+        assert "字幕按比例摊开（旧行为），长句可能漂移" in out
+        assert "DEGRADED" in out
+
+    def test_keep_subs_never_retimes(self, tmp_path, monkeypatch):
+        """--keep-subs reuses on-disk subtitle files that may hold hand
+        edits — retime must not rewrite them (marker skipped, reason names
+        the recovery path)."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        work = root / "dubbed" / "_full"
+        _make_srt(work / "dubbing.merged.srt",
+                  [(1, "00:00:10,000 --> 00:00:12,000", "手改中文字幕")])
+        _make_srt(work / "dubbing.en.merged.srt",
+                  [(1, "00:00:10,000 --> 00:00:12,000", "hand-edited en")])
+        _make_srt(work / "dubbing.bilingual.srt",
+                  [(1, "00:00:10,000 --> 00:00:12,000", "手改中文字幕\nhand-edited en")])
+        fake_rt = self._fake_retime_mod()
+        monkeypatch.setattr(mod, "_import_retime_module", lambda: fake_rt)
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            mod.stage_assemble(str(root), "video", keep_subs=True)
+        assert fake_rt.calls == []
+        marker = self._marker(root)
+        assert marker["retime"] == "skipped"
+        assert "--keep-subs" in marker["reason"]
+        # the hand-edited file survives verbatim
+        assert "手改中文字幕" in (work / "dubbing.bilingual.srt").read_text(
+            encoding="utf-8")
+        assert "Stage 2 DONE" in buf.getvalue()
+
+
+class TestAssembleRetimeCLI:
+    """full_dub.py's own CLI: the `--no-retime` argv cook passes through must
+    reach stage_assemble (default off = retime on), and the flag is legal on
+    the assemble stage only — same contract as --keep-subs."""
+
+    def _capture(self, tmp_path, monkeypatch, argv):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        recorded = {}
+
+        def fake_assemble(root, name, keep_subs=False, no_retime=False):
+            recorded.update(no_retime=no_retime, keep_subs=keep_subs)
+
+        monkeypatch.setattr(mod, "stage_assemble", fake_assemble)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod._cli_main(argv)
+        return recorded
+
+    def test_cli_no_retime_flag_reaches_stage(self, tmp_path, monkeypatch):
+        rec = self._capture(tmp_path, monkeypatch,
+                            ["assemble", str(tmp_path), "video", "--no-retime"])
+        assert rec["no_retime"] is True
+
+    def test_cli_default_is_retime_on(self, tmp_path, monkeypatch):
+        rec = self._capture(tmp_path, monkeypatch,
+                            ["assemble", str(tmp_path), "video"])
+        assert rec["no_retime"] is False
+
+    def test_cli_flag_combinable_with_keep_subs(self, tmp_path, monkeypatch):
+        rec = self._capture(tmp_path, monkeypatch,
+                            ["assemble", str(tmp_path), "video",
+                             "--keep-subs", "--no-retime"])
+        assert rec["no_retime"] is True and rec["keep_subs"] is True
+
+    def test_cli_no_retime_rejected_outside_assemble(self, tmp_path, monkeypatch):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        for stage in ("synth", "full"):
+            with pytest.raises(SystemExit) as ei:
+                mod._cli_main([stage, str(tmp_path), "video", "--no-retime"])
+            assert ei.value.code != 0
+
+
+class TestCookAssembleRetimeSurface:
+    """cook dub assemble command surface (ticket 09): --no-retime reaches
+    full_dub.py's subprocess argv (default argv carries no flag = retime
+    on), and the JSON result carries the retime state full_dub wrote to
+    dubbed/_full/_assemble_retime.json — applied / degraded / skipped."""
+
+    def _run_cmd(self, monkeypatch, tmp_path, no_retime=False, marker=None,
+                 keep_subs=False):
+        root = tmp_path / "vid"
+        for rel in ("transcript/translations_dub.txt",
+                    "dubbed/_reference/ref.wav",
+                    "dubbed/_full/_segments/sent_0001.wav"):
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x" * 2000)
+        captured = {}
+
+        def fake_run_long_task(cmd, cwd, log_file, err_file, detach=False):
+            captured["cmd"] = cmd
+            if marker is not None:
+                mp = root / "dubbed" / "_full" / "_assemble_retime.json"
+                mp.parent.mkdir(parents=True, exist_ok=True)
+                mp.write_text(json.dumps(marker, ensure_ascii=False),
+                              encoding="utf-8")
+            return {"ok": True, "returncode": 0}
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run_long_task)
+        args = type("A", (), {"output_root": str(root), "name": "video",
+                              "python": None, "detach": False,
+                              "keep_subs": keep_subs,
+                              "no_retime": no_retime})()
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cook.cmd_dub_assemble(args)
+            except SystemExit as e:
+                if e.code not in (0, None):
+                    raise
+        return captured.get("cmd"), json.loads(out.getvalue().strip()), err.getvalue()
+
+    def test_no_retime_flag_reaches_subprocess(self, monkeypatch, tmp_path):
+        cmd, _payload, _err = self._run_cmd(monkeypatch, tmp_path, no_retime=True)
+        assert "--no-retime" in cmd
+
+    def test_default_argv_carries_no_flag(self, monkeypatch, tmp_path):
+        cmd, _payload, _err = self._run_cmd(monkeypatch, tmp_path)
+        assert "--no-retime" not in cmd
+
+    def test_json_carries_applied_state(self, monkeypatch, tmp_path):
+        _cmd, payload, err = self._run_cmd(
+            monkeypatch, tmp_path,
+            marker={"retime": "applied", "reason": None, "anchors": 2})
+        assert payload["retime"] == "applied"
+        assert "retime applied" in err
+
+    def test_json_carries_degraded_state_and_warns(self, monkeypatch, tmp_path):
+        _cmd, payload, err = self._run_cmd(
+            monkeypatch, tmp_path,
+            marker={"retime": "degraded",
+                    "reason": "faster-whisper is not installed"})
+        assert payload["retime"] == "degraded"
+        assert payload["retime_reason"] == "faster-whisper is not installed"
+        # the degradation is visible on stderr too, not only in the JSON
+        assert "retime degraded" in err
+
+    def test_json_carries_skipped_state(self, monkeypatch, tmp_path):
+        _cmd, payload, _err = self._run_cmd(
+            monkeypatch, tmp_path, no_retime=True,
+            marker={"retime": "skipped", "reason": "--no-retime: old behavior"})
+        assert payload["retime"] == "skipped"
+
+    def test_no_marker_leaves_payload_unchanged(self, monkeypatch, tmp_path):
+        """Defensive: no marker file (pre-ticket run / failure) must not
+        fabricate a retime field."""
+        _cmd, payload, _err = self._run_cmd(monkeypatch, tmp_path, marker=None)
+        assert "retime" not in payload
+
+
 # dub gate (ticket 05): the length gate, wired into the cook command surface
 # and driven by the MEASURED speech rate — never an assumed one. The public
 # seam is cmd_dub_gate (argv: output_root/name/--rate/--self-measure/--json).

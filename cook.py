@@ -1243,7 +1243,8 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
                    log_name: str | None = None, extra_args: list[str] | None = None,
                    workers: int = 1, stagger: float = 0.0,
-                   script: str = "full_dub.py") -> None:
+                   script: str = "full_dub.py",
+                   merge_report: str | None = None) -> None:
     """Run one full_dub.py stage as a subprocess under the chosen interpreter.
 
     This is the fix for the IndexTTS2 environment split: full_dub.py needs
@@ -1266,6 +1267,12 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     (synth-worker, descending cue order, self-staggered k*S seconds) before
     the unchanged supervisor subprocess runs in the foreground; exit codes
     aggregate — any non-zero (supervisor or worker) fails the stage.
+
+    merge_report (ticket 09): a JSON file path RELATIVE to the video root
+    that the stage writes while running (e.g. the assemble retime marker).
+    When the stage finished OK and the file exists, its retime state is
+    merged into the emitted payload — the stdout stays a single JSON
+    document carrying the stage's own report.
     """
     if workers < 1:
         _die(f"--workers must be >= 1 (got {workers})",
@@ -1366,6 +1373,17 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     }
     if worker_rows:
         payload["workers"] = worker_rows
+    if merge_report is not None and ok:
+        rp = root / merge_report
+        if rp.is_file():
+            try:
+                rep = json.loads(rp.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                rep = None
+            if rep and "retime" in rep:
+                payload["retime"] = rep["retime"]
+                if rep.get("reason"):
+                    payload["retime_reason"] = rep["reason"]
     _emit_json(payload)
     if not ok:
         failing = "; ".join(
@@ -2036,20 +2054,55 @@ def cmd_dub_assemble(args: argparse.Namespace) -> None:
     original clock, and the raw video is burned once (pad + ass + loudnorm).
     See video-dubbing SKILL.md Step 5.
 
+    Auto-retime (ticket 09, ADR 0002): by default the freshly built
+    bilingual SRT is retimed onto the dubbed speech's real word times
+    (faster-whisper on the clean _audio_pad tracks) BEFORE the ASS build —
+    the default behavior is the correct one, no extra step to remember.
+    --no-retime steps back to the old proportional-split behavior (with a
+    warning); a missing faster-whisper in the --python env degrades the
+    same way with an explicit warning. The JSON result carries
+    retime: "applied" | "degraded" | "skipped".
+
     --keep-subs skips the subtitle regeneration and reuses the files already
     in dubbed/_full/ — the recovery path after a post-burn quality-gate fix
     (dubbing SKILL.md Step 5) edited dubbing.bilingual.srt or the merged
     SRTs by hand (regenerating would wipe those edits). The ASS is still
-    rebuilt from the on-disk bilingual SRT.
+    rebuilt from the on-disk bilingual SRT, and retime never runs (its
+    rewrite would wipe the hand edits too).
 
     No version probe: the flag is honored by the package-internal
     stages/dub/full_dub.py, which ships with this cook and cannot be an
     older copy."""
+    no_retime = getattr(args, "no_retime", False)
+    extra = []
+    if getattr(args, "keep_subs", False):
+        extra.append("--keep-subs")
+    if no_retime:
+        extra.append("--no-retime")
     _run_dub_stage("assemble", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    detach=getattr(args, "detach", False),
                    log_name="assemble.log",
-                   extra_args=["--keep-subs"] if getattr(args, "keep_subs", False) else None)
+                   extra_args=extra or None,
+                   merge_report="dubbed/_full/_assemble_retime.json")
+    # surface the retime state on stderr too (stdout must stay pure JSON)
+    marker_path = (_video_dir(args.output_root) / "dubbed" / "_full"
+                   / "_assemble_retime.json")
+    if marker_path.is_file():
+        try:
+            rep = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        state = rep.get("retime")
+        if state == "applied":
+            _log(f"cook dub assemble: retime applied — {rep.get('anchors')} "
+                 f"anchors, {rep.get('dwells')} dwells, "
+                 f"{rep.get('kept_input')} kept-input")
+        elif state == "degraded":
+            _log(f"cook dub assemble: WARNING retime degraded — "
+                 f"{rep.get('reason')}")
+        elif state == "skipped":
+            _log(f"cook dub assemble: retime skipped — {rep.get('reason')}")
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
@@ -2070,7 +2123,8 @@ def cmd_dub_full(args: argparse.Namespace) -> None:
     _run_dub_stage("synth", args.output_root, args.name, python=py,
                    detach=detach, log_name="synth.log")
     _run_dub_stage("assemble", args.output_root, args.name, python=py,
-                   detach=detach, log_name="assemble.log")
+                   detach=detach, log_name="assemble.log",
+                   merge_report="dubbed/_full/_assemble_retime.json")
 
 
 # ----------------------------------------------------------------------------
@@ -2698,13 +2752,20 @@ def build_parser() -> argparse.ArgumentParser:
     pdsyn.set_defaults(func=cmd_dub_synth)
 
     pdas = dub_sub.add_parser("assemble",
-                              help="Stage 2: identity assembly (video never re-timed) → "
+                              help="Stage 2: identity assembly (video never "
+                                   "re-timed, auto-retime ON by default) → "
                                    "cooked/<name>.dubbed.mp4")
     _add_dub_common(pdas, with_detach=True)
     pdas.add_argument("--keep-subs", dest="keep_subs", action="store_true",
                       help="Skip subtitle regeneration and reuse the files in "
                            "dubbed/_full/ (recovery after editing them by hand); "
                            "the ASS is still rebuilt from the on-disk bilingual SRT")
+    pdas.add_argument("--no-retime", dest="no_retime", action="store_true",
+                      help="Skip the automatic subtitle retime (ADR 0002) and "
+                           "keep the proportional-split starts — long cues may "
+                           "drift behind the speech. Default: retime runs "
+                           "(degrades with a warning when faster-whisper is "
+                           "missing from the --python env)")
     pdas.set_defaults(func=cmd_dub_assemble)
 
     pdfl = dub_sub.add_parser("full",

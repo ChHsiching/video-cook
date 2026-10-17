@@ -20,7 +20,7 @@ Usage (CLI):
   python full_dub.py synth-worker <output-root> <name> --lo N --hi M [--stagger S]
                                                           # stage 1 band: cues N..M descending, staggered S seconds
                                                           # (spawned by `cook dub synth --workers N --stagger S`)
-  python full_dub.py assemble     <output-root> <name> [--keep-subs]  # stage 2: fit + place + subtitles + burn
+  python full_dub.py assemble     <output-root> <name> [--keep-subs] [--no-retime]  # stage 2: fit + place + subtitles + retime + burn
   python full_dub.py full     <output-root> <name>   # both, in sequence
 
 Usage (from cook via importlib):
@@ -406,7 +406,8 @@ _LOUDNORM_I = -18.0    # dub track loudness; NOT source-matched — a quiet sour
                        # master (screencast mics) must not drag the dub down to a whisper
 
 
-def stage_assemble(output_root, name: str, keep_subs: bool = False):
+def stage_assemble(output_root, name: str, keep_subs: bool = False,
+                   no_retime: bool = False):
     p = _paths(output_root, name)
     cues = load_cues(p["en_full_srt"], p["zh_dub_txt"])
     raw_dur = _raw_dur(p["raw_mp4"])
@@ -555,6 +556,46 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False):
         bilingual_srt = p["work"] / "dubbing.bilingual.srt"
         _run_subs(subs_mod, ["biliteral", str(en_merged_srt), str(merged_srt), str(bilingual_srt)])
 
+    # 2c-2. Auto-retime (ticket 09, ADR 0002): the freshly built bilingual
+    #     SRT still carries the shorten/merge proportional-split clock — on
+    #     the reflux lecture that drifted up to 17.7s behind the actual
+    #     dubbed speech. The retime stage (same module family, loaded
+    #     in-process; its faster-whisper model loading stays its own) runs
+    #     by default BEFORE the ASS build so the burned subtitles carry the
+    #     retimed starts. --no-retime steps back to the old behavior; a
+    #     missing faster-whisper degrades the same way with an explicit
+    #     warning; --keep-subs never retimes (its on-disk subtitle files
+    #     may hold hand edits that must survive).
+    retime_state, retime_reason = "skipped", None
+    if keep_subs:
+        retime_reason = "--keep-subs reuses the on-disk subtitles (hand edits must survive)"
+        log(f"  2c-2: retime skipped — {retime_reason}")
+    elif no_retime:
+        retime_reason = "--no-retime: proportional-split subtitle clock kept (old behavior)"
+        log("  WARNING: 2c-2 retime skipped by --no-retime — "
+            "字幕按比例摊开（旧行为），长句可能漂移")
+    else:
+        retime_mod = _import_retime_module()
+        if not retime_mod.fw_available():
+            retime_state = "degraded"
+            retime_reason = ("faster-whisper is not installed in this interpreter — "
+                             "install it in the --python env: pip install faster-whisper")
+            log("  WARNING: 2c-2 retime DEGRADED — faster-whisper missing; "
+                "字幕按比例摊开（旧行为），长句可能漂移 "
+                f"({retime_reason})")
+        else:
+            log("  2c-2: retime — subtitle starts onto the dubbed speech's word times")
+            rep = retime_mod.stage_retime(p["root"], name)
+            retime_state = "applied"
+            log(f"    retimed: {rep.get('anchors')} anchors / {rep.get('dwells')} "
+                f"dwells / {rep.get('kept_input')} kept-input")
+    retime_marker = {"retime": retime_state, "reason": retime_reason}
+    if retime_state == "applied":
+        retime_marker.update({k: rep.get(k) for k in
+                              ("anchors", "dwells", "kept_input", "maps_rejected")})
+    (p["work"] / "_assemble_retime.json").write_text(
+        json.dumps(retime_marker, ensure_ascii=False, indent=2), encoding="utf-8")
+
     # 2d. ASS with correct geometry for THIS frame size. The subtitles module's
     #     coordinate system is 1920 x (1080 + bar); libass scales it to the
     #     real frame per-axis. For the bar to start exactly at the video's
@@ -652,6 +693,20 @@ def _run_subs(mod, argv):
         sys.argv = old
 
 
+def _import_retime_module():
+    """Load the retime stage (stages/dub/retime.py — the module sitting next
+    to this file) for the in-process assemble integration (ticket 09): no
+    subprocess hop, and the faster-whisper model loading stays retime's own
+    (behind its fw_transcriber seam). Same file-location pattern as
+    _import_subtitles_module."""
+    import importlib.util
+    cand = Path(__file__).resolve().parent / "retime.py"
+    spec = importlib.util.spec_from_file_location("cook_stages_dub_retime", cand)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 # ---------- CLI entry ----------
 
 _STAGES = {
@@ -681,8 +736,9 @@ def _cli_main(argv: list[str]) -> None:
         return None
 
     keep_subs = "--keep-subs" in rest
-    if keep_subs and cmd != "assemble":
-        print("--keep-subs applies to the assemble stage only")
+    no_retime = "--no-retime" in rest
+    if (keep_subs or no_retime) and cmd != "assemble":
+        print("--keep-subs/--no-retime apply to the assemble stage only")
         sys.exit(1)
 
     if cmd == "synth-worker":
@@ -708,7 +764,8 @@ def _cli_main(argv: list[str]) -> None:
         log("all stages complete")
     elif cmd in _STAGES:
         if cmd == "assemble":
-            stage_assemble(output_root, name, keep_subs=keep_subs)
+            stage_assemble(output_root, name, keep_subs=keep_subs,
+                           no_retime=no_retime)
         elif rest:
             # `synth` accepts no flags (pre-existing contract, kept frozen:
             # the supervisor argv cook builds must never grow band flags)
