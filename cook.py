@@ -406,7 +406,11 @@ def cmd_download(args: argparse.Namespace) -> None:
     known traps: writes source.json itself from the probe result (no stdout
     redirect, no yt-dlp print_to_file — both have silently eaten output),
     renames the .raw.jpg thumbnail to <name>.jpg, and runs cookie negotiation
-    internally rather than asking the agent to drive it.
+    internally rather than asking the agent to drive it. The format table is
+    ranked by (codec family vp9 > h264 > av01, bitrate) inside the tallest
+    resolution allowed by --quality, and the download is pinned to the chosen
+    itags; the landed file is ffprobe-checked and the cargo (codec, height,
+    fps, audio language) is recorded inside source.json.
     A bad CLI value should fail before any dependency is touched, so the
     quality sanity check sits above the import/ffmpeg gates.
     """
@@ -479,13 +483,31 @@ def cmd_download(args: argparse.Namespace) -> None:
     _log(f"cook download: output_root={output_root}, name={name}")
 
     # --- Phase 3: real download (video + thumbnail + json in one call) ---
-    # The trailing "/best" matters: sources without separate video/audio
-    # streams (HLS-only, incl. YouTube's auto-dubbed multi-audio delivery)
-    # have nothing for bestvideo+bestaudio to grab, and without the muxed
-    # fallback the download dies with "Requested format is not available".
-    format_spec = "bestvideo+bestaudio/best"
-    if args.quality:
-        format_spec = f"bv*[height<={args.quality}]+ba/b[height<={args.quality}]/b"
+    # Rank the format table ourselves (vp9 > h264 > av01, then bitrate, inside
+    # the tallest resolution allowed by --quality) and pin the download to the
+    # chosen itags — yt-dlp's default sort keeps picking the half-bitrate av01
+    # encode (four confirmed incidents). The legacy spec stays as fallback for
+    # tables with nothing selectable (it also covers sources without separate
+    # video/audio streams, incl. YouTube's auto-dubbed multi-audio delivery).
+    selection = _select_best_formats(info.get("formats") or [],
+                                     quality=args.quality,
+                                     language=info.get("language"))
+    if selection:
+        format_spec = selection["format_spec"]
+        v = selection["video"]
+        a = selection["audio"] or {}
+        _log(f"cook download: format selection: {v['format_id']}"
+             f" ({v['codec_family']}, {v['height']}p, {v['bitrate']:.0f}k)")
+        if a:
+            _log(f"cook download: audio selection: {a['format_id']}"
+                 f" ({a.get('language')}, {a['bitrate']:.0f}k)")
+    else:
+        format_spec = "bestvideo+bestaudio/best"
+        if args.quality:
+            format_spec = (f"bv*[height<={args.quality}]+ba"
+                           f"/b[height<={args.quality}]/b")
+        _log("cook download: no itag-pinnable selection, falling back to "
+             f"yt-dlp default sort: {format_spec}")
 
     out_tpl = str(raw_dir / f"{name}.raw.%(ext)s")
     json_path = raw_dir / f"{name}.source.json"
@@ -557,13 +579,14 @@ def cmd_download(args: argparse.Namespace) -> None:
     # yt-dlp picks among possibly dozens of streams (auto-dubbed sources carry
     # 20+ audio-language variants per resolution); its sort prefers the
     # original track, but nothing asserted what actually landed. Probe the
-    # file and warn on mismatches — resolution/fps/bitrate are facts for the
-    # record, the language check is the one that saves a 14h pipeline from
-    # transcribing a dub track.
+    # file and warn on mismatches — codec/resolution/fps/bitrate are facts
+    # for the record, the language check is the one that saves a 14h pipeline
+    # from transcribing a dub track.
     try:
         cargo_probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,width,height,avg_frame_rate,bit_rate:stream_tags=language",
+             "stream=codec_type,codec_name,width,height,avg_frame_rate,bit_rate"
+             ":stream_tags=language",
              "-of", "json", str(raw_mp4)],
             capture_output=True, text=True)
         pdata = json.loads(cargo_probe.stdout or "{}")
@@ -574,7 +597,9 @@ def cmd_download(args: argparse.Namespace) -> None:
         cargo = {
             "width": vstream.get("width"), "height": vstream.get("height"),
             "fps": vstream.get("avg_frame_rate"),
+            "video_codec": vstream.get("codec_name"),
             "video_bitrate": vstream.get("bit_rate"),
+            "audio_codec": astream.get("codec_name"),
             "audio_language": (astream.get("tags") or {}).get("language"),
         }
     except Exception as e:
@@ -586,13 +611,39 @@ def cmd_download(args: argparse.Namespace) -> None:
             f"downloaded height {height} exceeds requested cap {args.quality}")
     orig_lang = (info.get("language") or "").split("-")[0].lower()
     got_lang = (cargo.get("audio_language") or "").split("-")[0].lower()
-    if orig_lang and got_lang and got_lang != orig_lang:
+    # merging into mp4 drops the audio language tag ('und'); when the pinned
+    # itag already proves the original-language track, an absent tag is not
+    # evidence of a dub — only a contradicting tag still warns
+    pinned_native_audio = bool(
+        selection and selection["audio"]
+        and (selection["audio"].get("language") or "").split("-")[0].lower()
+        == orig_lang)
+    if (orig_lang and got_lang and got_lang != orig_lang
+            and not (pinned_native_audio and got_lang in ("", "und"))):
         cargo_warnings.append(
             f"audio language '{got_lang}' != original '{orig_lang}' — "
             "a dub track may have been grabbed instead of the original")
+    # the selection was pinned to itags, so a codec mismatch means yt-dlp
+    # ignored or re-resolved the spec — flag it loudly
+    if selection:
+        landed = _codec_family(cargo.get("video_codec"))
+        if landed != "none" and landed != selection["video"]["codec_family"]:
+            cargo_warnings.append(
+                f"landed video codec '{cargo.get('video_codec')}' != selected "
+                f"'{selection['video']['codec_family']}' (wanted itag "
+                f"{selection['video']['format_id']})")
     if cargo_warnings:
         for w in cargo_warnings:
             _log(f"cook download: WARNING {w}")
+
+    # --- Phase 5c: record the landed cargo in source.json ---
+    # Mechanizes the by-hand codec check: downstream stages (and post-mortems)
+    # read what actually landed from the same file they already parse.
+    info["cargo"] = cargo
+    info["selected_formats"] = selection
+    json_path.write_text(_json.dumps(info, ensure_ascii=False, indent=2,
+                                     default=str), encoding="utf-8")
+    _log("cook download: recorded cargo + format selection in source.json")
 
     files = []
     for p in raw_dir.iterdir():
@@ -613,6 +664,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         "source_json_present": json_path.exists(),
         "cookie_source": probe_opts.get("cookiefile")
                          or probe_opts.get("cookiesfrombrowser", (None,))[0],
+        "format_selection": selection,
         "cargo": cargo,
         "cargo_warnings": cargo_warnings,
     })
@@ -643,6 +695,109 @@ def _slugify(s: str) -> str:
         digest = hashlib.sha1(s.encode("utf-8")).hexdigest()[:5]
         s = s[: _MAX_STEM - 6].rstrip("-") + "-" + digest
     return s
+
+
+# Download format selection.
+#
+# yt-dlp's default sort ("bestvideo") prefers the newest codec, which on
+# YouTube means av01 — and av01 streams at the same resolution run at HALF
+# the bitrate of the vp9 encodes (1080p: av01 255k vs vp9 509k, confirmed
+# four times in production runs). Within the target resolution cook ranks
+# candidates by (codec family vp9 > h264 > av01, bitrate) and downloads with
+# an explicit `-f <video_itag>+<audio_itag>` so there is no ambiguity about
+# what lands on disk.
+
+# codec family -> rank; higher wins. Families not listed rank below av01 and
+# fall back to pure bitrate order.
+_CODEC_RANK = {"vp9": 3, "h264": 2, "av01": 1}
+
+
+def _codec_family(vcodec: str | None) -> str:
+    """Normalize a yt-dlp/ffprobe codec string to a family name.
+
+    Handles both flavors seen in the wild: yt-dlp's container-level tags
+    ('avc1.640028', 'av01.0.08M.08', 'vp09.00.10.08') and ffprobe's
+    stream-level names ('h264', 'av01', 'vp9')."""
+    v = (vcodec or "").lower()
+    if v.startswith(("vp9", "vp09")):
+        return "vp9"
+    if v.startswith(("avc1", "h264")):
+        return "h264"
+    if v.startswith(("av01", "av1")):
+        return "av01"
+    return v.split(".")[0] if v else "none"
+
+
+def _select_best_formats(formats: list[dict],
+                         quality: int | None = None,
+                         language: str | None = None) -> dict | None:
+    """Pick the best video+audio streams from a yt-dlp format list.
+
+    Policy (see spec 2026-10-reflux, ticket 03):
+    - video: restrict to height <= quality (when given), take the tallest
+      remaining resolution as the target, then rank within that resolution by
+      (codec family vp9 > h264 > av01, bitrate descending).
+    - audio: audio-only streams of the original language (prefix match on the
+      language field), highest bitrate; ties prefer the non-DRC variant.
+    - a muxed pick (video stream that already carries audio) is used alone.
+
+    Returns a selection dict with 'format_spec' plus video/audio detail rows
+    (suitable for logging, the emitted JSON, and cargo cross-checks), or None
+    when the table has nothing selectable — the caller then falls back to the
+    legacy yt-dlp format spec.
+    """
+    def _bitrate(f: dict) -> float:
+        return f.get("tbr") or f.get("vbr") or 0
+
+    # --- video candidates: any stream that carries video ---
+    video = [f for f in formats
+             if (f.get("vcodec") or "none") != "none"
+             and isinstance(f.get("height"), int) and f["height"] > 0]
+    if quality is not None:
+        video = [f for f in video if f["height"] <= quality]
+    if not video:
+        return None
+    target_h = max(f["height"] for f in video)
+    shortlist = [f for f in video if f["height"] == target_h]
+    # sort by (codec rank desc, bitrate desc); stable order breaks any
+    # remaining tie deterministically (yt-dlp lists formats stably)
+    ranked = sorted(shortlist, key=lambda f: (
+        -_CODEC_RANK.get(_codec_family(f.get("vcodec")), 0), -_bitrate(f)))
+    vpick = ranked[0]
+
+    # --- audio candidates: audio-ONLY streams (muxed handled below) ---
+    audio_only = [f for f in formats
+                  if (f.get("acodec") or "none") != "none"
+                  and (f.get("vcodec") or "none") == "none"]
+    orig_prefix = (language or "").split("-")[0].lower()
+    if orig_prefix:
+        native = [f for f in audio_only
+                  if (f.get("language") or "").lower().startswith(orig_prefix)]
+        if native:  # prefix matched nothing -> keep all rather than guess
+            audio_only = native
+    apick = None
+    if audio_only:
+        apick = sorted(audio_only, key=lambda f: (
+            -(f.get("abr") or f.get("tbr") or 0),
+            1 if "-drc" in (f.get("format_id") or "") else 0))[0]
+
+    vrow = {"format_id": vpick.get("format_id"),
+            "vcodec": vpick.get("vcodec"),
+            "codec_family": _codec_family(vpick.get("vcodec")),
+            "height": vpick.get("height"),
+            "bitrate": _bitrate(vpick)}
+    if (vpick.get("acodec") or "none") != "none":
+        # muxed stream carries its own audio — use it alone
+        return {"format_spec": str(vpick.get("format_id")), "video": vrow,
+                "audio": None}
+    if apick is None:
+        return None  # video-only source without pairable audio -> legacy spec
+    arow = {"format_id": apick.get("format_id"),
+            "acodec": apick.get("acodec"),
+            "bitrate": apick.get("abr") or apick.get("tbr"),
+            "language": apick.get("language")}
+    return {"format_spec": f"{vpick.get('format_id')}+{apick.get('format_id')}",
+            "video": vrow, "audio": arow}
 
 
 def _negotiate_cookie(url: str, user_specified: str | None) -> str | None:
