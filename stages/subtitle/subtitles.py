@@ -44,6 +44,14 @@ exists as one module: long cues get rejected by platforms (Bilibili's limit
 is ~45 Chinese chars / ~90 ASCII per cue), and whisperX occasionally emits
 one cue spanning several sentences. `shorten` fixes both: split on 。！？；／.!?;,
 then hard-wrap at commas when a fragment still exceeds the limit.
+
+Sub-clauses that STILL exceed the limit after the punctuation ladder
+(sentence -> clause -> dash/quote) is exhausted are hard-cut at the width
+boundary, snapped to the nearest jieba word boundary when jieba is
+installed (pip install video-cook[subtitle]) so a cut never splits a word
+in two («…新技» / «能，…»). Without jieba the legacy width-only cut runs
+and a one-time stderr warning names the fix — shorten never hard-fails on
+an optional dependency.
 """
 import sys
 import re
@@ -447,7 +455,9 @@ def cmd_split(args):
 def split_zh(text, limit=MAX_ZH_DEFAULT):
     """Split Chinese text into fragments under `limit` WIDTH units (wlen).
     Splits at sentence punctuation (。！？；), then clause punctuation (，、：),
-    then em-dash/quote boundaries (—— "")."""
+    then em-dash/quote boundaries (—— ""). A sub-clause still over the limit
+    after the ladder is exhausted is emitted whole — pack_zh hard-cuts it,
+    snapped to the nearest jieba word boundary (see pack_zh)."""
     parts = re.split(r"(?<=[。！？；])", text)
     parts = [p.strip() for p in parts if p.strip()]
     refined = []
@@ -507,10 +517,74 @@ def pack(parts, limit):
     return [c.strip() for c in chunks if c.strip()]
 
 
+# Width a word-boundary snap may overshoot the split limit by. Same budget
+# the punctuation guard uses: at the pipeline's 56 limit a chunk can never
+# cross the 64 ceiling (= 56 x 1.15, the documented ZH review band).
+_WB_MAX_OVERSHOOT = 8
+
+_jieba = None          # cached module after first successful import
+_jieba_missing = False # latched once the degradation warning has fired
+
+
+def _word_boundaries(text: str):
+    """Char offsets of `text` where a cut keeps the chars on both sides in
+    different jieba tokens (word boundary). Returns None when jieba is not
+    installed — the caller then keeps the legacy width-only hard cut and we
+    warn once on stderr, the same degrade-with-a-warning contract the other
+    optional-dependency stages use."""
+    global _jieba, _jieba_missing
+    if _jieba is None and not _jieba_missing:
+        try:
+            import logging
+            import jieba
+            jieba.setLogLevel(logging.ERROR)  # silence prefix-dict build spam
+            _jieba = jieba
+        except ImportError:
+            _jieba_missing = True
+            print("[shorten] WARNING: jieba is not installed — over-length "
+                  "sub-clauses are hard-cut at the width boundary and words "
+                  "may be split mid-way (seen as broken cues like 「技」「能」). "
+                  "Install it with: pip install video-cook[subtitle]",
+                  file=sys.stderr)
+    if _jieba is None:
+        return None
+    cuts, pos = set(), 0
+    for tok in _jieba.cut(text):
+        pos += len(tok)
+        cuts.add(pos)
+    return cuts
+
+
+def _snap_cut_to_word(p: str, cut: int, bounds, limit: int) -> int:
+    """Snap a width-boundary cut to the nearest jieba word boundary in `p`
+    (the punctuation ladder is exhausted; this is the must-cut path, and a
+    bare-character cut splits words like 「技」「能」). Searches both sides of
+    the cut; advancing right is capped so the chunk stays within
+    limit + _WB_MAX_OVERSHOOT width units (the 64 band at limit 56).
+    Retreating left only shortens the chunk and is always allowed. Ties go
+    left (under-limit beats fuller). Falls back to `cut` unchanged when no
+    boundary exists on either side (pathological single-token runs)."""
+    if cut >= len(p) or cut in bounds:
+        return cut
+    left = next((b for b in range(cut - 1, 0, -1) if b in bounds), 0)
+    right = 0
+    for b in range(cut + 1, len(p) + 1):
+        if wlen(p[:b]) > limit + _WB_MAX_OVERSHOOT:
+            break
+        if b in bounds:
+            right = b
+            break
+    if right and right - cut < cut - left:
+        return right
+    return left or cut
+
+
 def pack_zh(parts, limit):
     """Width-aware packer for Chinese (wlen: CJK=2, ASCII=1).
     No space joiner (Chinese has no spaces). Fragments exceeding the limit
-    after split_zh's punctuation splitting are hard-cut at the width boundary."""
+    after split_zh's punctuation splitting are hard-cut at the width
+    boundary, snapped to the nearest jieba word boundary when jieba is
+    available (see _snap_cut_to_word)."""
     chunks, buf = [], ""
     for p in parts:
         cand = (buf + p) if buf else p
@@ -536,16 +610,24 @@ def pack_zh(parts, limit):
                 last_space = p.rfind(' ', 0, cut)
                 if last_space > 0:
                     cut = last_space
+            # Word-boundary guard, CJK: snap the cut to the nearest jieba word
+            # boundary so the must-cut path never emits half a word. No-op
+            # without jieba (degraded mode keeps the legacy hard cut above).
+            bounds = _word_boundaries(p)
+            if bounds is not None:
+                cut = _snap_cut_to_word(p, cut, bounds, limit)
             # Punctuation guard: a width-boundary cut can land right BEFORE a
             # punctuation run, leaving the next chunk to start with "，本质…"
             # — a leading-punct cue that reads as a stray mark. Consume the
-            # run into this chunk, capped at 8 extra width units so the chunk
+            # run into this chunk, capped (together with any word-snap
+            # overshoot) at _WB_MAX_OVERSHOOT extra width units so the chunk
             # can never cross the 64 ceiling at the pipeline's 56 split limit
             # (56 + 8); a few units over the
             # split limit is far cheaper than an orphaned comma.
+            over = max(0, wlen(p[:cut]) - limit)
             w_extra = 0
             while (cut < len(p) and p[cut] in "，。、：；！？——…）】”>),.;:!?\"'"
-                   and w_extra + (2 if ord(p[cut]) > 127 else 1) <= 8):
+                   and over + w_extra + (2 if ord(p[cut]) > 127 else 1) <= _WB_MAX_OVERSHOOT):
                 w_extra += 2 if ord(p[cut]) > 127 else 1
                 cut += 1
             chunks.append(p[:cut])

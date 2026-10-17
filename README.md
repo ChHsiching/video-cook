@@ -34,6 +34,7 @@ pip install video-cook[all]       # yt-dlp + whisperx + cook itself
 # or pick what you need:
 pip install video-cook[download]   # for `cook download`
 pip install video-cook[transcribe] # for `cook transcribe`
+pip install video-cook[subtitle]   # word-boundary cutting in `cook subtitles`
 ```
 
 ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).

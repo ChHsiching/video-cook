@@ -1151,3 +1151,150 @@ class TestTranscribeUsesPackagedScript:
         packaged script must actually print that literal."""
         src = cook._stage_script("subtitle", "transcribe.py").read_text(encoding="utf-8")
         assert '[transcribe] done.' in src
+
+
+# ----------------------------------------------------------------------------
+# cook subtitles shorten: word-boundary cutting (ticket 07). When shorten's
+# punctuation ladder (sentence -> clause -> dash/quote) is exhausted and a
+# sub-clause still exceeds the width limit, the hard cut must snap to the
+# nearest jieba word boundary. Round defect being fixed: a 106-width cue cut
+# as 「…顺手学会新技」/「能，…」 — 「技能」 split mid-word (dubbing.merged
+# cues 598/599). Oracle for "is this cut inside a word": jieba tokenization
+# of the joined text; a legal cut has the chars on both sides of the cut in
+# different tokens.
+# ----------------------------------------------------------------------------
+
+# The acceptance sentence from the ticket: 106 width units at limit 56, its
+# punctuation ladder leaves a 60-width clause that must be hard-cut.
+_WB_SENTENCE = (
+    "我认为模型和产品会变得非常擅长在干活的过程中顺手学会新技能，"
+    "然后把这些技能固化成文件和指令、沉淀成 skill。"
+)
+
+
+def _shorten_cue_texts(tmp_path: Path, text: str, max_zh: int = 56) -> list[str]:
+    """Run the packaged shorten stage on one zh cue; return output cue texts."""
+    src = tmp_path / "in.srt"
+    dst = tmp_path / "out.srt"
+    _make_srt(src, [(1, "00:00:00,000 --> 00:00:10,000", text)])
+    subs = cook._import_subtitles_module()
+    cook._run_subs(subs, ["shorten", str(src), str(dst),
+                          "--lang", "zh", "--max-zh", str(max_zh)])
+    out = []
+    for block in dst.read_text(encoding="utf-8").strip().split("\n\n"):
+        lines = block.split("\n")
+        out.append(" ".join(lines[2:]).strip())
+    return out
+
+
+def _jieba_cut_positions(text: str) -> set[int]:
+    """Char offsets where a cut keeps both sides in different jieba tokens."""
+    import logging
+    jieba = pytest.importorskip("jieba")
+    jieba.setLogLevel(logging.ERROR)
+    cuts, pos = set(), 0
+    for tok in jieba.cut(text):
+        pos += len(tok)
+        cuts.add(pos)
+    return cuts
+
+
+class TestShortenWordBoundary:
+    def test_acceptance_sentence_no_cut_inside_a_word(self, tmp_path):
+        pieces = _shorten_cue_texts(tmp_path, _WB_SENTENCE, max_zh=56)
+        # the 106-width cue is far past the x1.15 exemption (64) — it must
+        # actually be split, not kept whole
+        assert len(pieces) >= 2
+        # no content lost (cut-position-agnostic: edge spaces may be stripped)
+        assert "".join(pieces).replace(" ", "") == _WB_SENTENCE.replace(" ", "")
+        for a, b in zip(pieces, pieces[1:]):
+            joined = a + b
+            assert len(a) in _jieba_cut_positions(joined), (
+                f"cut lands inside a word: {a!r} | {b!r}")
+
+    def test_each_piece_stays_within_the_documented_band(self, tmp_path):
+        """Word snapping may advance a cut past the limit to reach a boundary,
+        but never past the pipeline's 64-width ceiling (56 + 8, the band the
+        punctuation guard and the review gate already allow)."""
+        subs = cook._import_subtitles_module()
+        pieces = _shorten_cue_texts(tmp_path, _WB_SENTENCE, max_zh=56)
+        for p in pieces:
+            assert subs.wlen(p) <= 64
+
+    def test_no_punctuation_text_survives_repeated_hard_cuts(self, tmp_path):
+        """Text with zero punctuation exhausts the ladder immediately and is
+        hard-cut several times over (limit 20 -> ~6 cuts). Every one of those
+        cuts must land on a jieba boundary — the remainder must be re-examined
+        after each cut, not segmented once up front."""
+        text = "这是一段完全没有任何标点符号的超长句子用来验证多次硬切的情况下词边界保护依然在每一次切分时生效而不是只在第一次生效"
+        pieces = _shorten_cue_texts(tmp_path, text, max_zh=20)
+        assert len(pieces) >= 4  # 88-width text at limit 20 needs several cuts
+        assert "".join(pieces) == text  # nothing lost, nothing reordered
+        for a, b in zip(pieces, pieces[1:]):
+            assert len(a) in _jieba_cut_positions(a + b), (
+                f"cut lands inside a word: {a!r} | {b!r}")
+
+
+class TestShortenWordBoundaryDegraded:
+    """jieba is an optional dependency: when it is missing, shorten must
+    degrade to the legacy width-only hard cut (the exact pre-ticket output)
+    and say so on stderr exactly once — the same warn-and-continue contract
+    the other optional-dependency stages use. A fresh module instance is
+    imported per test so the cached import state never leaks between tests."""
+
+    def test_missing_jieba_keeps_legacy_cut_and_warns(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setitem(sys.modules, "jieba", None)  # import jieba -> ImportError
+        src = tmp_path / "in.srt"
+        dst = tmp_path / "out.srt"
+        _make_srt(src, [(1, "00:00:00,000 --> 00:00:10,000", _WB_SENTENCE)])
+        subs = cook._import_subtitles_module()
+        cook._run_subs(subs, ["shorten", str(src), str(dst),
+                              "--lang", "zh", "--max-zh", "56"])
+        pieces = []
+        for block in dst.read_text(encoding="utf-8").strip().split("\n\n"):
+            pieces.append(" ".join(block.split("\n")[2:]).strip())
+        # legacy behavior: bare width cut at 56 — the 「技/能」 break is the
+        # known cost of running without jieba, pinned here so the degradation
+        # itself never drifts
+        assert pieces == [
+            "我认为模型和产品会变得非常擅长在干活的过程中顺手学会新技",
+            "能，然后把这些技能固化成文件和指令、沉淀成 skill。",
+        ]
+        err = capsys.readouterr().err
+        assert "jieba" in err and "WARNING" in err
+        assert "video-cook[subtitle]" in err  # names the fix
+
+    def test_missing_jieba_warns_exactly_once_per_run(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setitem(sys.modules, "jieba", None)
+        src = tmp_path / "in.srt"
+        dst = tmp_path / "out.srt"
+        _make_srt(src, [
+            (1, "00:00:00,000 --> 00:00:10,000", _WB_SENTENCE),
+            (2, "00:00:10,000 --> 00:00:20,000",
+             "第二条同样超过长度限制且没有任何标点可以依赖的句子也要被硬切一下"),
+        ])
+        subs = cook._import_subtitles_module()
+        cook._run_subs(subs, ["shorten", str(src), str(dst),
+                              "--lang", "zh", "--max-zh", "56"])
+        err = capsys.readouterr().err
+        assert err.count("jieba is not installed") == 1
+
+
+class TestShortenExemptionUnchanged:
+    """Ticket constraint: shorten's x1.15 mild-overrun exemption (a cue within
+    limit*1.15 passes through whole) is untouched by the word-boundary work —
+    it must neither start splitting exempt cues nor widen the band."""
+
+    def test_mild_overrun_within_1_15x_stays_one_cue(self, tmp_path):
+        subs = cook._import_subtitles_module()
+        # 32 CJK chars = width 64 = exactly 56 x 1.15 -> exempt, unsplit
+        text = "这条宽度恰好落在豁免带里面的中文字幕用来确认豁免路径没有被改动过"
+        assert subs.wlen(text) == 64
+        pieces = _shorten_cue_texts(tmp_path, text, max_zh=56)
+        assert pieces == [text]
+
+    def test_one_past_the_exemption_is_split(self, tmp_path):
+        # width 66 > 64: outside the band, the must-cut path must fire
+        text = "这是一条宽度刚好超过豁免带上限一点点的中文字幕用来确认必须切分路径仍会触发"
+        pieces = _shorten_cue_texts(tmp_path, text, max_zh=56)
+        assert len(pieces) >= 2

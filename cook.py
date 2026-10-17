@@ -955,8 +955,10 @@ def _stage_script(stage: str, script: str) -> Path:
 def _import_subtitles_module():
     """Import the packaged subtitles module (stages/subtitle/subtitles.py).
 
-    The module has zero third-party deps (only stdlib re/argparse/sys), so
-    in-process loading via importlib works everywhere cook itself runs."""
+    The module's only third-party dep (jieba, for word-boundary cutting in
+    shorten) is optional and imported lazily — the module degrades with a
+    stderr warning when it is absent — so in-process loading via importlib
+    works everywhere cook itself runs."""
     path = _stage_script("subtitle", "subtitles.py")
     import importlib.util
     spec = importlib.util.spec_from_file_location("cook_stages_subtitle", path)
