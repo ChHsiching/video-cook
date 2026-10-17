@@ -2065,6 +2065,208 @@ def cmd_dub_full(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------------------
+# dub merge — the ONLY legal cue-merge entry: both sides in lockstep.
+# ----------------------------------------------------------------------------
+
+# The 2026-10 incident (leerob run): cue groups were merged by hand on the
+# en side only, leaving translations_dub.txt one line ahead — zh/en drifted
+# by one line and 8 dubbed sentences landed 4-14s late, surviving three
+# review passes. cook dub merge makes that edit impossible to do halfway:
+# one command merges <name>.en.full.srt AND translations_dub.txt together,
+# and refuses to touch anything unless every pairing invariant holds.
+
+_SRT_TS_RE = re.compile(
+    r"(\d{2,}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2,}):(\d{2}):(\d{2}),(\d{3})")
+
+
+def _parse_full_srt(path: Path) -> list[dict[str, str]]:
+    """Strict parse of an en.full.srt into [{start, end, text}, ...].
+    start/end keep the ORIGINAL timestamp strings (no float round-trip) so
+    untouched cues are rewritten byte-identically."""
+    return _parse_full_srt_str(path.read_text(encoding="utf-8-sig"))
+
+
+def _parse_full_srt_str(text: str) -> list[dict[str, str]]:
+    """Strict SRT parse from an in-memory string (used both to load the file
+    and to re-verify the serialized output before it is written)."""
+    cues: list[dict[str, str]] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        if len(lines) < 3 or not lines[0].strip().isdigit():
+            _die(f"malformed SRT block near {lines[0][:40]!r}")
+        ts = lines[1].strip()
+        if not _SRT_TS_RE.fullmatch(ts):
+            _die(f"malformed SRT timestamp in cue {lines[0].strip()}: {ts!r}")
+        start, _, end = ts.partition(" --> ")
+        cues.append({"start": start, "end": end,
+                     "text": " ".join(l.strip() for l in lines[2:])})
+    return cues
+
+
+def _parse_dub_merge_groups(raw: list[str] | None,
+                            n: int) -> list[list[int]]:
+    """Validate --group specs against a file of n lines; return 0-based
+    groups (sorted, each contiguous ascending). Raises ValueError with a
+    human message on any invalid spec — the caller refuses before writing."""
+    if not raw:
+        raise ValueError("no --group given — nothing to merge (e.g. --group 12,13)")
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for spec in raw:
+        try:
+            idx = [int(x) for x in str(spec).split(",")]
+        except ValueError:
+            raise ValueError(f"{spec!r}: line numbers must be 1-based integers")
+        if len(idx) < 2:
+            raise ValueError(f"{spec!r}: a merge group needs >= 2 lines")
+        for a, b in zip(idx, idx[1:]):
+            if b != a + 1:
+                raise ValueError(f"{spec!r}: lines must be consecutive "
+                                 f"(got {a} then {b})")
+        for i in idx:
+            if not 1 <= i <= n:
+                raise ValueError(f"{spec!r}: line {i} is out of range 1..{n}")
+            if i in seen:
+                raise ValueError(f"line {i} appears in more than one --group")
+        seen.update(idx)
+        groups.append([i - 1 for i in idx])
+    groups.sort(key=lambda g: g[0])
+    return groups
+
+
+def _apply_dub_merge(cues: list[dict[str, str]], zh: list[str],
+                     groups: list[list[int]]
+                     ) -> tuple[list[dict[str, str]], list[str]]:
+    """The pure transform. For each group: en cue = first start + last end
+    window with texts space-joined; zh line = texts directly joined. Lines
+    outside groups pass through unchanged. Numbering is NOT done here."""
+    starts = {g[0]: g for g in groups}
+    inside = {i for g in groups for i in g}
+    out_cues: list[dict[str, str]] = []
+    out_zh: list[str] = []
+    for i, cue in enumerate(cues):
+        if i in starts:
+            g = starts[i]
+            out_cues.append({"start": cues[g[0]]["start"],
+                             "end": cues[g[-1]]["end"],
+                             "text": " ".join(cues[j]["text"] for j in g)})
+            out_zh.append("".join(zh[j] for j in g))
+        elif i in inside:
+            continue
+        else:
+            out_cues.append(dict(cue))
+            out_zh.append(zh[i])
+    return out_cues, out_zh
+
+
+def _serialize_srt(cues: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for k, c in enumerate(cues, 1):
+        parts += [str(k), f"{c['start']} --> {c['end']}", c["text"], ""]
+    return "\n".join(parts)
+
+
+def _verify_dub_merge(en_text: str, zh_text: str,
+                      groups: list[list[int]], cues: list[dict[str, str]],
+                      zh: list[str]) -> None:
+    """Final pre-write gate, run on the exact bytes about to hit the disk:
+    re-parse both serializations and assert (a) the two sides still carry the
+    same number of entries, and (b) every merged group starts with the first
+    word/first text of its first line on BOTH sides (the marker that pairs
+    them). Any mismatch means the merge corrupted the pairing — refuse."""
+    re_cues = _parse_full_srt_str(en_text)
+    re_zh = zh_text.splitlines()
+    while re_zh and re_zh[-1].strip() == "":
+        re_zh.pop()
+    if len(re_cues) != len(re_zh):
+        _die(f"pairing invariant violated in the merged output "
+             f"({len(re_cues)} en cues vs {len(re_zh)} zh lines); refusing to write")
+    removed = 0
+    for g in groups:
+        k = g[0] - removed  # 0-based position of this group in the output
+        removed += len(g) - 1
+        first_en = cues[g[0]]["text"]
+        if first_en and re_cues[k]["text"].split()[:1] != first_en.split()[:1]:
+            _die(f"first-word marker mismatch on en side of group "
+                 f"{g[0] + 1}-{g[-1] + 1}; refusing to write")
+        if not re_zh[k].startswith(zh[g[0]]):
+            _die(f"first-text marker mismatch on zh side of group "
+                 f"{g[0] + 1}-{g[-1] + 1}; refusing to write")
+
+
+def cmd_dub_merge(args: argparse.Namespace) -> None:
+    """Merge cue groups in <name>.en.full.srt and translations_dub.txt in
+    LOCKSTEP — the only supported way to merge, because editing one file by
+    hand desynchronizes zh/en (the 2026-10 incident: one line of drift, 8
+    dubbed sentences 4-14s late, three review passes missed it).
+
+    --group takes 1-based consecutive line numbers ("--group 12,13"),
+    repeatable; a run applies to the current numbering (after a merge the
+    file is renumbered, so the next --group uses the new numbers).
+
+    Refuses to write anything (zero side effects — no backup, no rewrite)
+    unless every invariant holds:
+      1. both sides carry the same number of lines (nothing was hand-merged
+         on one side already);
+      2. every group is in range, consecutive, >=2 lines, and no line is
+         claimed twice — one validated set drives BOTH sides;
+      3. the serialized output re-parses with equal counts on both sides and
+         every merged group still starts with its first line's first word
+         (en) / first text (zh) — the pairing marker.
+    On success both originals are backed up once as *.v1 (an existing .v1 is
+    kept: it holds the pristine pre-any-merge state)."""
+    root = _video_dir(args.output_root)
+    name = args.name
+    en_path = root / "transcript" / f"{name}.en.full.srt"
+    zh_path = root / "transcript" / "translations_dub.txt"
+    if not en_path.exists():
+        _die(f"{en_path.name} not found: {en_path}")
+    if not zh_path.exists():
+        _die(f"translations_dub.txt not found: {zh_path}")
+
+    cues = _parse_full_srt(en_path)
+    zh_lines = zh_path.read_text(encoding="utf-8").splitlines()
+    while zh_lines and zh_lines[-1].strip() == "":
+        zh_lines.pop()
+
+    # Invariant 1: the two files must still be line-for-line paired.
+    if len(cues) != len(zh_lines):
+        _die(f"pairing invariant violated: {en_path.name} has {len(cues)} cues "
+             f"but translations_dub.txt has {len(zh_lines)} lines — one side "
+             f"was edited alone. Fix the pairing before merging.",
+             {"en_cues": len(cues), "zh_lines": len(zh_lines)})
+
+    # Invariant 2: one validated group set drives both sides.
+    try:
+        groups = _parse_dub_merge_groups(getattr(args, "group", None), len(cues))
+    except ValueError as e:
+        _die(f"--group rejected: {e}", {"en_cues": len(cues)})
+
+    new_cues, new_zh = _apply_dub_merge(cues, zh_lines, groups)
+    en_text = _serialize_srt(new_cues)
+    zh_text = "\n".join(new_zh) + "\n"
+
+    # Invariant 3: verify the exact bytes before touching the disk.
+    _verify_dub_merge(en_text, zh_text, groups, cues, zh_lines)
+
+    # Backups first (only if absent — the pristine pre-merge state wins),
+    # then the lockstep write.
+    for pth in (en_path, zh_path):
+        bak = pth.with_name(pth.name + ".v1")
+        if not bak.exists():
+            shutil.copyfile(pth, bak)
+    en_path.write_text(en_text, encoding="utf-8")
+    zh_path.write_text(zh_text, encoding="utf-8")
+
+    _emit_json({"ok": True,
+                "cues_before": len(cues),
+                "cues_after": len(new_cues),
+                "merged": [[i + 1 for i in g] for g in groups],
+                "backup_suffix": ".v1"})
+
+
 # dub subcommand: measure-rate — the real speech rate, measured not assumed.
 # Wraps stages/dub/measure_rate.py IN-PROCESS (soundfile+numpy only, no
 # indextts venv needed). Exit 0 = rate measured; exit 1 = bad invocation or
@@ -2337,6 +2539,21 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run both stages: synth → assemble")
     _add_dub_common(pdfl, with_detach=True)
     pdfl.set_defaults(func=cmd_dub_full)
+
+    pdmg = dub_sub.add_parser(
+        "merge",
+        help="merge cue groups in en.full.srt + translations_dub.txt in "
+             "lockstep (the only legal merge; refuses to write unless the "
+             "zh/en pairing invariants hold)")
+    pdmg.add_argument("output_root")
+    pdmg.add_argument("name")
+    pdmg.add_argument("--group", action="append", metavar="A,B",
+                      help="1-based consecutive line numbers to merge into one "
+                           "cue, e.g. --group 12,13 (repeatable; after a merge "
+                           "the file is renumbered, so the next --group uses "
+                           "the new numbers)")
+    pdmg.set_defaults(func=cmd_dub_merge)
+
 
     # measure-rate: in-process (soundfile+numpy only — no indextts venv).
     pmr = dub_sub.add_parser(

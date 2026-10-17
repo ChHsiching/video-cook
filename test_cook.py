@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -2046,6 +2047,382 @@ class TestSynthWorkersOrchestration:
 
 
 # ----------------------------------------------------------------------------
+# cook dub merge: the ONLY legal way to merge cues — en.full.srt and
+# translations_dub.txt are merged in lockstep (one side hand-edited alone is
+# the 2026-10 incident: zh/en off by one line, 8 dubbed sentences 4-14s late).
+# ============================================================================
+
+class _DubMergeHarness:
+    """Shared harness for dub-merge tests. Seam: cmd_dub_merge in-process;
+    observed via the on-disk files under transcript/ (en.full.srt,
+    translations_dub.txt, their .v1 backups), the exit code, and stdout JSON.
+    Fake SRTs in temp dirs only."""
+
+    def _setup(self, tmp_path: Path, en_cues, zh_lines, name="video"):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / f"{name}.en.full.srt"
+        zh_txt = root / "transcript" / "translations_dub.txt"
+        _make_srt(en_srt, en_cues)
+        _make_translations(zh_txt, zh_lines)
+        return root, en_srt, zh_txt
+
+    def _run(self, root: Path, groups, name="video"):
+        """Invoke cmd_dub_merge in-process. Returns (exit_code, stdout_json).
+        exit_code None = returned normally (exit 0)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": name,
+                              "group": list(groups)})()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_merge(args)
+            except SystemExit as e:
+                code = e.code
+        try:
+            report = json.loads(buf.getvalue())
+        except ValueError:
+            report = None
+        return code, report
+
+    def _blocks(self, path: Path):
+        """Parse an SRT on disk into [(num, ts, text), ...]."""
+        text = path.read_text(encoding="utf-8").strip()
+        out = []
+        for b in re.split(r"\n\s*\n", text):
+            lines = b.splitlines()
+            out.append((int(lines[0]), lines[1], " ".join(lines[2:])))
+        return out
+
+    def _assert_refused_untouched(self, root, en_srt, zh_txt,
+                                  orig_en, orig_zh, code, report):
+        assert code == 1  # _die's non-zero exit
+        assert report is None or report.get("ok") is False
+        # zero side effects: working files byte-identical, no backups created
+        assert en_srt.read_text(encoding="utf-8") == orig_en
+        assert zh_txt.read_text(encoding="utf-8") == orig_zh
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+        assert not (zh_txt.parent / "translations_dub.txt.v1").exists()
+
+
+class TestDubMerge(_DubMergeHarness):
+
+    def test_single_group_merges_both_sides_in_lockstep(self, tmp_path):
+        """The happy path: --group 2,3 merges cue 2+3 on BOTH sides in one
+        atomic action — en text space-joined, zh text directly joined, the
+        merged window = first start + last end, untouched cues verbatim,
+        numbering resequenced, and .v1 backups holding the pre-merge files."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+            (3, "00:00:05,300 --> 00:00:06,400", "third cue"),
+            (4, "00:00:07,500 --> 00:00:08,600", "fourth cue"),
+        ]
+        zh = ["第一句", "第二句", "第三句", "第四句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+
+        code, report = self._run(root, ["2,3"])
+
+        assert code is None  # returned normally -> exit 0
+        assert report["ok"] is True
+        assert report["cues_before"] == 4
+        assert report["cues_after"] == 3
+
+        # en side: 3 cues, untouched ones byte-identical, merged window spans
+        # first start -> last end, texts space-joined
+        blocks = self._blocks(en_srt)
+        assert [b[0] for b in blocks] == [1, 2, 3]
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,000", "first cue")
+        assert blocks[1] == (2, "00:00:03,100 --> 00:00:06,400",
+                             "second cue third cue")
+        assert blocks[2] == (3, "00:00:07,500 --> 00:00:08,600", "fourth cue")
+
+        # zh side: 3 lines, group 2+3 directly concatenated, others verbatim
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["第一句", "第二句第三句", "第四句"]
+
+        # backups hold the pristine pre-merge files
+        assert (en_srt.parent / "video.en.full.srt.v1").read_text(
+            encoding="utf-8") == orig_en
+        assert (zh_txt.parent / "translations_dub.txt.v1").read_text(
+            encoding="utf-8") == orig_zh
+
+    def test_existing_v1_backup_is_never_overwritten(self, tmp_path):
+        """A second merge run must NOT clobber the .v1 backups: they hold the
+        pristine pre-any-merge state (the recovery point), matching the
+        *.v1 convention the dub pipeline already relies on."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first"),
+            (2, "00:00:03,000 --> 00:00:04,000", "second"),
+            (3, "00:00:05,000 --> 00:00:06,000", "third"),
+            (4, "00:00:07,000 --> 00:00:08,000", "fourth"),
+        ]
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        pristine_en = en_srt.read_text(encoding="utf-8")
+        pristine_zh = zh_txt.read_text(encoding="utf-8")
+        en_bak = en_srt.parent / "video.en.full.srt.v1"
+        zh_bak = zh_txt.parent / "translations_dub.txt.v1"
+
+        # first merge: groups 1,2 -> backups created from the pristine files
+        code, _ = self._run(root, ["1,2"])
+        assert code is None
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+
+        # second merge on the renumbered file (groups now 2,3 = old 3,4):
+        # current files change, .v1 stays pristine
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["cues_after"] == 2
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+        # and the second merge really did rewrite the working files
+        assert [b[2] for b in self._blocks(en_srt)] == \
+            ["first second", "third fourth"]
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三四"]
+
+    # -- refusals: every invariant failure leaves ZERO side effects ----------
+
+    def _pristine(self, en_cues, zh):
+        en = [
+            (i + 1, f"00:00:{i + 1:02d},000 --> 00:00:{i + 1:02d},500",
+             f"cue {i + 1}")
+            for i in range(len(zh))
+        ]
+        return en
+
+    def test_reject_out_of_bounds_group(self, tmp_path):
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,9"])  # 9 > 4 cues
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_zero_index(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["0,1"])  # 1-based: 0 is invalid
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_consecutive_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,3"])  # skips line 2
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_overlapping_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,2", "2,3"])  # line 2 claimed twice
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_singleton_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2"])  # merging one line is a no-op
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_integer_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["one,two"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_no_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, [])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_line_count_mismatch_one_side_hand_merged(self, tmp_path):
+        """THE incident shape: someone already merged cue groups by hand on
+        the en side only (3 en cues left, zh still 4 lines). The pairing
+        invariant must refuse the merge — running it would pair zh line 3
+        with the wrong en cue and ship 4-14s-late audio again."""
+        # en side: 3 cues, cue 2 already absorbed cue 3's text by hand
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "cue 1"),
+            (2, "00:00:03,000 --> 00:00:06,000", "cue 2 cue 3"),
+            (3, "00:00:07,000 --> 00:00:08,000", "cue 4"),
+        ]
+        zh = ["一", "二", "三", "四"]  # zh side: still 4 separate lines
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_missing_translations_file(self, tmp_path):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / "video.en.full.srt"
+        _make_srt(en_srt, self._pristine(None, ["一", "二"]))
+        code, report = self._run(root, ["1,2"])
+        assert code == 1
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+
+    # -- several groups in one run ------------------------------------------
+
+    def test_multiple_groups_one_run_out_of_order_flags(self, tmp_path):
+        """--group is repeatable; flags may arrive in any order and a group
+        may span 3 lines. 6 cues, groups {1,2} and {4,5,6} -> 3 output cues."""
+        zh = ["一", "二", "三", "四", "五", "六"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        code, report = self._run(root, ["4,5,6", "1,2"])  # deliberately unordered
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_before"] == 6
+        assert report["cues_after"] == 3
+        assert report["merged"] == [[1, 2], [4, 5, 6]]
+        blocks = self._blocks(en_srt)
+        # merged windows: group 1 spans cue1.start->cue2.end; group 2 spans
+        # cue4.start->cue6.end; cue 3 passes through verbatim
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,500", "cue 1 cue 2")
+        assert blocks[1] == (2, "00:00:03,000 --> 00:00:03,500", "cue 3")
+        assert blocks[2] == (3, "00:00:04,000 --> 00:00:06,500",
+                             "cue 4 cue 5 cue 6")
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三", "四五六"]
+
+
+# ----------------------------------------------------------------------------
+# Regression fixture: the 2026-10 "flywheel + 群聊" misalignment incident.
+# Real texts from leerob/stanford-cs146s-always-on-agents
+# (transcript/*.v1, cues 330-333). The hand-merge folded the short group-chat
+# sentence into the flywheel paragraph cue on the en side only; zh drifted
+# one line (dangling "所以说，") and 8 dubbed sentences landed 4-14s late.
+# ============================================================================
+
+# flywheel paragraph sentence (en), verbatim minus the absorbed tail
+_FLY_EN = ("And ideally the new models are learning from all of these bugs "
+           "and these failures, and they're kind of climbing on the evals to "
+           "get better at the things that you care about. And you can drop "
+           "the new versions into the product and make sure that they're "
+           "improving in all these different things.")
+# its zh, verbatim minus the dangling "所以说，" the incident left behind
+_FLY_ZH = ("理想状态下，新模型会从这一大堆 bug 和失败里学习，在你真正关心的那些 "
+           "eval 指标上不断爬升。你把新版本放进产品里，确认各项东西确实都在变好。")
+# the short group-chat sentence that got folded into the flywheel cue
+_CHAT_EN = ("So There hasn't really been a lot of training data, for "
+            "example, on using bots in a group chat.")
+_CHAT_ZH = "比如 bot 在群聊里该怎么表现，就没有多少训练数据。"
+# the sentence AFTER the pair — in the incident state it was paired with
+# _CHAT_ZH (one line of drift); after a legal merge it must get its own zh.
+_NEXT_EN = ("This is kind of an emergent thing that's being figured out, "
+            "and it's important to get it right.")
+_NEXT_ZH = "这是一件正在摸索中、逐渐成型的新事物，而把它做对非常重要。"
+# the cue before the flywheel pair (verbatim from the incident, v1 cue 329)
+_PREV_EN = ("But then there's this outer loop, which is like every few "
+            "months or every month or however long you're training new models.")
+_PREV_ZH = "而外面还有一层外环：每隔几个月、或者每个月，总之按某种周期，训练新模型。"
+
+
+class TestDubMergeFlywheelRegression(_DubMergeHarness):
+    """Same seam as TestDubMerge (in-process cmd_dub_merge, temp dirs), but
+    the material is the real incident text so the shape that broke the run
+    can never quietly come back."""
+
+    def _pristine(self, tmp_path):
+        """The pre-incident state: 4 clean en/zh pairs around the flywheel
+        paragraph. Cue 3's reconstructed timestamps keep the incident's
+        merged window (…,357 --> …15,946) as first-start/last-end."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:07,900", _FLY_EN),
+            (3, "00:37:08,000 --> 00:37:15,946", _CHAT_EN),
+            (4, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        zh = [_PREV_ZH, _FLY_ZH, _CHAT_ZH, _NEXT_ZH]
+        return self._setup(tmp_path, en_cues, zh)
+
+    def test_legal_merge_keeps_flywheel_pairing_in_lockstep(self, tmp_path):
+        """Merging the flywheel cue with the group-chat cue through the tool:
+        both sides move together, the 群聊 zh lands in the SAME cue as its en
+        sentence, and the following cue is paired with ITS zh (exactly the
+        pairing the hand-merge destroyed)."""
+        root, en_srt, zh_txt = self._pristine(tmp_path)
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_after"] == 3
+
+        blocks = self._blocks(en_srt)
+        zh_out = zh_txt.read_text(encoding="utf-8").splitlines()
+
+        # en cue 2 = flywheel + group-chat, window = first start + last end
+        assert blocks[1][1] == "00:36:50,357 --> 00:37:15,946"
+        assert blocks[1][2] == _FLY_EN + " " + _CHAT_EN
+        # zh line 2 = flywheel zh + 群聊 zh, directly joined — the group-chat
+        # translation travels WITH its english sentence
+        assert zh_out[1] == _FLY_ZH + _CHAT_ZH
+        # the next pair stays paired (the one-line drift never happens)
+        assert blocks[2][2] == _NEXT_EN
+        assert zh_out[2] == _NEXT_ZH
+        # untouched neighbours pass through verbatim
+        assert blocks[0][2] == _PREV_EN and zh_out[0] == _PREV_ZH
+        # both sides carry the same number of entries
+        assert len(blocks) == len(zh_out) == 3
+
+    def test_incident_shape_one_side_hand_merged_is_refused(self, tmp_path):
+        """The incident re-run: the en side has ALREADY been hand-merged
+        (flywheel cue absorbed the group-chat sentence, 3 en cues) while zh
+        still has 4 lines with the dangling tail. The pairing invariant must
+        refuse and leave everything untouched — merging on top of a
+        desynchronized pair is what shipped 8 late sentences."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:15,946", _FLY_EN + " " + _CHAT_EN),
+            (3, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        # zh side still 4 lines, cue 2 ends with the incident's dangling tail
+        zh = [_PREV_ZH, _FLY_ZH + "所以说，", _CHAT_ZH, _NEXT_ZH]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+
+class TestDubMergeCliSurface:
+    """The ticket's command shape: cook dub merge <root> <name> --group "a,b,c"
+    (repeatable). Pinned at the argparse surface like TestQualityParserInt."""
+
+    def test_group_flag_repeatable_appends(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "merge", "author/video", "video", "--group", "1,2",
+             "--group", "5,6,7"])
+        assert args.group == ["1,2", "5,6,7"]
+        assert args.output_root == "author/video"
+        assert args.name == "video"
+        assert args.func is cook.cmd_dub_merge
+
+
 # dub measure-rate (ticket 04): measure the real speech rate of audition
 # wavs / synthesized takes via energy VAD. Tests synthesize tiny wavs
 # (sine = speech, zeros = silence) — no real audio is ever loaded.

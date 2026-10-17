@@ -54,6 +54,7 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 | `cook verify-align <root> <name>` | DP-align `en.srt` vs `translations.txt`, catch missing/drifted translations | (new — no prior equivalent) |
 | `cook verify-shipment <root> <name>` | Check the full release set exists; exit 0 = ready to ship | (new — no prior equivalent) |
 | `cook dub <stage> <root> <name> --python <venv>` | Dub pipeline (separate/synth/timeline/retime/burn, or `full`) under the IndexTTS2 venv; `burn --keep-subs` reuses hand-edited subtitle files | video-dubbing Steps 1, 4-7 |
+| `cook dub merge <root> <name> --group "a,b,c"` | Merge cue groups in `en.full.srt` + `translations_dub.txt` in lockstep (`--group` repeatable, 1-based consecutive lines); refuses to write unless the zh/en pairing invariants hold, backs up both files as `*.v1` | hand-editing the SRT to merge cues (one side alone desynchronizes zh/en) |
 
 Every command prints a JSON object on stdout (machine-readable; agents parse this) and human-readable progress on stderr. Exit codes are meaningful: 0 = done criterion passed, non-zero = it didn't.
 
