@@ -27,6 +27,7 @@ dependencies = []
 #   pip install video-cook[download]    # for cook download
 #   pip install video-cook[transcribe]  # for cook transcribe
 #   pip install video-cook[subtitle]    # for cook subtitles (word-boundary cutting)
+#   pip install video-cook[dub]         # for cook dub measure-rate (energy VAD)
 #   pip install video-cook[all]         # everything
 download = ["yt-dlp>=2026.3.3"]
 transcribe = ["whisperx>=3.8.0"]
@@ -34,7 +35,11 @@ transcribe = ["whisperx>=3.8.0"]
 # (「技」「能」). Optional: without it shorten degrades to the legacy
 # width-only hard cut and warns on stderr.
 subtitle = ["jieba>=0.42"]
-all = ["yt-dlp>=2026.3.3", "whisperx>=3.8.0", "jieba>=0.42"]
+# dub measure-rate's energy VAD: soundfile streams the wav in blocks,
+# numpy does the per-block RMS. Optional: without them the command dies
+# with a pip install hint.
+dub = ["numpy", "soundfile"]
+all = ["yt-dlp>=2026.3.3", "whisperx>=3.8.0", "jieba>=0.42", "numpy", "soundfile"]
 dev = ["pytest>=7"]
 
 [project.scripts]
