@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -1125,6 +1127,7 @@ class TestQualityGuardR2:
 
 _DUB_STAGE_SCRIPTS = [
     "full_dub.py",
+    "retime.py",
     "loudness_match.py",
     "scan_reference.py",
     "extract_reference.py",
@@ -2249,3 +2252,424 @@ class TestDubMeasureRate:
         report, _, code = self._run(wav=wav, text="  你好，世界！  ")
         assert code == 0
         assert report["chars"] == 6
+
+
+# ----------------------------------------------------------------------------
+# dub retime (ticket 08): rewrite the bilingual SRT's start times to the
+# dubbed speech's real word times. All tests use FAKE word timestamps —
+# the faster-whisper model is never loaded here (resource rule).
+# ----------------------------------------------------------------------------
+
+def _load_retime():
+    """Load stages/dub/retime.py fresh. Module level is stdlib-only; the
+    faster-whisper import happens lazily inside the transcriber factory."""
+    spec = importlib.util.spec_from_file_location(
+        f"retime_test_{id(_stages_dub_dir()):x}", _stages_dub_dir() / "retime.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestRetimeCharFilter:
+    """filter_chars: punctuation and whitespace drop out, everything else
+    (CJK, latin, digits) stays in order — the rule calibrated against the
+    leerob _fw_char_maps.json (79 raw -> 69 kept chars on cue 0)."""
+
+    def test_punct_and_space_dropped(self):
+        mod = _load_retime()
+        assert mod.filter_chars("如前所说，我是 Lee。今天") == "如前所说我是Lee今天"
+
+    def test_full_width_and_ascii_punct_both_drop(self):
+        mod = _load_retime()
+        assert mod.filter_chars("你好，世界！hello? (ok)") == "你好世界hellook"
+
+    def test_empty_for_punct_only(self):
+        mod = _load_retime()
+        assert mod.filter_chars("。，！？ ") == ""
+
+
+class TestRetimeCharMap:
+    """build_char_map: SequenceMatcher maps the filtered text's chars onto
+    the ASR word stream; every char gets the START time of the word it
+    matched (absolute = cue_start + word start). Fake words only."""
+
+    def test_exact_match_gives_word_starts(self):
+        mod = _load_retime()
+        # text filters to 你好世界; ASR hears exactly that in 2 words
+        words = [(0.00, 0.42, "你好"), (0.42, 0.90, "世界")]
+        times = mod.build_char_map("你好世界", 100.0, words)
+        assert times == [100.00, 100.00, 100.42, 100.42]
+
+    def test_unmatched_chars_forward_fill_previous_word(self):
+        """ASR mishears latin (Lee->力): the unmatched latin chars inherit
+        the PREVIOUS matched char's time (leerob cue 0: L,e,e all got
+        我's 1.351, not 力's later word start)."""
+        mod = _load_retime()
+        words = [(0.00, 0.30, "我是力"), (0.30, 0.80, "今天")]
+        times = mod.build_char_map("我是Lee今天", 10.0, words)
+        # 我/是 in word 1; L/e/e unmatched -> forward fill from previous
+        assert times == [10.00, 10.00, 10.00, 10.00, 10.00, 10.30, 10.30]
+
+    def test_leading_unmatched_fill_from_cue_start(self):
+        """Leading unmatched chars take the CUE window start, not the
+        first word's time — calibrated on leerob cue 59 ('subagent...'
+        latin head got the window start while fw's first word began
+        0.44s later)."""
+        mod = _load_retime()
+        words = [(0.44, 0.90, "世界")]
+        times = mod.build_char_map("你好世界", 10.0, words)
+        assert times == [10.00, 10.00, 10.44, 10.44]
+
+    def test_asr_punctuation_ignored_on_asr_side(self):
+        """fw zh output carries punctuation; it must not consume a text
+        char in the alignment."""
+        mod = _load_retime()
+        words = [(0.00, 0.40, "你好，"), (0.40, 0.80, "世界。")]
+        times = mod.build_char_map("你好世界", 0.0, words)
+        assert times == [0.00, 0.00, 0.40, 0.40]
+
+    def test_poor_transcript_returns_none(self):
+        """Fewer than half the chars matched: the whole map is rejected —
+        the leerob cue 240 case (coverage 0.471, 同樣/幀 traditional-char
+        garble) fell back rather than trusting garbage times."""
+        mod = _load_retime()
+        words = [(0.00, 0.90, "完全不同的句子啊真的")]
+        assert mod.build_char_map("你好世界", 0.0, words) is None
+
+    def test_half_coverage_is_accepted(self):
+        """Exactly 50% matched stays trusted — the leerob cue 32 boundary
+        case (9/18 chars, accepted by the reference chain)."""
+        mod = _load_retime()
+        # text filters to 你好世界啊; ASR hears 世界啊 + 3 junk chars
+        words = [(0.20, 0.90, "世界啊呸呸呸")]
+        times = mod.build_char_map("你好世界啊", 5.0, words)
+        assert times is not None
+        assert times == [5.00, 5.00, 5.20, 5.20, 5.20]
+
+    def test_case_sensitive_mismatch_fills_not_rejects(self):
+        """A single-case mismatch (harness vs Harness) still aligns the
+        rest; the mismatched chars forward-fill (leerob cue 2, 81/83)."""
+        mod = _load_retime()
+        words = [(0.00, 1.00, "一个很简单的Harness了")]
+        times = mod.build_char_map("一个非常简单的harness了", 0.0, words)
+        # 15 filtered chars on the text side (7 CJK + 7 latin + 了), one
+        # ASR word covering them all -> every char takes its start
+        assert times is not None
+        assert len(times) == 15
+
+
+
+class TestRetimePlan:
+    """retime_plan: the two-pass rewrite. Behaviors verified bit-exact
+    against the leerob r12 accepted output (778/778 starts)."""
+
+    def _cue(self, start, end, zh, en="en text"):
+        return {"num": ["1"], "start": start, "end": end,
+                "lines": [zh, en]}
+
+    def test_anchor_start_is_first_char_minus_lead(self):
+        """ANCHOR cue: start = first char's time - 0.05 (subtitles land
+        50ms before the word is spoken); first cue gets the SAME lead,
+        not a double one (leerob cue 1: 0.331 -> 0.281)."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙丙丁，"), self._cue(12.0, 15.0, "戊己庚辛")]
+        plan = mod.retime_plan(cues, "甲乙丙丁戊己庚辛",
+                               [10.0, 10.5, 11.0, 11.5, 20.0, 20.5, 21.0, 21.5],
+                               30.0)
+        assert plan[0]["kind"] == "ANCHOR"
+        assert plan[0]["start"] == 10.0 - 0.05
+        assert plan[1]["start"] == 20.0 - 0.05
+
+    def test_dwell_inherits_then_min_gap_clamp(self):
+        """A union repeat (same zh text as the cue just consumed) inherits
+        the previous start and the monotonic clamp pushes it +0.04 — the
+        leerob cue 65/66 pattern: [234.126] then [234.166]."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙，"),
+                self._cue(9.0, 9.02, "甲乙，"),   # union repeat
+                self._cue(12.0, 15.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [10.0, 10.5, 20.0, 20.5], 30.0)
+        assert [p["kind"] for p in plan] == ["ANCHOR", "DWELL", "ANCHOR"]
+        assert plan[0]["start"] == 9.95
+        assert plan[1]["start"] == 9.95 + 0.04
+        assert plan[1]["end"] == plan[2]["start"] - 0.02
+
+    def test_end_is_next_start_minus_gap_and_last_uses_dub_dur(self):
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙"), self._cue(12.0, 15.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [10.0, 10.5, 20.0, 20.5], 30.0)
+        assert plan[0]["end"] == plan[1]["start"] - 0.02
+        assert plan[1]["end"] == 30.0 - 0.02   # last end = dub duration - 0.02
+
+    def test_last_end_falls_back_to_input_when_no_dub_dur(self):
+        """Without a dub.wav to anchor the tail, the last end keeps the
+        input value verbatim — a -0.02 fallback would drift 20ms on every
+        re-run and break idempotency."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙")]
+        plan = mod.retime_plan(cues, "甲乙", [10.0, 10.5], None)
+        assert plan[0]["end"] == 12.0
+
+    def test_close_anchors_are_monotonically_clamped(self):
+        """Anchor char times closer than the min gap cannot stack: each
+        start is pushed to previous + 0.04 (the 'topping up' guard that
+        kept dwell chains from pushing cues skyward)."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 9.5, "甲"), self._cue(9.5, 10.0, "乙")]
+        plan = mod.retime_plan(cues, "甲乙", [10.0, 10.02], 30.0)
+        assert plan[0]["start"] == 9.95
+        assert plan[1]["start"] == 9.95 + 0.04
+
+    def test_gap_chars_keep_input_start(self):
+        """An anchor whose char times are None (the ASR map was rejected)
+        keeps the start already on disk — never invent a time from
+        nothing (leerob cue 519 anchored in the rejected cue 240)."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙"), self._cue(17.5, 21.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [10.0, 10.5, None, None], 30.0)
+        assert plan[0]["start"] == 9.95
+        assert plan[1]["start"] == 17.5     # kept verbatim
+
+    def test_en_grid_snap_pretrim_pulls_prev_end(self):
+        """A next-start at fractional >= .995 renders ~0.9s early in ASS
+        (centisecond carry formats as SS.100 -> libass reads SS.10); the
+        previous cue's end is pulled to the snap point - 0.04 — the three
+        leerob spots (2046.998 -> prev end 2046.060)."""
+        mod = _load_retime()
+        # anchor char time 101.048 -> start 100.998 (frac carries)
+        cues = [self._cue(9.0, 99.0, "甲乙"), self._cue(99.0, 104.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [10.0, 10.5, 101.048, 101.5], 110.0)
+        assert plan[1]["start"] == 100.998
+        # normal rule would be 100.998 - 0.02 = 100.978; snap trim wins:
+        assert plan[0]["end"] == 100 + 0.10 - 0.04
+
+    def test_no_snap_trim_below_carry_threshold(self):
+        """frac .994 does not carry (round -> 99): the normal
+        next-start-minus-0.02 end survives."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 99.0, "甲乙"), self._cue(99.0, 104.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [10.0, 10.5, 101.044, 101.5], 110.0)
+        assert plan[1]["start"] == 100.994
+        assert plan[0]["end"] == 100.994 - 0.02
+
+    def test_punctuation_only_cue_inherits(self):
+        """A cue whose zh filters to nothing cannot anchor; it inherits
+        the previous start like a dwell."""
+        mod = _load_retime()
+        cues = [self._cue(9.0, 12.0, "甲乙"), self._cue(12.0, 12.5, "。")]
+        plan = mod.retime_plan(cues, "甲乙", [10.0, 10.5], 30.0)
+        assert plan[1]["kind"] == "DWELL"
+        assert plan[1]["start"] == plan[0]["start"] + 0.04
+
+    def test_written_timestamps_round_to_millisecond(self):
+        """write_srt renders the plan's floats as SRT ms timestamps and
+        preserves cue numbers + text lines verbatim."""
+        mod = _load_retime()
+        cues = [{"num": ["7"], "start": 9.95, "end": 19.93,
+                 "lines": ["甲乙，", "en line"]}]
+        out = Path(tempfile.mkdtemp()) / "out.srt"
+        mod.write_srt(out, cues)
+        text = out.read_text(encoding="utf-8")
+        assert "7\n00:00:09,950 --> 00:00:19,930\n甲乙，\nen line" in text
+
+
+class TestRetimeStage:
+    """stage_retime: file-level orchestration with an injected fake
+    transcriber (the model is never loaded). Verifies the backup, the
+    rewrite, and the report — the public seam the CLI calls."""
+
+    def _fixture(self, tmp_path: Path) -> Path:
+        """2 dubbing cues, 3 bilingual cues (one union repeat), 2 dummy
+        pad wavs; no dub.wav (duration falls back to input end)."""
+        root = tmp_path / "vid"
+        work = root / "dubbed" / "_full"
+        work.mkdir(parents=True)
+        _make_srt(work / "dubbing.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "甲乙丙丁，"),
+            (2, "00:00:20,000 --> 00:00:22,000", "戊己庚辛"),
+        ])
+        _make_srt(work / "dubbing.bilingual.srt", [
+            (1, "00:00:09,000 --> 00:00:12,000", "甲乙丙丁，\nen one"),
+            (2, "00:00:09,200 --> 00:00:09,220", "甲乙丙丁，\nen one"),
+            (3, "00:00:19,000 --> 00:00:22,000", "戊己庚辛\nen two"),
+        ])
+        (work / "_audio_pad").mkdir(parents=True, exist_ok=True)
+        for i in range(2):
+            (work / "_audio_pad" / f"cue_{i:04d}.wav").write_bytes(b"x" * 100)
+        return root
+
+    def _fake_transcriber(self):
+        """Deterministic fake word timestamps: cue 0 speaks 甲乙 at 0.0 and
+        丙丁 at 1.0; cue 1 speaks 戊己 at 0.0, 庚辛 at 1.0 (wav-relative)."""
+        words = [
+            [(0.0, 0.9, "甲乙"), (1.0, 1.9, "丙丁")],
+            [(0.0, 0.9, "戊己"), (1.0, 1.9, "庚辛")],
+        ]
+        it = iter(words)
+        return lambda wav: next(it)
+
+    def test_rewrite_backup_and_report(self, tmp_path):
+        mod = _load_retime()
+        root = self._fixture(tmp_path)
+        report = mod.stage_retime(root, "vid", transcriber=self._fake_transcriber())
+        assert report["ok"] is True
+        assert report["cues"] == 3
+        assert report["anchors"] == 2
+        assert report["dwells"] == 1
+        work = root / "dubbed" / "_full"
+        # backup holds the ORIGINAL content
+        backup = work / "dubbing.bilingual.srt.pre_retime"
+        assert backup.is_file()
+        assert "00:00:09,000 --> 00:00:12,000" in backup.read_text(encoding="utf-8")
+        # rewritten: anchor1 = 10.0-0.05; dwell = +0.04; anchor2 = 20.0-0.05
+        out = (work / "dubbing.bilingual.srt").read_text(encoding="utf-8")
+        assert "00:00:09,950 -->" in out          # anchor 1
+        assert "00:00:09,990 -->" in out          # dwell clamped
+        assert "00:00:19,950 -->" in out          # anchor 2
+        # end of cue 2 = dwell-clamped start - 0.02
+        assert "--> 00:00:09,970" in out
+        # text lines preserved verbatim
+        assert "en one" in out and "en two" in out
+        # report + char-map cache written
+        rep = json.loads((work / "_retime_report.json").read_text(encoding="utf-8"))
+        assert rep["cues"] == 3
+        maps = json.loads((work / "_fw_char_maps.json").read_text(encoding="utf-8"))
+        assert maps["0"] == [10.0, 10.0, 11.0, 11.0]
+        assert maps["1"] == [20.0, 20.0, 21.0, 21.0]
+
+    def test_idempotent_on_rerun(self, tmp_path):
+        """Running retime on its own output reproduces the same starts —
+        the fixed-point property the leerob regression relies on."""
+        mod = _load_retime()
+        root = self._fixture(tmp_path)
+        mod.stage_retime(root, "vid", transcriber=self._fake_transcriber())
+        first = (root / "dubbed" / "_full" / "dubbing.bilingual.srt").read_text(
+            encoding="utf-8")
+        # fresh transcriber iter for the second run
+        mod.stage_retime(root, "vid", transcriber=self._fake_transcriber())
+        second = (root / "dubbed" / "_full" / "dubbing.bilingual.srt").read_text(
+            encoding="utf-8")
+        assert first == second
+
+    def test_rejected_map_keeps_start_and_counts(self, tmp_path):
+        """A garbled transcript (transcriber returns junk) keeps the cue's
+        existing start and counts as a rejected source map."""
+        mod = _load_retime()
+        root = self._fixture(tmp_path)
+        junk = lambda wav: [(0.0, 1.9, "完全不一样的听写")]
+        report = mod.stage_retime(root, "vid", transcriber=junk)
+        assert report["maps_rejected"] == 2
+        assert report["kept_input"] == 2
+        out = (root / "dubbed" / "_full" / "dubbing.bilingual.srt").read_text(
+            encoding="utf-8")
+        # all three cues keep 9.0-ish input starts, clamped +0.04 apart
+        assert "00:00:09,000 -->" in out or "00:00:08,980 -->" in out
+
+    def test_missing_bilingual_is_error(self, tmp_path):
+        mod = _load_retime()
+        root = self._fixture(tmp_path)
+        (root / "dubbed" / "_full" / "dubbing.bilingual.srt").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_retime(root, "vid", transcriber=lambda w: [])
+        assert e.value.code not in (0, None)
+
+    def test_missing_pad_wavs_is_error_naming_them(self, tmp_path):
+        mod = _load_retime()
+        root = self._fixture(tmp_path)
+        (root / "dubbed" / "_full" / "_audio_pad" / "cue_0001.wav").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_retime(root, "vid", transcriber=lambda w: [])
+        assert e.value.code not in (0, None)
+
+
+class TestDubRetimeCommand:
+    """cook dub retime: launches stages/dub/retime.py under --python like
+    the other dub stages, with the retime prerequisites gated."""
+
+    def _capture_cmd(self, monkeypatch, tmp_path, python=None):
+        root = tmp_path / "vid"
+        work = root / "dubbed" / "_full"
+        work.mkdir(parents=True)
+        _make_srt(work / "dubbing.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "甲乙")])
+        _make_srt(work / "dubbing.bilingual.srt", [
+            (1, "00:00:09,000 --> 00:00:12,000", "甲乙\nen")])
+        (work / "_audio_pad").mkdir(parents=True, exist_ok=True)
+        (work / "_audio_pad" / "cue_0000.wav").write_bytes(b"x" * 100)
+        captured = {}
+
+        def fake_run_long_task(cmd, cwd, log_file, err_file, detach=False):
+            captured["cmd"] = cmd
+            return {"ok": True, "returncode": 0}
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run_long_task)
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "python": python})()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_dub_retime(args)
+        return captured.get("cmd")
+
+    def test_launches_package_script_with_stage_name(self, monkeypatch, tmp_path):
+        cmd = self._capture_cmd(monkeypatch, tmp_path)
+        assert cmd[1] == str(_stages_dub_dir() / "retime.py")
+        assert cmd[2] == "retime"
+        assert cmd[3].endswith("vid")
+        assert cmd[4] == "vid"
+
+    def test_python_flag_selects_interpreter(self, monkeypatch, tmp_path):
+        cmd = self._capture_cmd(monkeypatch, tmp_path, python="C:/venv/py.exe")
+        assert cmd[0] == "C:/venv/py.exe"
+
+    def test_missing_prerequisites_die_before_launch(self, monkeypatch, tmp_path):
+        """No dubbing.srt: the stage dies with the producing command in
+        the message, before any subprocess (and any model load)."""
+        root = tmp_path / "vid"
+        (root / "dubbed" / "_full").mkdir(parents=True)
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "python": None})()
+        with pytest.raises(SystemExit) as e:
+            cook.cmd_dub_retime(args)
+        assert e.value.code not in (0, None)
+
+
+class TestRetimeCLIMissingFasterWhisper:
+    """retime.py run under an interpreter where faster-whisper is missing:
+    non-zero exit with the install hint — never silent wrong values."""
+
+    def test_missing_fw_is_nonzero_with_hint(self, tmp_path):
+        d = _stages_dub_dir()
+        # a shim dir whose faster_whisper raises ImportError on import
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        (shim / "faster_whisper.py").write_text(
+            "raise ImportError('no faster-whisper here')\n", encoding="utf-8")
+        root = tmp_path / "vid"
+        work = root / "dubbed" / "_full"
+        work.mkdir(parents=True)
+        _make_srt(work / "dubbing.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "甲乙")])
+        _make_srt(work / "dubbing.bilingual.srt", [
+            (1, "00:00:09,000 --> 00:00:12,000", "甲乙\nen")])
+        (work / "_audio_pad").mkdir(parents=True, exist_ok=True)
+        (work / "_audio_pad" / "cue_0000.wav").write_bytes(b"x" * 100)
+        env = {k: v for k, v in os.environ.items()}
+        env["PYTHONPATH"] = str(shim) + os.pathsep + env.get("PYTHONPATH", "")
+        r = subprocess.run(
+            [sys.executable, str(d / "retime.py"), "retime", str(root), "vid"],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        assert r.returncode != 0
+        assert "faster-whisper" in (r.stdout + r.stderr)
+        assert "pip install faster-whisper" in (r.stdout + r.stderr)
+        # nothing was rewritten: the bilingual file keeps its original ts
+        assert "00:00:09,000 --> 00:00:12,000" in (
+            work / "dubbing.bilingual.srt").read_text(encoding="utf-8")
+        assert not (work / "dubbing.bilingual.srt.pre_retime").exists()

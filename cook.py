@@ -1202,6 +1202,14 @@ def _dub_prereqs() -> dict:
             {"rel": "dubbed/_full/_segments/", "kind": "dir_glob", "glob": "*.wav",
              "produces": "cook dub synth"},
         ],
+        "retime": [
+            {"rel": "dubbed/_full/dubbing.srt", "kind": "file",
+             "produces": "cook dub assemble"},
+            {"rel": "dubbed/_full/dubbing.bilingual.srt", "kind": "file",
+             "produces": "cook dub assemble"},
+            {"rel": "dubbed/_full/_audio_pad/", "kind": "dir_glob",
+             "glob": "cue_*.wav", "produces": "cook dub assemble"},
+        ],
     }
 
 
@@ -1234,7 +1242,8 @@ def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
                    log_name: str | None = None, extra_args: list[str] | None = None,
-                   workers: int = 1, stagger: float = 0.0) -> None:
+                   workers: int = 1, stagger: float = 0.0,
+                   script: str = "full_dub.py") -> None:
     """Run one full_dub.py stage as a subprocess under the chosen interpreter.
 
     This is the fix for the IndexTTS2 environment split: full_dub.py needs
@@ -1275,16 +1284,16 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     root = _video_dir(output_root)
     _check_dub_stage_prerequisites(stage, root, name)
 
-    # package-internal stages/dub/full_dub.py (2026-10 consolidation: the
-    # script ships with cook, so it can never be an older copy than the CLI
+    # package-internal stage script (2026-10 consolidation: the script
+    # ships with cook, so it can never be an older copy than the CLI
     # driving it — the --keep-subs version probe died with this change)
-    script = _stage_script("dub", "full_dub.py")
+    script_path = _stage_script("dub", script)
     py_bin = python or sys.executable
     log_file = root / "dubbed" / (log_name or f"{stage}.log")
     err_file = root / "dubbed" / (log_name or f"{stage}.log").replace(".log", ".err.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [py_bin, str(script), stage, str(root), name] + (extra_args or [])
+    cmd = [py_bin, str(script_path), stage, str(root), name] + (extra_args or [])
     label = f"cook dub {stage}"
     _log(f"{label}: stage={stage} python={py_bin} ({'detached' if detach else 'foreground'})")
 
@@ -1316,7 +1325,7 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
         for k, (band_lo, band_hi) in enumerate(bands, start=1):
             wlog = root / "dubbed" / f"synth.worker{k}.log"
             werr = root / "dubbed" / f"synth.worker{k}.err.log"
-            wcmd = [py_bin, str(script), "synth-worker", str(root), name,
+            wcmd = [py_bin, str(script_path), "synth-worker", str(root), name,
                     "--lo", str(band_lo), "--hi", str(band_hi),
                     "--stagger", str(k * stagger)]
             _log(f"{label}: worker {k}/{len(bands)} band {band_lo}-{band_hi} "
@@ -2065,6 +2074,42 @@ def cmd_dub_full(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------------------
+# dub subcommand: retime — subtitle starts follow the actual speech.
+# Runs stages/dub/retime.py as a subprocess under --python (faster-whisper
+# lives there, small/int8/cpu, one instance, serial per cue pad wav).
+# The rewrite backs up dubbing.bilingual.srt as .pre_retime first; exit
+# non-zero when faster-whisper is missing (degradation is the assemble
+# integration's call, ticket 09 — this stage never fails silently).
+# ----------------------------------------------------------------------------
+
+def cmd_dub_retime(args: argparse.Namespace) -> None:
+    """Rewrite dubbed/_full/dubbing.bilingual.srt start times onto the
+    dubbed speech's real word times (faster-whisper word timestamps on the
+    clean _audio_pad/cue_NNNN.wav tracks; SequenceMatcher char anchors;
+    two-pass anchors/dwells/clamp/end rules — the chain calibrated against
+    the reflux lecture's r12 accepted output). The original file is backed
+    up as dubbing.bilingual.srt.pre_retime before the rewrite."""
+    _run_dub_stage("retime", args.output_root, args.name,
+                   python=getattr(args, "python", None),
+                   detach=False,
+                   log_name="retime.log",
+                   script="retime.py")
+    # the stage already emitted the standard JSON payload; surface the
+    # detailed report (anchors/dwells/rejected maps) on stderr only —
+    # stdout must stay a single JSON document
+    report_path = _video_dir(args.output_root) / "dubbed" / "_full" / "_retime_report.json"
+    if report_path.is_file():
+        try:
+            rep = json.loads(report_path.read_text(encoding="utf-8"))
+            _log(f"cook dub retime: {rep.get('anchors')} anchors, "
+                 f"{rep.get('dwells')} dwells, {rep.get('kept_input')} kept-input "
+                 f"({rep.get('maps_rejected')} source map(s) rejected) — "
+                 f"details: {report_path.name}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+# ----------------------------------------------------------------------------
 # dub subcommand: measure-rate — the real speech rate, measured not assumed.
 # Wraps stages/dub/measure_rate.py IN-PROCESS (soundfile+numpy only, no
 # indextts venv needed). Exit 0 = rate measured; exit 1 = bad invocation or
@@ -2337,6 +2382,15 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run both stages: synth → assemble")
     _add_dub_common(pdfl, with_detach=True)
     pdfl.set_defaults(func=cmd_dub_full)
+
+    # retime: subprocess under --python (faster-whisper env).
+    prt = dub_sub.add_parser(
+        "retime",
+        help="rewrite dubbing.bilingual.srt starts onto the real speech "
+             "times (faster-whisper word timestamps on the clean pad wavs); "
+             "backs up the original as .pre_retime")
+    _add_dub_common(prt)
+    prt.set_defaults(func=cmd_dub_retime)
 
     # measure-rate: in-process (soundfile+numpy only — no indextts venv).
     pmr = dub_sub.add_parser(
