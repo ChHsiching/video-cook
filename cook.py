@@ -2110,6 +2110,208 @@ def cmd_dub_retime(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------------------
+# dub merge — the ONLY legal cue-merge entry: both sides in lockstep.
+# ----------------------------------------------------------------------------
+
+# The 2026-10 incident (leerob run): cue groups were merged by hand on the
+# en side only, leaving translations_dub.txt one line ahead — zh/en drifted
+# by one line and 8 dubbed sentences landed 4-14s late, surviving three
+# review passes. cook dub merge makes that edit impossible to do halfway:
+# one command merges <name>.en.full.srt AND translations_dub.txt together,
+# and refuses to touch anything unless every pairing invariant holds.
+
+_SRT_TS_RE = re.compile(
+    r"(\d{2,}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2,}):(\d{2}):(\d{2}),(\d{3})")
+
+
+def _parse_full_srt(path: Path) -> list[dict[str, str]]:
+    """Strict parse of an en.full.srt into [{start, end, text}, ...].
+    start/end keep the ORIGINAL timestamp strings (no float round-trip) so
+    untouched cues are rewritten byte-identically."""
+    return _parse_full_srt_str(path.read_text(encoding="utf-8-sig"))
+
+
+def _parse_full_srt_str(text: str) -> list[dict[str, str]]:
+    """Strict SRT parse from an in-memory string (used both to load the file
+    and to re-verify the serialized output before it is written)."""
+    cues: list[dict[str, str]] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        if len(lines) < 3 or not lines[0].strip().isdigit():
+            _die(f"malformed SRT block near {lines[0][:40]!r}")
+        ts = lines[1].strip()
+        if not _SRT_TS_RE.fullmatch(ts):
+            _die(f"malformed SRT timestamp in cue {lines[0].strip()}: {ts!r}")
+        start, _, end = ts.partition(" --> ")
+        cues.append({"start": start, "end": end,
+                     "text": " ".join(l.strip() for l in lines[2:])})
+    return cues
+
+
+def _parse_dub_merge_groups(raw: list[str] | None,
+                            n: int) -> list[list[int]]:
+    """Validate --group specs against a file of n lines; return 0-based
+    groups (sorted, each contiguous ascending). Raises ValueError with a
+    human message on any invalid spec — the caller refuses before writing."""
+    if not raw:
+        raise ValueError("no --group given — nothing to merge (e.g. --group 12,13)")
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for spec in raw:
+        try:
+            idx = [int(x) for x in str(spec).split(",")]
+        except ValueError:
+            raise ValueError(f"{spec!r}: line numbers must be 1-based integers")
+        if len(idx) < 2:
+            raise ValueError(f"{spec!r}: a merge group needs >= 2 lines")
+        for a, b in zip(idx, idx[1:]):
+            if b != a + 1:
+                raise ValueError(f"{spec!r}: lines must be consecutive "
+                                 f"(got {a} then {b})")
+        for i in idx:
+            if not 1 <= i <= n:
+                raise ValueError(f"{spec!r}: line {i} is out of range 1..{n}")
+            if i in seen:
+                raise ValueError(f"line {i} appears in more than one --group")
+        seen.update(idx)
+        groups.append([i - 1 for i in idx])
+    groups.sort(key=lambda g: g[0])
+    return groups
+
+
+def _apply_dub_merge(cues: list[dict[str, str]], zh: list[str],
+                     groups: list[list[int]]
+                     ) -> tuple[list[dict[str, str]], list[str]]:
+    """The pure transform. For each group: en cue = first start + last end
+    window with texts space-joined; zh line = texts directly joined. Lines
+    outside groups pass through unchanged. Numbering is NOT done here."""
+    starts = {g[0]: g for g in groups}
+    inside = {i for g in groups for i in g}
+    out_cues: list[dict[str, str]] = []
+    out_zh: list[str] = []
+    for i, cue in enumerate(cues):
+        if i in starts:
+            g = starts[i]
+            out_cues.append({"start": cues[g[0]]["start"],
+                             "end": cues[g[-1]]["end"],
+                             "text": " ".join(cues[j]["text"] for j in g)})
+            out_zh.append("".join(zh[j] for j in g))
+        elif i in inside:
+            continue
+        else:
+            out_cues.append(dict(cue))
+            out_zh.append(zh[i])
+    return out_cues, out_zh
+
+
+def _serialize_srt(cues: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for k, c in enumerate(cues, 1):
+        parts += [str(k), f"{c['start']} --> {c['end']}", c["text"], ""]
+    return "\n".join(parts)
+
+
+def _verify_dub_merge(en_text: str, zh_text: str,
+                      groups: list[list[int]], cues: list[dict[str, str]],
+                      zh: list[str]) -> None:
+    """Final pre-write gate, run on the exact bytes about to hit the disk:
+    re-parse both serializations and assert (a) the two sides still carry the
+    same number of entries, and (b) every merged group starts with the first
+    word/first text of its first line on BOTH sides (the marker that pairs
+    them). Any mismatch means the merge corrupted the pairing — refuse."""
+    re_cues = _parse_full_srt_str(en_text)
+    re_zh = zh_text.splitlines()
+    while re_zh and re_zh[-1].strip() == "":
+        re_zh.pop()
+    if len(re_cues) != len(re_zh):
+        _die(f"pairing invariant violated in the merged output "
+             f"({len(re_cues)} en cues vs {len(re_zh)} zh lines); refusing to write")
+    removed = 0
+    for g in groups:
+        k = g[0] - removed  # 0-based position of this group in the output
+        removed += len(g) - 1
+        first_en = cues[g[0]]["text"]
+        if first_en and re_cues[k]["text"].split()[:1] != first_en.split()[:1]:
+            _die(f"first-word marker mismatch on en side of group "
+                 f"{g[0] + 1}-{g[-1] + 1}; refusing to write")
+        if not re_zh[k].startswith(zh[g[0]]):
+            _die(f"first-text marker mismatch on zh side of group "
+                 f"{g[0] + 1}-{g[-1] + 1}; refusing to write")
+
+
+def cmd_dub_merge(args: argparse.Namespace) -> None:
+    """Merge cue groups in <name>.en.full.srt and translations_dub.txt in
+    LOCKSTEP — the only supported way to merge, because editing one file by
+    hand desynchronizes zh/en (the 2026-10 incident: one line of drift, 8
+    dubbed sentences 4-14s late, three review passes missed it).
+
+    --group takes 1-based consecutive line numbers ("--group 12,13"),
+    repeatable; a run applies to the current numbering (after a merge the
+    file is renumbered, so the next --group uses the new numbers).
+
+    Refuses to write anything (zero side effects — no backup, no rewrite)
+    unless every invariant holds:
+      1. both sides carry the same number of lines (nothing was hand-merged
+         on one side already);
+      2. every group is in range, consecutive, >=2 lines, and no line is
+         claimed twice — one validated set drives BOTH sides;
+      3. the serialized output re-parses with equal counts on both sides and
+         every merged group still starts with its first line's first word
+         (en) / first text (zh) — the pairing marker.
+    On success both originals are backed up once as *.v1 (an existing .v1 is
+    kept: it holds the pristine pre-any-merge state)."""
+    root = _video_dir(args.output_root)
+    name = args.name
+    en_path = root / "transcript" / f"{name}.en.full.srt"
+    zh_path = root / "transcript" / "translations_dub.txt"
+    if not en_path.exists():
+        _die(f"{en_path.name} not found: {en_path}")
+    if not zh_path.exists():
+        _die(f"translations_dub.txt not found: {zh_path}")
+
+    cues = _parse_full_srt(en_path)
+    zh_lines = zh_path.read_text(encoding="utf-8").splitlines()
+    while zh_lines and zh_lines[-1].strip() == "":
+        zh_lines.pop()
+
+    # Invariant 1: the two files must still be line-for-line paired.
+    if len(cues) != len(zh_lines):
+        _die(f"pairing invariant violated: {en_path.name} has {len(cues)} cues "
+             f"but translations_dub.txt has {len(zh_lines)} lines — one side "
+             f"was edited alone. Fix the pairing before merging.",
+             {"en_cues": len(cues), "zh_lines": len(zh_lines)})
+
+    # Invariant 2: one validated group set drives both sides.
+    try:
+        groups = _parse_dub_merge_groups(getattr(args, "group", None), len(cues))
+    except ValueError as e:
+        _die(f"--group rejected: {e}", {"en_cues": len(cues)})
+
+    new_cues, new_zh = _apply_dub_merge(cues, zh_lines, groups)
+    en_text = _serialize_srt(new_cues)
+    zh_text = "\n".join(new_zh) + "\n"
+
+    # Invariant 3: verify the exact bytes before touching the disk.
+    _verify_dub_merge(en_text, zh_text, groups, cues, zh_lines)
+
+    # Backups first (only if absent — the pristine pre-merge state wins),
+    # then the lockstep write.
+    for pth in (en_path, zh_path):
+        bak = pth.with_name(pth.name + ".v1")
+        if not bak.exists():
+            shutil.copyfile(pth, bak)
+    en_path.write_text(en_text, encoding="utf-8")
+    zh_path.write_text(zh_text, encoding="utf-8")
+
+    _emit_json({"ok": True,
+                "cues_before": len(cues),
+                "cues_after": len(new_cues),
+                "merged": [[i + 1 for i in g] for g in groups],
+                "backup_suffix": ".v1"})
+
+
 # dub subcommand: measure-rate — the real speech rate, measured not assumed.
 # Wraps stages/dub/measure_rate.py IN-PROCESS (soundfile+numpy only, no
 # indextts venv needed). Exit 0 = rate measured; exit 1 = bad invocation or
@@ -2167,6 +2369,37 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
              obj={"stage": "measure-rate"})
 
     # --- measure (serially: one wav's blocks in memory at a time) ---
+    rate, rows = _measure_rate_pairs(mr, pairs, labels, stage="measure-rate")
+    report = {
+        "ok": True,
+        "mode": mode,
+        "files": rows,
+        "files_measured": len(rows),
+        "chars": sum(r["chars"] for r in rows),
+        "voiced_seconds": round(sum(r["voiced_seconds"] for r in rows), 3),
+        "rate": round(rate, 3),
+    }
+    if getattr(args, "json", False):
+        _emit_json(report)
+    else:
+        _log(f"measured rate: {rate:.2f} chars/s "
+             f"({report['chars']} chars / {report['voiced_seconds']:.1f}s "
+             f"voiced, {len(rows)} file(s))")
+    print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+    sys.exit(0)
+
+
+def _measure_rate_pairs(mr, pairs: list, labels: list[str],
+                        stage: str = "measure-rate") -> tuple[float, list]:
+    """Shared measurement loop behind `cook dub measure-rate` and
+    `cook dub gate --self-measure`: count chars per line (measure_rate's
+    convention), VAD each wav's voiced span STREAMING (one wav's blocks in
+    memory at a time — safe on any file size, per the resource contract),
+    and return (rate chars/s, per-file rows).
+
+    An input with NO detected speech is an error, not a rate of 0 — a silent
+    take means synthesis failed, and a 0-rate would poison every downstream
+    estimate that consumes it (the gate included)."""
     rows, silent = [], []
     total_chars = 0
     total_voiced = 0.0
@@ -2175,7 +2408,7 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
         voiced = mr.voiced_seconds(wav)
         if chars <= 0:
             _die(f"text for {label} has no countable characters", {
-                "stage": "measure-rate", "file": label})
+                "stage": stage, "file": label})
         if voiced <= 0.0:
             silent.append(label)
             continue
@@ -2187,28 +2420,124 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
         _die(f"no speech detected in {len(silent)} file(s) — the take is "
              f"silent (synthesis failed?): {', '.join(silent[:5])}"
              + (" ..." if len(silent) > 5 else ""), {
-                 "stage": "measure-rate", "silent_files": silent})
+                 "stage": stage, "silent_files": silent})
     if total_voiced <= 0.0:
-        _die("no speech detected in any input", obj={"stage": "measure-rate"})
+        _die("no speech detected in any input", obj={"stage": stage})
+    return total_chars / total_voiced, rows
 
-    rate = total_chars / total_voiced
-    report = {
-        "ok": True,
-        "mode": mode,
-        "files": rows,
-        "files_measured": len(rows),
-        "chars": total_chars,
-        "voiced_seconds": round(total_voiced, 3),
-        "rate": round(rate, 3),
-    }
-    if getattr(args, "json", False):
-        _emit_json(report)
+
+# ----------------------------------------------------------------------------
+# dub subcommand: gate — the pre-synth length gate on translations_dub.txt,
+# driven by the MEASURED speech rate (ticket 05). The assumed-rate planning
+# that the old length_gate.py did internally (bucketed syll/s estimates,
+# ~5 chars/s in effect) is what let the 2026-10 run's thin translation pass
+# and cost ~6h of rework — here the rate is an INPUT, and it is mandatory.
+# Wraps stages/dub/length_gate.py IN-PROCESS (pure arithmetic, no audio
+# deps). Exit 0 = pass/advisory-only; exit 1 = refused, short, over-budget,
+# or coverage out of band.
+# ----------------------------------------------------------------------------
+
+def _gate_self_measure(root: Path) -> float:
+    """Derive the speech rate for the gate from the run's own synthesized
+    takes: pair translations_dub.txt lines with dubbed/_full/_segments/
+    sent_NNNN.wav (measure_rate.pair_segments) and VAD them serially — one
+    wav's streaming blocks in memory at a time, the same resource contract
+    as cook dub measure-rate. Prints the measured value (the operator must
+    SEE what the gate will run on), returns it as chars/s."""
+    import importlib.util
+    if importlib.util.find_spec("soundfile") is None:
+        _die("soundfile not installed — gate --self-measure needs it for "
+             "VAD. Run: pip install soundfile numpy (or measure the rate "
+             "explicitly with an environment that has it)",
+             obj={"stage": "gate"})
+    mr = _import_stage_module("dub", "measure_rate.py",
+                              "cook_stages_dub_measure")
+    try:
+        pairs = mr.pair_segments(root)
+    except (FileNotFoundError, ValueError) as e:
+        _die(f"{e} — --self-measure needs a synthesized run "
+             "(dubbed/_full/_segments). Otherwise measure an audition take "
+             "with `cook dub measure-rate` and pass --rate explicitly",
+             obj={"stage": "gate"})
+    labels = [w.relative_to(root).as_posix() for w, _ in pairs]
+    rate, rows = _measure_rate_pairs(mr, pairs, labels, stage="gate")
+    _log(f"gate --self-measure: {rate:.3f} chars/s "
+         f"({sum(r['chars'] for r in rows)} chars / "
+         f"{sum(r['voiced_seconds'] for r in rows):.1f}s voiced, "
+         f"{len(rows)} take(s)) — gating by this measured value")
+    return rate
+
+
+def cmd_dub_gate(args: argparse.Namespace) -> None:
+    """Length-gate the dub translation against the MEASURED speech rate.
+
+    Rate sources (exactly one):
+      --rate CHARS_PER_SEC   a value measured by `cook dub measure-rate`
+                             (audition take or synthesized run)
+      --self-measure         measure the rate right here from
+                             dubbed/_full/_segments (synth's takes), print
+                             it, and gate by the measured value
+
+    Everything downstream — per-cue budget factor and total coverage — is
+    computed as est = count_chars(line)/rate, the reflux budget math
+    (预算 = 实测率 × 窗口) inverted, in the same char convention the rate
+    was calibrated in."""
+    import math
+
+    if args.self_measure and args.rate is not None:
+        _die("use either --rate or --self-measure, not both — --self-measure "
+             "derives the rate itself", obj={"stage": "gate"})
+    if args.self_measure:
+        rate = _gate_self_measure(_video_dir(args.output_root))
+        rate_source = "self-measured"
+    elif args.rate is not None:
+        if not math.isfinite(args.rate) or args.rate <= 0:
+            _die(f"--rate must be a positive chars/s value (got {args.rate!r}) "
+                 "measured with `cook dub measure-rate` — an assumed rate is "
+                 "what the 2026-10 run gated on and cost ~6h of rework",
+                 obj={"stage": "gate"})
+        rate = float(args.rate)
+        rate_source = "flag"
     else:
-        _log(f"measured rate: {rate:.2f} chars/s "
-             f"({total_chars} chars / {total_voiced:.1f}s voiced, "
-             f"{len(rows)} file(s))")
-    print("COOK-RESULT: OK", file=sys.stderr, flush=True)
-    sys.exit(0)
+        _die("gate requires the measured speech rate: pass --rate "
+             "CHARS_PER_SEC (from `cook dub measure-rate`) or --self-measure "
+             "to derive it from dubbed/_full/_segments. Refusing to run on an "
+             "assumed rate — that is how the 2026-10 run's thin translation "
+             "passed and cost ~6h of rework", obj={"stage": "gate"})
+
+    # --- evaluate (in-process: the gate is pure arithmetic, no audio deps) ---
+    root = _video_dir(args.output_root)
+    gate = _import_stage_module("dub", "length_gate.py",
+                                "cook_stages_dub_gate")
+    full_srt = root / "transcript" / f"{args.name}.en.full.srt"
+    trans = root / "transcript" / "translations_dub.txt"
+    for f in (full_srt, trans):
+        if not f.exists():
+            _die(f"{f} not found — the gate needs the en.full.srt cue windows "
+                 "and the dub translation (write it first)",
+                 obj={"stage": "gate", "missing": str(f)})
+    try:
+        rep = gate.evaluate(full_srt.read_text(encoding="utf-8"),
+                            trans.read_text(encoding="utf-8"), rate)
+    except ValueError as e:
+        _die(str(e), obj={"stage": "gate"})
+
+    rep.update({"ok": rep["verdict"] == "pass", "rate": rate,
+                "rate_source": rate_source, "stage": "gate"})
+    if getattr(args, "json", False):
+        _emit_json(rep)
+    else:
+        for line in gate.format_report(rep, rate, rate_source):
+            _log(line)
+    if rep["ok"]:
+        print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+        sys.exit(0)
+    summary = (f"coverage {rep['coverage'] * 100:.1f}%" if rep["coverage"] < 0.85
+               or rep["coverage"] > 1.12 else
+               f"{len(rep['short'])} short, {len(rep['over'])} over-budget")
+    print(f"COOK-RESULT: FAIL — length gate: {summary}; rerun after fixing "
+          "the flagged lines", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 
 # ============================================================================
@@ -2391,6 +2720,20 @@ def build_parser() -> argparse.ArgumentParser:
              "backs up the original as .pre_retime")
     _add_dub_common(prt)
     prt.set_defaults(func=cmd_dub_retime)
+    pdmg = dub_sub.add_parser(
+        "merge",
+        help="merge cue groups in en.full.srt + translations_dub.txt in "
+             "lockstep (the only legal merge; refuses to write unless the "
+             "zh/en pairing invariants hold)")
+    pdmg.add_argument("output_root")
+    pdmg.add_argument("name")
+    pdmg.add_argument("--group", action="append", metavar="A,B",
+                      help="1-based consecutive line numbers to merge into one "
+                           "cue, e.g. --group 12,13 (repeatable; after a merge "
+                           "the file is renumbered, so the next --group uses "
+                           "the new numbers)")
+    pdmg.set_defaults(func=cmd_dub_merge)
+
 
     # measure-rate: in-process (soundfile+numpy only — no indextts venv).
     pmr = dub_sub.add_parser(
@@ -2411,6 +2754,26 @@ def build_parser() -> argparse.ArgumentParser:
                           "(per-file voiced seconds, chars, and the rate). "
                           "Without it only a human summary goes to stderr.")
     pmr.set_defaults(func=cmd_dub_measure_rate)
+
+    # gate: in-process length gate over the MEASURED rate (pure arithmetic).
+    pgr = dub_sub.add_parser(
+        "gate",
+        help="pre-synth length gate on translations_dub.txt, computed "
+             "against the MEASURED speech rate — refuses to run without it")
+    pgr.add_argument("output_root")
+    pgr.add_argument("name")
+    pgr.add_argument("--rate", type=float, metavar="CHARS_PER_SEC",
+                     help="measured chars/s from `cook dub measure-rate` "
+                          "(required unless --self-measure; must be > 0)")
+    pgr.add_argument("--self-measure", action="store_true",
+                     help="measure the rate right here from "
+                          "dubbed/_full/_segments (synth's takes), print it, "
+                          "and gate by the measured value")
+    pgr.add_argument("--json", action="store_true",
+                     help="emit the machine-readable report on stdout "
+                          "(findings, coverage, verdict). Without it only a "
+                          "human summary goes to stderr.")
+    pgr.set_defaults(func=cmd_dub_gate)
 
     return p
 

@@ -17,9 +17,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import tempfile
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -1133,8 +1134,9 @@ _DUB_STAGE_SCRIPTS = [
     "extract_reference.py",
     "make_zh_dub_srt.py",
     "build_merge.py",
-    "length_gate.py",
 ]
+# length_gate.py is deliberately NOT here (ticket 05): functions-only, its
+# CLI is `cook dub gate` — same conversion measure_rate.py got in ticket 04.
 
 
 def _stages_dub_dir() -> Path:
@@ -1144,9 +1146,10 @@ def _stages_dub_dir() -> Path:
 
 
 class TestDubScriptsInPackage:
-    """All seven dub stage scripts are vendored in stages/dub/ and stay
-    directly runnable (python <script> ...) — the skill repo no longer needs
-    to be installed for the pipeline to run."""
+    """The subprocess-run dub stage scripts are vendored in stages/dub/ and
+    stay directly runnable (python <script> ...) — the skill repo no longer
+    needs to be installed for the pipeline to run. (measure_rate.py and
+    length_gate.py are functions-only and run in-process under cook.)"""
 
     def test_all_seven_scripts_present(self):
         d = _stages_dub_dir()
@@ -1193,11 +1196,14 @@ class TestDubScriptsInPackage:
         assert "你好呀" in text and "第二条" in text
 
     def test_length_gate_direct_run_reports_coverage(self, tmp_path):
-        """End-to-end direct run of the pure-arithmetic gate: prints the
-        coverage line and exits with a defined code (no ffmpeg involved)."""
-        d = _stages_dub_dir()
+        """End-to-end direct run of the pure-arithmetic gate through the
+        cook CLI (its only surface since ticket 05; the standalone script
+        entry died with the functions-only conversion): prints the coverage
+        line, exits with a defined code, no ffmpeg involved."""
         root = tmp_path / "vid"
-        # two 5s windows with 1s gaps -> budgets 6s each; 2x ~4s est lines
+        # two 5s windows, 1s gap after cue1 only (last cue has no next) ->
+        # budgets 6+5=11; 9- and 10-char lines at rate 4.0 -> est 2.25+2.5,
+        # coverage 4.75/11 = 43.2% (out of band, exit 1)
         _make_srt(root / "transcript" / "video.en.full.srt", [
             (1, "00:00:00,000 --> 00:00:05,000", "one two three four five"),
             (2, "00:00:06,000 --> 00:00:11,000", "six seven eight nine ten"),
@@ -1205,11 +1211,22 @@ class TestDubScriptsInPackage:
         _make_translations(root / "transcript" / "translations_dub.txt",
                            ["一句话占个位子而已", "两句话占个位子而已呀"])
         r = subprocess.run(
-            [sys.executable, str(d / "length_gate.py"), str(root), "video"],
+            [sys.executable, str(_HERE / "cook.py"), "dub", "gate",
+             str(root), "video", "--rate", "4.0"],
             capture_output=True, text=True, timeout=60,
         )
-        assert "coverage" in r.stdout
-        assert r.returncode in (0, 1), r.stdout + r.stderr
+        combined = r.stdout + r.stderr
+        assert "coverage" in combined
+        assert "43.2%" in combined
+        assert r.returncode == 1
+        # and the same invocation without a rate refuses (the ticket's core)
+        r2 = subprocess.run(
+            [sys.executable, str(_HERE / "cook.py"), "dub", "gate",
+             str(root), "video"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert r2.returncode != 0
+        assert "measure-rate" in (r2.stdout + r2.stderr)
 
 
 class TestFindDubScriptPackageInternal:
@@ -2049,6 +2066,382 @@ class TestSynthWorkersOrchestration:
 
 
 # ----------------------------------------------------------------------------
+# cook dub merge: the ONLY legal way to merge cues — en.full.srt and
+# translations_dub.txt are merged in lockstep (one side hand-edited alone is
+# the 2026-10 incident: zh/en off by one line, 8 dubbed sentences 4-14s late).
+# ============================================================================
+
+class _DubMergeHarness:
+    """Shared harness for dub-merge tests. Seam: cmd_dub_merge in-process;
+    observed via the on-disk files under transcript/ (en.full.srt,
+    translations_dub.txt, their .v1 backups), the exit code, and stdout JSON.
+    Fake SRTs in temp dirs only."""
+
+    def _setup(self, tmp_path: Path, en_cues, zh_lines, name="video"):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / f"{name}.en.full.srt"
+        zh_txt = root / "transcript" / "translations_dub.txt"
+        _make_srt(en_srt, en_cues)
+        _make_translations(zh_txt, zh_lines)
+        return root, en_srt, zh_txt
+
+    def _run(self, root: Path, groups, name="video"):
+        """Invoke cmd_dub_merge in-process. Returns (exit_code, stdout_json).
+        exit_code None = returned normally (exit 0)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": name,
+                              "group": list(groups)})()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_merge(args)
+            except SystemExit as e:
+                code = e.code
+        try:
+            report = json.loads(buf.getvalue())
+        except ValueError:
+            report = None
+        return code, report
+
+    def _blocks(self, path: Path):
+        """Parse an SRT on disk into [(num, ts, text), ...]."""
+        text = path.read_text(encoding="utf-8").strip()
+        out = []
+        for b in re.split(r"\n\s*\n", text):
+            lines = b.splitlines()
+            out.append((int(lines[0]), lines[1], " ".join(lines[2:])))
+        return out
+
+    def _assert_refused_untouched(self, root, en_srt, zh_txt,
+                                  orig_en, orig_zh, code, report):
+        assert code == 1  # _die's non-zero exit
+        assert report is None or report.get("ok") is False
+        # zero side effects: working files byte-identical, no backups created
+        assert en_srt.read_text(encoding="utf-8") == orig_en
+        assert zh_txt.read_text(encoding="utf-8") == orig_zh
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+        assert not (zh_txt.parent / "translations_dub.txt.v1").exists()
+
+
+class TestDubMerge(_DubMergeHarness):
+
+    def test_single_group_merges_both_sides_in_lockstep(self, tmp_path):
+        """The happy path: --group 2,3 merges cue 2+3 on BOTH sides in one
+        atomic action — en text space-joined, zh text directly joined, the
+        merged window = first start + last end, untouched cues verbatim,
+        numbering resequenced, and .v1 backups holding the pre-merge files."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+            (3, "00:00:05,300 --> 00:00:06,400", "third cue"),
+            (4, "00:00:07,500 --> 00:00:08,600", "fourth cue"),
+        ]
+        zh = ["第一句", "第二句", "第三句", "第四句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+
+        code, report = self._run(root, ["2,3"])
+
+        assert code is None  # returned normally -> exit 0
+        assert report["ok"] is True
+        assert report["cues_before"] == 4
+        assert report["cues_after"] == 3
+
+        # en side: 3 cues, untouched ones byte-identical, merged window spans
+        # first start -> last end, texts space-joined
+        blocks = self._blocks(en_srt)
+        assert [b[0] for b in blocks] == [1, 2, 3]
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,000", "first cue")
+        assert blocks[1] == (2, "00:00:03,100 --> 00:00:06,400",
+                             "second cue third cue")
+        assert blocks[2] == (3, "00:00:07,500 --> 00:00:08,600", "fourth cue")
+
+        # zh side: 3 lines, group 2+3 directly concatenated, others verbatim
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["第一句", "第二句第三句", "第四句"]
+
+        # backups hold the pristine pre-merge files
+        assert (en_srt.parent / "video.en.full.srt.v1").read_text(
+            encoding="utf-8") == orig_en
+        assert (zh_txt.parent / "translations_dub.txt.v1").read_text(
+            encoding="utf-8") == orig_zh
+
+    def test_existing_v1_backup_is_never_overwritten(self, tmp_path):
+        """A second merge run must NOT clobber the .v1 backups: they hold the
+        pristine pre-any-merge state (the recovery point), matching the
+        *.v1 convention the dub pipeline already relies on."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first"),
+            (2, "00:00:03,000 --> 00:00:04,000", "second"),
+            (3, "00:00:05,000 --> 00:00:06,000", "third"),
+            (4, "00:00:07,000 --> 00:00:08,000", "fourth"),
+        ]
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        pristine_en = en_srt.read_text(encoding="utf-8")
+        pristine_zh = zh_txt.read_text(encoding="utf-8")
+        en_bak = en_srt.parent / "video.en.full.srt.v1"
+        zh_bak = zh_txt.parent / "translations_dub.txt.v1"
+
+        # first merge: groups 1,2 -> backups created from the pristine files
+        code, _ = self._run(root, ["1,2"])
+        assert code is None
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+
+        # second merge on the renumbered file (groups now 2,3 = old 3,4):
+        # current files change, .v1 stays pristine
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["cues_after"] == 2
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+        # and the second merge really did rewrite the working files
+        assert [b[2] for b in self._blocks(en_srt)] == \
+            ["first second", "third fourth"]
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三四"]
+
+    # -- refusals: every invariant failure leaves ZERO side effects ----------
+
+    def _pristine(self, en_cues, zh):
+        en = [
+            (i + 1, f"00:00:{i + 1:02d},000 --> 00:00:{i + 1:02d},500",
+             f"cue {i + 1}")
+            for i in range(len(zh))
+        ]
+        return en
+
+    def test_reject_out_of_bounds_group(self, tmp_path):
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,9"])  # 9 > 4 cues
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_zero_index(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["0,1"])  # 1-based: 0 is invalid
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_consecutive_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,3"])  # skips line 2
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_overlapping_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,2", "2,3"])  # line 2 claimed twice
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_singleton_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2"])  # merging one line is a no-op
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_integer_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["one,two"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_no_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, [])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_line_count_mismatch_one_side_hand_merged(self, tmp_path):
+        """THE incident shape: someone already merged cue groups by hand on
+        the en side only (3 en cues left, zh still 4 lines). The pairing
+        invariant must refuse the merge — running it would pair zh line 3
+        with the wrong en cue and ship 4-14s-late audio again."""
+        # en side: 3 cues, cue 2 already absorbed cue 3's text by hand
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "cue 1"),
+            (2, "00:00:03,000 --> 00:00:06,000", "cue 2 cue 3"),
+            (3, "00:00:07,000 --> 00:00:08,000", "cue 4"),
+        ]
+        zh = ["一", "二", "三", "四"]  # zh side: still 4 separate lines
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_missing_translations_file(self, tmp_path):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / "video.en.full.srt"
+        _make_srt(en_srt, self._pristine(None, ["一", "二"]))
+        code, report = self._run(root, ["1,2"])
+        assert code == 1
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+
+    # -- several groups in one run ------------------------------------------
+
+    def test_multiple_groups_one_run_out_of_order_flags(self, tmp_path):
+        """--group is repeatable; flags may arrive in any order and a group
+        may span 3 lines. 6 cues, groups {1,2} and {4,5,6} -> 3 output cues."""
+        zh = ["一", "二", "三", "四", "五", "六"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        code, report = self._run(root, ["4,5,6", "1,2"])  # deliberately unordered
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_before"] == 6
+        assert report["cues_after"] == 3
+        assert report["merged"] == [[1, 2], [4, 5, 6]]
+        blocks = self._blocks(en_srt)
+        # merged windows: group 1 spans cue1.start->cue2.end; group 2 spans
+        # cue4.start->cue6.end; cue 3 passes through verbatim
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,500", "cue 1 cue 2")
+        assert blocks[1] == (2, "00:00:03,000 --> 00:00:03,500", "cue 3")
+        assert blocks[2] == (3, "00:00:04,000 --> 00:00:06,500",
+                             "cue 4 cue 5 cue 6")
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三", "四五六"]
+
+
+# ----------------------------------------------------------------------------
+# Regression fixture: the 2026-10 "flywheel + 群聊" misalignment incident.
+# Real texts from leerob/stanford-cs146s-always-on-agents
+# (transcript/*.v1, cues 330-333). The hand-merge folded the short group-chat
+# sentence into the flywheel paragraph cue on the en side only; zh drifted
+# one line (dangling "所以说，") and 8 dubbed sentences landed 4-14s late.
+# ============================================================================
+
+# flywheel paragraph sentence (en), verbatim minus the absorbed tail
+_FLY_EN = ("And ideally the new models are learning from all of these bugs "
+           "and these failures, and they're kind of climbing on the evals to "
+           "get better at the things that you care about. And you can drop "
+           "the new versions into the product and make sure that they're "
+           "improving in all these different things.")
+# its zh, verbatim minus the dangling "所以说，" the incident left behind
+_FLY_ZH = ("理想状态下，新模型会从这一大堆 bug 和失败里学习，在你真正关心的那些 "
+           "eval 指标上不断爬升。你把新版本放进产品里，确认各项东西确实都在变好。")
+# the short group-chat sentence that got folded into the flywheel cue
+_CHAT_EN = ("So There hasn't really been a lot of training data, for "
+            "example, on using bots in a group chat.")
+_CHAT_ZH = "比如 bot 在群聊里该怎么表现，就没有多少训练数据。"
+# the sentence AFTER the pair — in the incident state it was paired with
+# _CHAT_ZH (one line of drift); after a legal merge it must get its own zh.
+_NEXT_EN = ("This is kind of an emergent thing that's being figured out, "
+            "and it's important to get it right.")
+_NEXT_ZH = "这是一件正在摸索中、逐渐成型的新事物，而把它做对非常重要。"
+# the cue before the flywheel pair (verbatim from the incident, v1 cue 329)
+_PREV_EN = ("But then there's this outer loop, which is like every few "
+            "months or every month or however long you're training new models.")
+_PREV_ZH = "而外面还有一层外环：每隔几个月、或者每个月，总之按某种周期，训练新模型。"
+
+
+class TestDubMergeFlywheelRegression(_DubMergeHarness):
+    """Same seam as TestDubMerge (in-process cmd_dub_merge, temp dirs), but
+    the material is the real incident text so the shape that broke the run
+    can never quietly come back."""
+
+    def _pristine(self, tmp_path):
+        """The pre-incident state: 4 clean en/zh pairs around the flywheel
+        paragraph. Cue 3's reconstructed timestamps keep the incident's
+        merged window (…,357 --> …15,946) as first-start/last-end."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:07,900", _FLY_EN),
+            (3, "00:37:08,000 --> 00:37:15,946", _CHAT_EN),
+            (4, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        zh = [_PREV_ZH, _FLY_ZH, _CHAT_ZH, _NEXT_ZH]
+        return self._setup(tmp_path, en_cues, zh)
+
+    def test_legal_merge_keeps_flywheel_pairing_in_lockstep(self, tmp_path):
+        """Merging the flywheel cue with the group-chat cue through the tool:
+        both sides move together, the 群聊 zh lands in the SAME cue as its en
+        sentence, and the following cue is paired with ITS zh (exactly the
+        pairing the hand-merge destroyed)."""
+        root, en_srt, zh_txt = self._pristine(tmp_path)
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_after"] == 3
+
+        blocks = self._blocks(en_srt)
+        zh_out = zh_txt.read_text(encoding="utf-8").splitlines()
+
+        # en cue 2 = flywheel + group-chat, window = first start + last end
+        assert blocks[1][1] == "00:36:50,357 --> 00:37:15,946"
+        assert blocks[1][2] == _FLY_EN + " " + _CHAT_EN
+        # zh line 2 = flywheel zh + 群聊 zh, directly joined — the group-chat
+        # translation travels WITH its english sentence
+        assert zh_out[1] == _FLY_ZH + _CHAT_ZH
+        # the next pair stays paired (the one-line drift never happens)
+        assert blocks[2][2] == _NEXT_EN
+        assert zh_out[2] == _NEXT_ZH
+        # untouched neighbours pass through verbatim
+        assert blocks[0][2] == _PREV_EN and zh_out[0] == _PREV_ZH
+        # both sides carry the same number of entries
+        assert len(blocks) == len(zh_out) == 3
+
+    def test_incident_shape_one_side_hand_merged_is_refused(self, tmp_path):
+        """The incident re-run: the en side has ALREADY been hand-merged
+        (flywheel cue absorbed the group-chat sentence, 3 en cues) while zh
+        still has 4 lines with the dangling tail. The pairing invariant must
+        refuse and leave everything untouched — merging on top of a
+        desynchronized pair is what shipped 8 late sentences."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:15,946", _FLY_EN + " " + _CHAT_EN),
+            (3, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        # zh side still 4 lines, cue 2 ends with the incident's dangling tail
+        zh = [_PREV_ZH, _FLY_ZH + "所以说，", _CHAT_ZH, _NEXT_ZH]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+
+class TestDubMergeCliSurface:
+    """The ticket's command shape: cook dub merge <root> <name> --group "a,b,c"
+    (repeatable). Pinned at the argparse surface like TestQualityParserInt."""
+
+    def test_group_flag_repeatable_appends(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "merge", "author/video", "video", "--group", "1,2",
+             "--group", "5,6,7"])
+        assert args.group == ["1,2", "5,6,7"]
+        assert args.output_root == "author/video"
+        assert args.name == "video"
+        assert args.func is cook.cmd_dub_merge
+
+
 # dub measure-rate (ticket 04): measure the real speech rate of audition
 # wavs / synthesized takes via energy VAD. Tests synthesize tiny wavs
 # (sine = speech, zeros = silence) — no real audio is ever loaded.
@@ -2673,3 +3066,340 @@ class TestRetimeCLIMissingFasterWhisper:
         assert "00:00:09,000 --> 00:00:12,000" in (
             work / "dubbing.bilingual.srt").read_text(encoding="utf-8")
         assert not (work / "dubbing.bilingual.srt.pre_retime").exists()
+# dub gate (ticket 05): the length gate, wired into the cook command surface
+# and driven by the MEASURED speech rate — never an assumed one. The public
+# seam is cmd_dub_gate (argv: output_root/name/--rate/--self-measure/--json).
+# Hand-worked fixtures: budgets are cue start → next cue start (identity
+# clock); est_s = count_chars(line)/rate (the reflux budget math inverted).
+# ----------------------------------------------------------------------------
+
+def _make_gate_inputs(tmp_path, cues, lines, name="video"):
+    """Write transcript/<name>.en.full.srt + translations_dub.txt.
+    cues = [("00:00:00,000", "00:00:04,000"), ...] raw SRT timestamps."""
+    root = tmp_path / "author" / name
+    _make_srt(root / "transcript" / f"{name}.en.full.srt",
+              [(i + 1, f"{s} --> {e}", f"English cue {i + 1}")
+               for i, (s, e) in enumerate(cues)])
+    _make_translations(root / "transcript" / "translations_dub.txt", lines)
+    return root
+
+
+class TestDubGateRateRequired:
+    """Ticket 05's core ruling: without a measured rate the gate refuses to
+    run — the assumed-rate path is what caused the 2026-10 rework."""
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        """Invoke cmd_dub_gate in-process, capture stdout JSON.
+        Returns (report_or_None, stdout_text, exit_code_or_None)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def test_missing_rate_refuses_and_points_at_measure_rate(self, tmp_path):
+        """No --rate, no --self-measure: nonzero exit, error names the
+        command that produces the rate. A fixture with valid inputs proves
+        the refusal is about the RATE, not about the files."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己", "甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己"])
+        report, _, code = self._run(root, rate=None)
+        assert code != 0
+        assert report is not None and report["ok"] is False
+        assert "measure-rate" in report["error"]
+
+    def test_zero_and_negative_rate_refuse(self, tmp_path):
+        """--rate 0 / negative: nonzero exit with a clear error — a 0 rate
+        would make every estimate infinite."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸", "甲乙丙丁戊己庚辛壬癸"])
+        for bad in (0.0, -6.9):
+            report, _, code = self._run(root, rate=bad)
+            assert code != 0
+            assert report["ok"] is False
+            assert "--rate" in report["error"]
+
+
+class TestDubGateVerdict:
+    """The three gate criteria, all computed from the passed rate:
+    est_s = count_chars(line)/rate (punctuation counted — the rate's unit).
+    Hand-worked fixture: budgets 4.5/6.0/4.0 (=14.5 total; cue start → next
+    cue start), rate 5.0, chars 20/24/22 → est 4.0/4.8/4.4 (=13.2),
+    factors 0.89/0.80/1.10, coverage 13.2/14.5 = 91.0% PASS. The OLD
+    syllable-bucket algorithm would estimate 4.76/5.24/5.00 → 103.4% — so
+    these assertions pin the chars/rate math, not a compatible overlap."""
+
+    CUES = [("00:00:00,000", "00:00:04,000"),
+            ("00:00:04,500", "00:00:09,500"),
+            ("00:00:10,500", "00:00:14,500")]
+    LINES = ["甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉",
+             "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥，。",
+             "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌！"]
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def test_healthy_pass_computes_est_from_chars_over_rate(self, tmp_path):
+        root = _make_gate_inputs(tmp_path, self.CUES, self.LINES)
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["verdict"] == "pass"
+        assert report["rate"] == 5.0
+        assert report["rate_source"] == "flag"
+        assert report["lines"] == 3
+        assert report["short"] == [] and report["over"] == [] \
+            and report["under"] == []
+        # hand-worked totals: est 13.2s over 14.5s of windows
+        assert report["total_est_s"] == pytest.approx(13.2, abs=0.05)
+        assert report["total_window_s"] == pytest.approx(14.5, abs=0.05)
+        assert report["coverage"] == pytest.approx(13.2 / 14.5, abs=0.002)
+
+    def test_fail_path_lists_short_over_and_thin_coverage(self, tmp_path):
+        """Hand-worked FAIL fixture: cue1 budget 10.5s with a 4-char line
+        (3 sylls → short, est 0.8s vs 10.5s → deep under), cue2 budget 0.5s
+        with a 30-char line (est 6.0s → factor 12x over). Totals 6.8/11.0 =
+        61.8% coverage — out of band. Exit 1 with all three findings."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:10,000"),
+             ("00:00:10,500", "00:00:11,000")],
+            ["你好呀。",
+             "子丑寅卯辰巳午未申酉戌亥" * 2 + "甲乙丙丁戊己"])
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 1
+        assert report["ok"] is False
+        assert report["verdict"] == "fail"
+        assert report["short"][0]["line"] == 1
+        assert report["short"][0]["sylls"] == 3  # 你好呀 — the 。 is not a syll
+        assert report["over"][0]["line"] == 2
+        assert report["over"][0]["factor"] == pytest.approx(12.0, abs=0.1)
+        assert report["coverage"] == pytest.approx(6.8 / 11.0, abs=0.005)
+        # the 4-char line is also deep under-budget (0.8s est vs 10.5s window)
+        assert report["under"][0]["line"] == 1
+
+    def test_under_budget_alone_is_advisory_pass(self, tmp_path):
+        """Under-budget lines alone do not fail the gate (the assembler pads
+        the shortfall) — verdict pass, advisory_under flagged, exit 0.
+        Fixture: budget1 3.8s/9 chars (est 1.8s, factor 0.47 → under),
+        budget2 6.0s/36 chars (est 7.2s, factor 1.2); coverage 9.0/9.8 =
+        91.8% in band."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:03,400"),
+             ("00:00:03,800", "00:00:09,800")],
+            ["甲乙丙丁戊己庚辛壬",
+             "子丑寅卯辰巳午未申酉戌亥" * 3])
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["verdict"] == "pass"
+        assert report["advisory_under"] is True
+        assert [u["line"] for u in report["under"]] == [1]
+        assert report["coverage"] == pytest.approx(9.0 / 9.8, abs=0.005)
+
+
+class TestDubGateSelfMeasure:
+    """--self-measure: derive the rate from dubbed/_full/_segments (synth's
+    takes) via measure_rate's pairing + VAD, print it, then gate by the
+    MEASURED value. Synthetic wavs: sine = speech, zeros = silence."""
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def _run_with_segments(self, tmp_path):
+        """2 takes of 2.0 s voiced speech for 10-char lines → measured rate
+        20 chars / 4.0 s = 5.0 chars/s. Cue budgets 2.4/2.0 → est 2.0/2.0,
+        coverage 4.0/4.4 = 90.9% → PASS by the measured rate."""
+        pytest.importorskip("soundfile")
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:02,000"),
+             ("00:00:02,400", "00:00:04,400")],
+            ["甲乙丙丁戊己庚辛壬癸", "子丑寅卯辰巳午未申酉"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.2, False), (2.0, True)])
+        _make_wav(segs / "sent_0002.wav", [(0.2, False), (2.0, True)])
+        return root
+
+    def test_self_measures_then_gates_by_the_measured_rate(self, tmp_path):
+        root = self._run_with_segments(tmp_path)
+        report, _, code = self._run(root, self_measure=True)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["rate_source"] == "self-measured"
+        # measured: 20 chars over ~4.0 s of voiced sine
+        assert 4.8 <= report["rate"] <= 5.2
+        # gate math runs on the measured rate: est 4.0s over 4.4s of windows
+        assert report["coverage"] == pytest.approx(20 / (5.0 * 4.4), abs=0.02)
+        assert report["short"] == [] and report["over"] == []
+
+    def test_rate_and_self_measure_are_mutually_exclusive(self, tmp_path):
+        root = self._run_with_segments(tmp_path)
+        report, _, code = self._run(root, rate=6.9, self_measure=True)
+        assert code != 0
+        assert report["ok"] is False
+        assert "--self-measure" in report["error"]
+
+    def test_self_measure_without_segments_is_refused(self, tmp_path):
+        """No synthesized takes yet (pre-synth run): the refusal names the
+        segments layout and the explicit-rate alternative."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000")],
+            ["甲乙丙丁戊己庚辛壬癸"])
+        report, _, code = self._run(root, self_measure=True)
+        assert code != 0
+        assert report["ok"] is False
+        assert "_segments" in report["error"]
+
+
+class TestDubGateContract:
+    """Remaining contract edges: unit lockstep, output channel, parser
+    wiring, count mismatch."""
+
+    def test_count_chars_stays_in_lockstep_with_measure_rate(self):
+        """The unit closeout (ticket 05): the gate estimates in the SAME
+        char convention the rate is calibrated in. length_gate.count_chars
+        is a second copy of measure_rate.count_chars (kept so the gate
+        module stays import-light) — this tripwire fails the day the two
+        counting conventions drift apart."""
+        mr = cook._import_stage_module("dub", "measure_rate.py",
+                                       "cook_stages_dub_measure")
+        lg = cook._import_stage_module("dub", "length_gate.py",
+                                       "cook_stages_dub_gate")
+        samples = [
+            "你好，世界！",             # CJK + fullwidth punctuation
+            "  padded whitespace  ",   # external whitespace not counted
+            "hello world",             # latin words
+            "混合 mixed 中文 line。",
+            "AI 编程 2026！",
+            "",
+        ]
+        for s in samples:
+            assert lg.count_chars(s) == mr.count_chars(s), repr(s)
+
+    def test_human_output_keeps_stdout_empty(self, tmp_path, capsys):
+        """Without --json: stdout stays empty (agents opt in with --json);
+        the human summary — including the rate it ran on — goes to stderr."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸" * 2 + "甲",
+             "甲乙丙丁戊己庚辛壬癸" * 2 + "甲乙丙"])
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "rate": 5.0, "self_measure": False, "json": False,
+        })()
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                assert e.code == 0
+        assert buf.getvalue() == ""  # stdout is pure-JSON-only territory
+        err = capsys.readouterr().err
+        assert "rate: 5.000 chars/s (flag)" in err
+        assert "coverage" in err
+
+    def test_cue_line_count_mismatch_is_refused(self, tmp_path):
+        """3 srt cues vs 2 translation lines: refuse rather than pair N
+        against N-1 silently."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"),
+             ("00:00:04,500", "00:00:08,000"),
+             ("00:00:08,500", "00:00:12,000")],
+            ["甲乙丙丁戊己庚辛壬癸", "甲乙丙丁戊己庚辛壬癸"])
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "rate": 5.0, "self_measure": False, "json": True,
+        })()
+        import io
+        import contextlib
+        buf = io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        report = json.loads(buf.getvalue().strip())
+        assert code == 1
+        assert report["ok"] is False
+        assert "3" in report["error"] and "2" in report["error"]
+
+    def test_parser_wires_dub_gate(self):
+        """The argparse surface: dub gate takes output_root/name, --rate is
+        typed float (non-numeric is argparse's own nonzero exit), and
+        --rate/--self-measure default to absent."""
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "gate", "some/root", "name",
+                             "--rate", "6.932"])
+        assert args.func is cook.cmd_dub_gate
+        assert args.rate == 6.932
+        assert args.self_measure is False
+        args = p.parse_args(["dub", "gate", "some/root", "name"])
+        assert args.rate is None
+        args = p.parse_args(["dub", "gate", "some/root", "name",
+                             "--self-measure"])
+        assert args.self_measure is True
+        with pytest.raises(SystemExit) as ei:
+            p.parse_args(["dub", "gate", "r", "n", "--rate", "fast"])
+        assert ei.value.code != 0
