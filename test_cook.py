@@ -588,6 +588,134 @@ class TestPathHelpers:
 
 
 # ----------------------------------------------------------------------------
+# download: best-format selection (the av01-fake-highest trap)
+#
+# yt-dlp's default sort picked av01 at 1080p/255k over vp9 at 1080p/509k four
+# times in production. cook now ranks (codec family vp9>h264>av01, bitrate)
+# inside the target resolution and downloads with an explicit -f itag spec.
+# ----------------------------------------------------------------------------
+
+def _fmt(fid: str, *, vcodec: str = "none", acodec: str = "none", height=None,
+         tbr=None, abr=None, language=None) -> dict:
+    """One yt-dlp format-table row (subset of the fields -F reports)."""
+    return {"format_id": fid, "vcodec": vcodec, "acodec": acodec,
+            "height": height, "tbr": tbr, "abr": abr, "language": language}
+
+
+# Real format table of YouTube L1OBRtfPS34 ("Stanford CS146S: How always-on
+# agents work", original language en-US), transcribed from the run that
+# caught the trap: at 1080p av01 (399) is 255.679k while vp9 (248) is
+# 509.651k. Storyboards pruned to two rows and the ~40 identical-bitrate
+# foreign dubs pruned to the top by abr; every kept row is verbatim.
+_LEEROB_FORMATS = [
+    # storyboards (no real audio/video codec — must never be candidates)
+    _fmt("sb1", height=45),
+    _fmt("sb0", height=180),
+    # video-only, per resolution: avc1 / vp9 / av01
+    _fmt("160", vcodec="avc1.4D400C", height=144, tbr=13.712),
+    _fmt("278", vcodec="vp9", height=144, tbr=37.82),
+    _fmt("394", vcodec="av01.0.00M.08", height=144, tbr=20.347),
+    _fmt("133", vcodec="avc1.4D4015", height=240, tbr=23.31),
+    _fmt("242", vcodec="vp9", height=240, tbr=55.182),
+    _fmt("395", vcodec="av01.0.00M.08", height=240, tbr=32.095),
+    _fmt("134", vcodec="avc1.4D401E", height=360, tbr=37.792),
+    _fmt("243", vcodec="vp9", height=360, tbr=111.155),
+    _fmt("396", vcodec="av01.0.01M.08", height=360, tbr=59.497),
+    _fmt("135", vcodec="avc1.4D401F", height=480, tbr=52.901),
+    _fmt("244", vcodec="vp9", height=480, tbr=154.556),
+    _fmt("397", vcodec="av01.0.04M.08", height=480, tbr=91.433),
+    _fmt("136", vcodec="avc1.4D401F", height=720, tbr=71.126),
+    _fmt("247", vcodec="vp9", height=720, tbr=274.293),
+    _fmt("398", vcodec="av01.0.05M.08", height=720, tbr=154.207),
+    _fmt("137", vcodec="avc1.640028", height=1080, tbr=203.478),
+    _fmt("248", vcodec="vp9", height=1080, tbr=509.651),
+    _fmt("399", vcodec="av01.0.08M.08", height=1080, tbr=255.679),
+    # muxed 360p (has both codecs)
+    _fmt("18", vcodec="avc1.42001E", acodec="mp4a.40.2", height=360, tbr=223.132),
+    # original-language (en-US) audio-only
+    _fmt("249-drc", acodec="opus", abr=50.69, language="en-US"),
+    _fmt("250-drc", acodec="opus", abr=58.68, language="en-US"),
+    _fmt("249-19", acodec="opus", abr=50.628, language="en-US"),
+    _fmt("250-19", acodec="opus", abr=58.454, language="en-US"),
+    _fmt("140-drc", acodec="mp4a.40.2", abr=129.473, language="en-US"),
+    _fmt("251-drc", acodec="opus", abr=107.074, language="en-US"),
+    _fmt("140-19", acodec="mp4a.40.2", abr=129.473, language="en-US"),
+    _fmt("251-19", acodec="opus", abr=106.719, language="en-US"),
+    # auto-dub audio in other languages — higher abr than any en track, so a
+    # bitrate-only sort would grab a dub; the language filter must guard this
+    _fmt("251-18", acodec="opus", abr=133.064, language="ar"),
+    _fmt("251-17", acodec="opus", abr=130.91, language="ta"),
+    _fmt("140-0", acodec="mp4a.40.2", abr=129.473, language="ar"),
+    _fmt("249-0", acodec="opus", abr=48.807, language="de-DE"),
+]
+
+
+class TestDownloadFormatSelection:
+    def test_real_leerob_table_picks_vp9_over_av01(self):
+        sel = cook._select_best_formats(_LEEROB_FORMATS, language="en-US")
+        assert sel["format_spec"] == "248+140-19"
+        assert sel["video"]["format_id"] == "248"
+        assert sel["video"]["codec_family"] == "vp9"
+        assert sel["video"]["height"] == 1080
+        # original-language top-bitrate audio, non-DRC on the abr tie
+        assert sel["audio"]["format_id"] == "140-19"
+        assert sel["audio"]["language"] == "en-US"
+
+    def test_quality_cap_selects_within_cap(self):
+        sel = cook._select_best_formats(_LEEROB_FORMATS, quality=720,
+                                        language="en-US")
+        # tallest height <= 720 is 720, and there vp9 (247, 274k) beats
+        # av01 (398, 154k) and avc1 (136, 71k)
+        assert sel["format_spec"] == "247+140-19"
+        assert sel["video"]["height"] == 720
+
+    def test_quality_cap_below_every_stream_gives_no_selection(self):
+        # smallest real stream is 144p; a 120p cap leaves nothing -> the
+        # caller must fall back rather than download garbage
+        assert cook._select_best_formats(_LEEROB_FORMATS, quality=120) is None
+
+    def test_h264_beats_higher_bitrate_av01_when_no_vp9(self):
+        # codec family outranks raw bitrate inside the same resolution
+        table = [
+            _fmt("399", vcodec="av01.0.08M.08", height=1080, tbr=255.679),
+            _fmt("137", vcodec="avc1.640028", height=1080, tbr=203.478),
+            _fmt("140", acodec="mp4a.40.2", abr=129.473, language="en"),
+        ]
+        sel = cook._select_best_formats(table, language="en")
+        assert sel["video"]["format_id"] == "137"
+        assert sel["video"]["codec_family"] == "h264"
+        assert sel["format_spec"] == "137+140"
+
+    def test_muxed_only_source_uses_single_itag(self):
+        # HLS-style source with no separate streams: the best muxed stream is
+        # used alone (no '+' spec that would die with "format not available")
+        table = [
+            _fmt("hls_360", vcodec="avc1.4D401E", acodec="mp4a.40.2",
+                 height=360, tbr=800),
+            _fmt("hls_720", vcodec="avc1.64001f", acodec="mp4a.40.2",
+                 height=720, tbr=2500),
+        ]
+        sel = cook._select_best_formats(table)
+        assert sel["format_spec"] == "hls_720"
+        assert sel["audio"] is None
+
+    def test_video_only_source_without_audio_returns_none(self):
+        # nothing pairable -> caller falls back to the legacy yt-dlp spec
+        table = [_fmt("248", vcodec="vp9", height=1080, tbr=509.651)]
+        assert cook._select_best_formats(table, language="en") is None
+
+    def test_no_language_info_falls_back_to_all_audio(self):
+        # formats without language fields must not zero out the audio pick
+        table = [
+            _fmt("248", vcodec="vp9", height=1080, tbr=509.651),
+            _fmt("250", acodec="opus", abr=58.68),
+            _fmt("251", acodec="opus", abr=107.074),
+        ]
+        sel = cook._select_best_formats(table)  # no language hint at all
+        assert sel["format_spec"] == "248+251"
+
+
+# ----------------------------------------------------------------------------
 # dub stage prerequisite checks (issue #3)
 # ----------------------------------------------------------------------------
 
