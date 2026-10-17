@@ -588,6 +588,134 @@ class TestPathHelpers:
 
 
 # ----------------------------------------------------------------------------
+# download: best-format selection (the av01-fake-highest trap)
+#
+# yt-dlp's default sort picked av01 at 1080p/255k over vp9 at 1080p/509k four
+# times in production. cook now ranks (codec family vp9>h264>av01, bitrate)
+# inside the target resolution and downloads with an explicit -f itag spec.
+# ----------------------------------------------------------------------------
+
+def _fmt(fid: str, *, vcodec: str = "none", acodec: str = "none", height=None,
+         tbr=None, abr=None, language=None) -> dict:
+    """One yt-dlp format-table row (subset of the fields -F reports)."""
+    return {"format_id": fid, "vcodec": vcodec, "acodec": acodec,
+            "height": height, "tbr": tbr, "abr": abr, "language": language}
+
+
+# Real format table of YouTube L1OBRtfPS34 ("Stanford CS146S: How always-on
+# agents work", original language en-US), transcribed from the run that
+# caught the trap: at 1080p av01 (399) is 255.679k while vp9 (248) is
+# 509.651k. Storyboards pruned to two rows and the ~40 identical-bitrate
+# foreign dubs pruned to the top by abr; every kept row is verbatim.
+_LEEROB_FORMATS = [
+    # storyboards (no real audio/video codec — must never be candidates)
+    _fmt("sb1", height=45),
+    _fmt("sb0", height=180),
+    # video-only, per resolution: avc1 / vp9 / av01
+    _fmt("160", vcodec="avc1.4D400C", height=144, tbr=13.712),
+    _fmt("278", vcodec="vp9", height=144, tbr=37.82),
+    _fmt("394", vcodec="av01.0.00M.08", height=144, tbr=20.347),
+    _fmt("133", vcodec="avc1.4D4015", height=240, tbr=23.31),
+    _fmt("242", vcodec="vp9", height=240, tbr=55.182),
+    _fmt("395", vcodec="av01.0.00M.08", height=240, tbr=32.095),
+    _fmt("134", vcodec="avc1.4D401E", height=360, tbr=37.792),
+    _fmt("243", vcodec="vp9", height=360, tbr=111.155),
+    _fmt("396", vcodec="av01.0.01M.08", height=360, tbr=59.497),
+    _fmt("135", vcodec="avc1.4D401F", height=480, tbr=52.901),
+    _fmt("244", vcodec="vp9", height=480, tbr=154.556),
+    _fmt("397", vcodec="av01.0.04M.08", height=480, tbr=91.433),
+    _fmt("136", vcodec="avc1.4D401F", height=720, tbr=71.126),
+    _fmt("247", vcodec="vp9", height=720, tbr=274.293),
+    _fmt("398", vcodec="av01.0.05M.08", height=720, tbr=154.207),
+    _fmt("137", vcodec="avc1.640028", height=1080, tbr=203.478),
+    _fmt("248", vcodec="vp9", height=1080, tbr=509.651),
+    _fmt("399", vcodec="av01.0.08M.08", height=1080, tbr=255.679),
+    # muxed 360p (has both codecs)
+    _fmt("18", vcodec="avc1.42001E", acodec="mp4a.40.2", height=360, tbr=223.132),
+    # original-language (en-US) audio-only
+    _fmt("249-drc", acodec="opus", abr=50.69, language="en-US"),
+    _fmt("250-drc", acodec="opus", abr=58.68, language="en-US"),
+    _fmt("249-19", acodec="opus", abr=50.628, language="en-US"),
+    _fmt("250-19", acodec="opus", abr=58.454, language="en-US"),
+    _fmt("140-drc", acodec="mp4a.40.2", abr=129.473, language="en-US"),
+    _fmt("251-drc", acodec="opus", abr=107.074, language="en-US"),
+    _fmt("140-19", acodec="mp4a.40.2", abr=129.473, language="en-US"),
+    _fmt("251-19", acodec="opus", abr=106.719, language="en-US"),
+    # auto-dub audio in other languages — higher abr than any en track, so a
+    # bitrate-only sort would grab a dub; the language filter must guard this
+    _fmt("251-18", acodec="opus", abr=133.064, language="ar"),
+    _fmt("251-17", acodec="opus", abr=130.91, language="ta"),
+    _fmt("140-0", acodec="mp4a.40.2", abr=129.473, language="ar"),
+    _fmt("249-0", acodec="opus", abr=48.807, language="de-DE"),
+]
+
+
+class TestDownloadFormatSelection:
+    def test_real_leerob_table_picks_vp9_over_av01(self):
+        sel = cook._select_best_formats(_LEEROB_FORMATS, language="en-US")
+        assert sel["format_spec"] == "248+140-19"
+        assert sel["video"]["format_id"] == "248"
+        assert sel["video"]["codec_family"] == "vp9"
+        assert sel["video"]["height"] == 1080
+        # original-language top-bitrate audio, non-DRC on the abr tie
+        assert sel["audio"]["format_id"] == "140-19"
+        assert sel["audio"]["language"] == "en-US"
+
+    def test_quality_cap_selects_within_cap(self):
+        sel = cook._select_best_formats(_LEEROB_FORMATS, quality=720,
+                                        language="en-US")
+        # tallest height <= 720 is 720, and there vp9 (247, 274k) beats
+        # av01 (398, 154k) and avc1 (136, 71k)
+        assert sel["format_spec"] == "247+140-19"
+        assert sel["video"]["height"] == 720
+
+    def test_quality_cap_below_every_stream_gives_no_selection(self):
+        # smallest real stream is 144p; a 120p cap leaves nothing -> the
+        # caller must fall back rather than download garbage
+        assert cook._select_best_formats(_LEEROB_FORMATS, quality=120) is None
+
+    def test_h264_beats_higher_bitrate_av01_when_no_vp9(self):
+        # codec family outranks raw bitrate inside the same resolution
+        table = [
+            _fmt("399", vcodec="av01.0.08M.08", height=1080, tbr=255.679),
+            _fmt("137", vcodec="avc1.640028", height=1080, tbr=203.478),
+            _fmt("140", acodec="mp4a.40.2", abr=129.473, language="en"),
+        ]
+        sel = cook._select_best_formats(table, language="en")
+        assert sel["video"]["format_id"] == "137"
+        assert sel["video"]["codec_family"] == "h264"
+        assert sel["format_spec"] == "137+140"
+
+    def test_muxed_only_source_uses_single_itag(self):
+        # HLS-style source with no separate streams: the best muxed stream is
+        # used alone (no '+' spec that would die with "format not available")
+        table = [
+            _fmt("hls_360", vcodec="avc1.4D401E", acodec="mp4a.40.2",
+                 height=360, tbr=800),
+            _fmt("hls_720", vcodec="avc1.64001f", acodec="mp4a.40.2",
+                 height=720, tbr=2500),
+        ]
+        sel = cook._select_best_formats(table)
+        assert sel["format_spec"] == "hls_720"
+        assert sel["audio"] is None
+
+    def test_video_only_source_without_audio_returns_none(self):
+        # nothing pairable -> caller falls back to the legacy yt-dlp spec
+        table = [_fmt("248", vcodec="vp9", height=1080, tbr=509.651)]
+        assert cook._select_best_formats(table, language="en") is None
+
+    def test_no_language_info_falls_back_to_all_audio(self):
+        # formats without language fields must not zero out the audio pick
+        table = [
+            _fmt("248", vcodec="vp9", height=1080, tbr=509.651),
+            _fmt("250", acodec="opus", abr=58.68),
+            _fmt("251", acodec="opus", abr=107.074),
+        ]
+        sel = cook._select_best_formats(table)  # no language hint at all
+        assert sel["format_spec"] == "248+251"
+
+
+# ----------------------------------------------------------------------------
 # dub stage prerequisite checks (issue #3)
 # ----------------------------------------------------------------------------
 
@@ -989,9 +1117,9 @@ class TestQualityGuardR2:
 # ----------------------------------------------------------------------------
 # dub stage scripts physically consolidated into the cook package (reflux
 # tk-02): the seven deterministic dub scripts live in stages/dub/, the dub
-# subcommands execute the PACKAGE-INTERNAL copy (not whatever video-dubbing
-# skill copy happens to be installed), and each script keeps __main__
-# direct-call capability.
+# subcommands execute the PACKAGE-INTERNAL copy via cook._stage_script (not
+# whatever video-dubbing skill copy happens to be installed), and each
+# script keeps __main__ direct-call capability.
 # ----------------------------------------------------------------------------
 
 _DUB_STAGE_SCRIPTS = [
@@ -1081,18 +1209,20 @@ class TestDubScriptsInPackage:
 
 
 class TestFindDubScriptPackageInternal:
-    """_find_dub_script resolves the package-internal stages/dub/full_dub.py —
-    the consolidation removes the 'installed skill copy may be older' failure
-    mode the --keep-subs version probe guarded against."""
+    """_stage_script('dub', 'full_dub.py') resolves the package-internal
+    stages/dub/full_dub.py — the consolidation removes the 'installed skill
+    copy may be older' failure mode the --keep-subs version probe guarded
+    against."""
 
     def test_resolves_package_internal_path(self):
-        script = cook._find_dub_script()
+        script = cook._stage_script("dub", "full_dub.py")
         assert script == _stages_dub_dir() / "full_dub.py"
         assert script.is_file()
 
     def test_ignores_installed_skill_copies(self, tmp_path, monkeypatch):
         """Stale skill copies under any of the old home-dir locations must
-        never win over the package file."""
+        never win over the package file (home pointed at a decoy dir with a
+        planted stale copy)."""
         fake_home = tmp_path / "fakehome"
         for sub in (".agents", ".zcode", ".claude"):
             d = fake_home / sub / "skills" / "video-dubbing" / "scripts"
@@ -1100,7 +1230,7 @@ class TestFindDubScriptPackageInternal:
             (d / "full_dub.py").write_text("# stale copy\n", encoding="utf-8")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setenv("USERPROFILE", str(fake_home))
-        script = cook._find_dub_script()
+        script = cook._stage_script("dub", "full_dub.py")
         assert script == _stages_dub_dir() / "full_dub.py"
 
 
@@ -1161,3 +1291,170 @@ class TestDubStageLaunchesPackageScript:
         cmd = self._capture_cmd(monkeypatch, tmp_path, "assemble", keep_subs=True)
         assert cmd is not None, "stage never launched — probe may still be dying"
         assert "--keep-subs" in cmd
+
+
+# ----------------------------------------------------------------------------
+# Stage-script resolution: cook must find its stage scripts inside its own
+# distribution (stages/<stage>/), never in an installed skill copy. This is
+# the reflux 2026-10 consolidation (ticket 01) — the installed-skill lookup
+# caused version skew between cook and the scripts it drove.
+# ----------------------------------------------------------------------------
+
+class TestStageScriptResolution:
+    def test_resolves_subtitle_scripts_inside_the_repo(self):
+        p = cook._stage_script("subtitle", "subtitles.py")
+        assert p.is_file()
+        assert p.name == "subtitles.py"
+        assert "stages" in p.parts and "subtitle" in p.parts
+
+    def test_all_four_subtitle_scripts_resolve(self):
+        for name in ("subtitles.py", "make_full_srt.py",
+                     "make_zh.py", "transcribe.py"):
+            assert cook._stage_script("subtitle", name).is_file(), name
+
+    def test_resolution_ignores_installed_skills(self, tmp_path, monkeypatch):
+        """No lookup may fall back to ~/.agents|~/.zcode|~/.claude skills —
+        otherwise a stale installed copy silently shadows the packaged one
+        (the version-skew bug this consolidation fixes). Point home at an
+        empty dir: resolution must still succeed."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert cook._stage_script("subtitle", "subtitles.py").is_file()
+
+    def test_missing_script_dies_with_clear_error(self, capsys):
+        with pytest.raises(SystemExit) as ei:
+            cook._stage_script("subtitle", "nope.py")
+        assert ei.value.code == 1
+        err = capsys.readouterr().err
+        # the message names what is missing and where it should come from
+        assert "stages" in err and "nope.py" in err
+        assert "video-cook" in err          # names the distribution to reinstall
+
+
+# ----------------------------------------------------------------------------
+# cook subtitles end-to-end: with the stage scripts packaged inside the
+# distribution, the full pipeline (shorten -> merge-short -> biliteral ->
+# ass -> cloud-srt) must run with NO installed skill anywhere. Home is
+# pointed at an empty dir so any installed-skill fallback would fail loudly
+# instead of silently shadowing the packaged module.
+# ----------------------------------------------------------------------------
+
+class TestSubtitlesPipelineEndToEnd:
+    def _setup_video(self, tmp_path: Path) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "vid.en.srt", [
+            (1, "00:00:01,000 --> 00:00:03,000", "Hello world from line one."),
+            (2, "00:00:03,000 --> 00:00:05,000", "Second cue right here."),
+        ])
+        _make_srt(root / "transcript" / "vid.zh.srt", [
+            (1, "00:00:01,000 --> 00:00:03,000", "第一句中文"),
+            (2, "00:00:03,000 --> 00:00:05,000", "第二句中文"),
+        ])
+        return root
+
+    def _run(self, root: Path, monkeypatch) -> dict:
+        monkeypatch.setattr(Path, "home", lambda: root / "no-skill-home")
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "mode": "bottom-bar", "bar_px": 220})()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_subtitles(args)
+        return json.loads(buf.getvalue())
+
+    def test_full_pipeline_without_any_installed_skill(self, tmp_path, monkeypatch):
+        root = self._setup_video(tmp_path)
+        report = self._run(root, monkeypatch)
+        assert report["ok"] is True
+        assert report["length_issues"] == []
+
+        # products exist
+        bilingual = root / "subtitle" / "vid.bilingual.srt"
+        assert bilingual.is_file()
+        assert (root / "subtitle" / "vid.bilingual.ass").is_file()
+        assert (root / "subtitle" / "vid.bilingual.bar.ass").is_file()
+
+        # pairwise merge: 2 en cues + 2 zh cues -> 2 bilingual cues, zh on top
+        text = bilingual.read_text(encoding="utf-8")
+        assert "第一句中文\nHello world from line one." in text
+        assert "第二句中文\nSecond cue right here." in text
+
+        # cloud-srt is a byte-identical copy of the per-language merged SRTs
+        zh_merged = root / "transcript" / "vid.zh.merged.srt"
+        en_merged = root / "transcript" / "vid.en.merged.srt"
+        assert (root / "cloud-srt" / "zh.srt").read_bytes() == zh_merged.read_bytes()
+        assert (root / "cloud-srt" / "en.srt").read_bytes() == en_merged.read_bytes()
+
+        # the ASS carries the bottom-bar geometry the burn must match
+        ass = (root / "subtitle" / "vid.bilingual.bar.ass").read_text(encoding="utf-8")
+        assert "PlayResY: 1300" in ass  # 1080 + 220 bar
+
+    def test_uses_packaged_module_not_any_installed_skill(self, tmp_path, monkeypatch):
+        """Even with a decoy subtitles.py planted in the old skill locations,
+        cook must import the packaged copy (proves the module identity, not
+        just that some subtitles.py ran)."""
+        decoy = tmp_path / "home" / ".agents" / "skills" / "video-subtitle" / "scripts"
+        decoy.mkdir(parents=True)
+        (decoy / "subtitles.py").write_text("raise RuntimeError('decoy skill ran')\n",
+                                            encoding="utf-8")
+        root = self._setup_video(tmp_path)
+        report = self._run(root, monkeypatch)
+        assert report["ok"] is True  # ran the packaged module; decoy never executed
+
+
+# ----------------------------------------------------------------------------
+# cook transcribe: the inner whisperX invocation must run the packaged
+# stages/subtitle/transcribe.py via sys.executable — not an inline script
+# string (the pre-consolidation duplication) and not any installed skill.
+# ----------------------------------------------------------------------------
+
+class TestTranscribeUsesPackagedScript:
+    def _run(self, tmp_path: Path, monkeypatch) -> tuple[list, dict]:
+        root = tmp_path / "vid"
+        wav = root / "transcript" / "vid.audio.wav"
+        wav.parent.mkdir(parents=True)
+        wav.write_bytes(b"RIFF fake wav")
+
+        captured: dict = {}
+
+        def fake_run(cmd, cwd, log_file, err_file, detach=False):
+            captured["cmd"] = cmd
+            return {"ok": True, "detached": False, "returncode": 0}
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "model": "large-v3", "compute": "auto",
+                              "language": "en", "detach": False})()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_transcribe(args)
+        return captured["cmd"], json.loads(buf.getvalue())
+
+    def test_inner_cmd_runs_packaged_transcribe_py(self, tmp_path, monkeypatch):
+        cmd, report = self._run(tmp_path, monkeypatch)
+        assert report["ok"] is True
+        # [python, <packaged transcribe.py>, wav, srt, model, compute, language, device]
+        assert cmd[0] == sys.executable
+        script = Path(cmd[1])
+        assert script.is_file()
+        assert script.name == "transcribe.py"
+        assert "stages" in script.parts and "subtitle" in script.parts
+        # transcribe.py positional contract: <input> <output.srt> [model]
+        # [compute_type] [language] [device]
+        root = tmp_path / "vid"
+        assert cmd[2] == str(root / "transcript" / "vid.audio.wav")
+        assert cmd[3] == str(root / "transcript" / "vid.en.srt")
+        assert cmd[4] == "large-v3"
+        assert cmd[7] in ("cpu", "cuda")
+        # compute/device pairing stays consistent with what cook reports
+        assert cmd[5] == report["compute"]
+        assert cmd[6] == report["language"]
+        assert cmd[7] == report["device"]
+
+    def test_packaged_script_has_same_done_marker(self):
+        """cook reports done_marker='[transcribe] done.' for pollers; the
+        packaged script must actually print that literal."""
+        src = cook._stage_script("subtitle", "transcribe.py").read_text(encoding="utf-8")
+        assert '[transcribe] done.' in src

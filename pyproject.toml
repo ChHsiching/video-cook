@@ -40,13 +40,11 @@ Homepage = "https://github.com/ChHsiching/video-cook"
 Repository = "https://github.com/ChHsiching/video-cook"
 
 [tool.setuptools]
-# cook.py stays a single top-level module; the stage scripts (deterministic
-# pipeline stages vendored from the skill repos) ship as the stages package
-# tree next to it, resolved by path at runtime.
+# cook.py stays a top-level module; the stage scripts it drives ship as the
+# stages/ package (resolved by cook._stage_script — see docs/adr/): subtitle
+# side in stages/subtitle (ticket 01), dub side in stages/dub (ticket 02).
 py-modules = ["cook"]
-
-[tool.setuptools.packages.find]
-include = ["stages*"]
+packages = ["stages", "stages.subtitle", "stages.dub"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

@@ -1,9 +1,13 @@
-"""video-cook stage scripts.
+"""Stage scripts for the video-cook pipeline.
 
-Deterministic pipeline stages physically vendored into the cook package
-(2026-10 reflux): the dub stage scripts live in ``stages/dub/``, the
-subtitle stage scripts in ``stages/subtitle/``. cook resolves these paths
-relative to its own installed location, so ``pip install -U`` upgrades
-everything at once and installed-skill copies can no longer drift out of
-sync with the CLI that drives them.
+Each subpackage holds the deterministic scripts for one pipeline stage
+family (subtitle, dub). The scripts keep their own __main__ entry points
+so they can also be invoked directly:
+
+    python -m stages.subtitle.subtitles shorten in.srt out.srt --lang zh
+    python stages/subtitle/transcribe.py in.wav out.srt large-v3
+
+cook resolves them through cook._stage_script() — inside this
+distribution, never in an installed skill copy. See docs/adr/ for the
+consolidation decision.
 """
