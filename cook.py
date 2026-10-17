@@ -2019,6 +2019,37 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
              obj={"stage": "measure-rate"})
 
     # --- measure (serially: one wav's blocks in memory at a time) ---
+    rate, rows = _measure_rate_pairs(mr, pairs, labels, stage="measure-rate")
+    report = {
+        "ok": True,
+        "mode": mode,
+        "files": rows,
+        "files_measured": len(rows),
+        "chars": sum(r["chars"] for r in rows),
+        "voiced_seconds": round(sum(r["voiced_seconds"] for r in rows), 3),
+        "rate": round(rate, 3),
+    }
+    if getattr(args, "json", False):
+        _emit_json(report)
+    else:
+        _log(f"measured rate: {rate:.2f} chars/s "
+             f"({report['chars']} chars / {report['voiced_seconds']:.1f}s "
+             f"voiced, {len(rows)} file(s))")
+    print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+    sys.exit(0)
+
+
+def _measure_rate_pairs(mr, pairs: list, labels: list[str],
+                        stage: str = "measure-rate") -> tuple[float, list]:
+    """Shared measurement loop behind `cook dub measure-rate` and
+    `cook dub gate --self-measure`: count chars per line (measure_rate's
+    convention), VAD each wav's voiced span STREAMING (one wav's blocks in
+    memory at a time — safe on any file size, per the resource contract),
+    and return (rate chars/s, per-file rows).
+
+    An input with NO detected speech is an error, not a rate of 0 — a silent
+    take means synthesis failed, and a 0-rate would poison every downstream
+    estimate that consumes it (the gate included)."""
     rows, silent = [], []
     total_chars = 0
     total_voiced = 0.0
@@ -2027,7 +2058,7 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
         voiced = mr.voiced_seconds(wav)
         if chars <= 0:
             _die(f"text for {label} has no countable characters", {
-                "stage": "measure-rate", "file": label})
+                "stage": stage, "file": label})
         if voiced <= 0.0:
             silent.append(label)
             continue
@@ -2039,28 +2070,124 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
         _die(f"no speech detected in {len(silent)} file(s) — the take is "
              f"silent (synthesis failed?): {', '.join(silent[:5])}"
              + (" ..." if len(silent) > 5 else ""), {
-                 "stage": "measure-rate", "silent_files": silent})
+                 "stage": stage, "silent_files": silent})
     if total_voiced <= 0.0:
-        _die("no speech detected in any input", obj={"stage": "measure-rate"})
+        _die("no speech detected in any input", obj={"stage": stage})
+    return total_chars / total_voiced, rows
 
-    rate = total_chars / total_voiced
-    report = {
-        "ok": True,
-        "mode": mode,
-        "files": rows,
-        "files_measured": len(rows),
-        "chars": total_chars,
-        "voiced_seconds": round(total_voiced, 3),
-        "rate": round(rate, 3),
-    }
-    if getattr(args, "json", False):
-        _emit_json(report)
+
+# ----------------------------------------------------------------------------
+# dub subcommand: gate — the pre-synth length gate on translations_dub.txt,
+# driven by the MEASURED speech rate (ticket 05). The assumed-rate planning
+# that the old length_gate.py did internally (bucketed syll/s estimates,
+# ~5 chars/s in effect) is what let the 2026-10 run's thin translation pass
+# and cost ~6h of rework — here the rate is an INPUT, and it is mandatory.
+# Wraps stages/dub/length_gate.py IN-PROCESS (pure arithmetic, no audio
+# deps). Exit 0 = pass/advisory-only; exit 1 = refused, short, over-budget,
+# or coverage out of band.
+# ----------------------------------------------------------------------------
+
+def _gate_self_measure(root: Path) -> float:
+    """Derive the speech rate for the gate from the run's own synthesized
+    takes: pair translations_dub.txt lines with dubbed/_full/_segments/
+    sent_NNNN.wav (measure_rate.pair_segments) and VAD them serially — one
+    wav's streaming blocks in memory at a time, the same resource contract
+    as cook dub measure-rate. Prints the measured value (the operator must
+    SEE what the gate will run on), returns it as chars/s."""
+    import importlib.util
+    if importlib.util.find_spec("soundfile") is None:
+        _die("soundfile not installed — gate --self-measure needs it for "
+             "VAD. Run: pip install soundfile numpy (or measure the rate "
+             "explicitly with an environment that has it)",
+             obj={"stage": "gate"})
+    mr = _import_stage_module("dub", "measure_rate.py",
+                              "cook_stages_dub_measure")
+    try:
+        pairs = mr.pair_segments(root)
+    except (FileNotFoundError, ValueError) as e:
+        _die(f"{e} — --self-measure needs a synthesized run "
+             "(dubbed/_full/_segments). Otherwise measure an audition take "
+             "with `cook dub measure-rate` and pass --rate explicitly",
+             obj={"stage": "gate"})
+    labels = [w.relative_to(root).as_posix() for w, _ in pairs]
+    rate, rows = _measure_rate_pairs(mr, pairs, labels, stage="gate")
+    _log(f"gate --self-measure: {rate:.3f} chars/s "
+         f"({sum(r['chars'] for r in rows)} chars / "
+         f"{sum(r['voiced_seconds'] for r in rows):.1f}s voiced, "
+         f"{len(rows)} take(s)) — gating by this measured value")
+    return rate
+
+
+def cmd_dub_gate(args: argparse.Namespace) -> None:
+    """Length-gate the dub translation against the MEASURED speech rate.
+
+    Rate sources (exactly one):
+      --rate CHARS_PER_SEC   a value measured by `cook dub measure-rate`
+                             (audition take or synthesized run)
+      --self-measure         measure the rate right here from
+                             dubbed/_full/_segments (synth's takes), print
+                             it, and gate by the measured value
+
+    Everything downstream — per-cue budget factor and total coverage — is
+    computed as est = count_chars(line)/rate, the reflux budget math
+    (预算 = 实测率 × 窗口) inverted, in the same char convention the rate
+    was calibrated in."""
+    import math
+
+    if args.self_measure and args.rate is not None:
+        _die("use either --rate or --self-measure, not both — --self-measure "
+             "derives the rate itself", obj={"stage": "gate"})
+    if args.self_measure:
+        rate = _gate_self_measure(_video_dir(args.output_root))
+        rate_source = "self-measured"
+    elif args.rate is not None:
+        if not math.isfinite(args.rate) or args.rate <= 0:
+            _die(f"--rate must be a positive chars/s value (got {args.rate!r}) "
+                 "measured with `cook dub measure-rate` — an assumed rate is "
+                 "what the 2026-10 run gated on and cost ~6h of rework",
+                 obj={"stage": "gate"})
+        rate = float(args.rate)
+        rate_source = "flag"
     else:
-        _log(f"measured rate: {rate:.2f} chars/s "
-             f"({total_chars} chars / {total_voiced:.1f}s voiced, "
-             f"{len(rows)} file(s))")
-    print("COOK-RESULT: OK", file=sys.stderr, flush=True)
-    sys.exit(0)
+        _die("gate requires the measured speech rate: pass --rate "
+             "CHARS_PER_SEC (from `cook dub measure-rate`) or --self-measure "
+             "to derive it from dubbed/_full/_segments. Refusing to run on an "
+             "assumed rate — that is how the 2026-10 run's thin translation "
+             "passed and cost ~6h of rework", obj={"stage": "gate"})
+
+    # --- evaluate (in-process: the gate is pure arithmetic, no audio deps) ---
+    root = _video_dir(args.output_root)
+    gate = _import_stage_module("dub", "length_gate.py",
+                                "cook_stages_dub_gate")
+    full_srt = root / "transcript" / f"{args.name}.en.full.srt"
+    trans = root / "transcript" / "translations_dub.txt"
+    for f in (full_srt, trans):
+        if not f.exists():
+            _die(f"{f} not found — the gate needs the en.full.srt cue windows "
+                 "and the dub translation (write it first)",
+                 obj={"stage": "gate", "missing": str(f)})
+    try:
+        rep = gate.evaluate(full_srt.read_text(encoding="utf-8"),
+                            trans.read_text(encoding="utf-8"), rate)
+    except ValueError as e:
+        _die(str(e), obj={"stage": "gate"})
+
+    rep.update({"ok": rep["verdict"] == "pass", "rate": rate,
+                "rate_source": rate_source, "stage": "gate"})
+    if getattr(args, "json", False):
+        _emit_json(rep)
+    else:
+        for line in gate.format_report(rep, rate, rate_source):
+            _log(line)
+    if rep["ok"]:
+        print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+        sys.exit(0)
+    summary = (f"coverage {rep['coverage'] * 100:.1f}%" if rep["coverage"] < 0.85
+               or rep["coverage"] > 1.12 else
+               f"{len(rep['short'])} short, {len(rep['over'])} over-budget")
+    print(f"COOK-RESULT: FAIL — length gate: {summary}; rerun after fixing "
+          "the flagged lines", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 
 # ============================================================================
@@ -2246,6 +2373,26 @@ def build_parser() -> argparse.ArgumentParser:
                           "(per-file voiced seconds, chars, and the rate). "
                           "Without it only a human summary goes to stderr.")
     pmr.set_defaults(func=cmd_dub_measure_rate)
+
+    # gate: in-process length gate over the MEASURED rate (pure arithmetic).
+    pgr = dub_sub.add_parser(
+        "gate",
+        help="pre-synth length gate on translations_dub.txt, computed "
+             "against the MEASURED speech rate — refuses to run without it")
+    pgr.add_argument("output_root")
+    pgr.add_argument("name")
+    pgr.add_argument("--rate", type=float, metavar="CHARS_PER_SEC",
+                     help="measured chars/s from `cook dub measure-rate` "
+                          "(required unless --self-measure; must be > 0)")
+    pgr.add_argument("--self-measure", action="store_true",
+                     help="measure the rate right here from "
+                          "dubbed/_full/_segments (synth's takes), print it, "
+                          "and gate by the measured value")
+    pgr.add_argument("--json", action="store_true",
+                     help="emit the machine-readable report on stdout "
+                          "(findings, coverage, verdict). Without it only a "
+                          "human summary goes to stderr.")
+    pgr.set_defaults(func=cmd_dub_gate)
 
     return p
 

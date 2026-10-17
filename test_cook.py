@@ -1129,8 +1129,9 @@ _DUB_STAGE_SCRIPTS = [
     "extract_reference.py",
     "make_zh_dub_srt.py",
     "build_merge.py",
-    "length_gate.py",
 ]
+# length_gate.py is deliberately NOT here (ticket 05): functions-only, its
+# CLI is `cook dub gate` — same conversion measure_rate.py got in ticket 04.
 
 
 def _stages_dub_dir() -> Path:
@@ -1140,9 +1141,10 @@ def _stages_dub_dir() -> Path:
 
 
 class TestDubScriptsInPackage:
-    """All seven dub stage scripts are vendored in stages/dub/ and stay
-    directly runnable (python <script> ...) — the skill repo no longer needs
-    to be installed for the pipeline to run."""
+    """The subprocess-run dub stage scripts are vendored in stages/dub/ and
+    stay directly runnable (python <script> ...) — the skill repo no longer
+    needs to be installed for the pipeline to run. (measure_rate.py and
+    length_gate.py are functions-only and run in-process under cook.)"""
 
     def test_all_seven_scripts_present(self):
         d = _stages_dub_dir()
@@ -1189,11 +1191,14 @@ class TestDubScriptsInPackage:
         assert "你好呀" in text and "第二条" in text
 
     def test_length_gate_direct_run_reports_coverage(self, tmp_path):
-        """End-to-end direct run of the pure-arithmetic gate: prints the
-        coverage line and exits with a defined code (no ffmpeg involved)."""
-        d = _stages_dub_dir()
+        """End-to-end direct run of the pure-arithmetic gate through the
+        cook CLI (its only surface since ticket 05; the standalone script
+        entry died with the functions-only conversion): prints the coverage
+        line, exits with a defined code, no ffmpeg involved."""
         root = tmp_path / "vid"
-        # two 5s windows with 1s gaps -> budgets 6s each; 2x ~4s est lines
+        # two 5s windows, 1s gap after cue1 only (last cue has no next) ->
+        # budgets 6+5=11; 9- and 10-char lines at rate 4.0 -> est 2.25+2.5,
+        # coverage 4.75/11 = 43.2% (out of band, exit 1)
         _make_srt(root / "transcript" / "video.en.full.srt", [
             (1, "00:00:00,000 --> 00:00:05,000", "one two three four five"),
             (2, "00:00:06,000 --> 00:00:11,000", "six seven eight nine ten"),
@@ -1201,11 +1206,22 @@ class TestDubScriptsInPackage:
         _make_translations(root / "transcript" / "translations_dub.txt",
                            ["一句话占个位子而已", "两句话占个位子而已呀"])
         r = subprocess.run(
-            [sys.executable, str(d / "length_gate.py"), str(root), "video"],
+            [sys.executable, str(_HERE / "cook.py"), "dub", "gate",
+             str(root), "video", "--rate", "4.0"],
             capture_output=True, text=True, timeout=60,
         )
-        assert "coverage" in r.stdout
-        assert r.returncode in (0, 1), r.stdout + r.stderr
+        combined = r.stdout + r.stderr
+        assert "coverage" in combined
+        assert "43.2%" in combined
+        assert r.returncode == 1
+        # and the same invocation without a rate refuses (the ticket's core)
+        r2 = subprocess.run(
+            [sys.executable, str(_HERE / "cook.py"), "dub", "gate",
+             str(root), "video"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert r2.returncode != 0
+        assert "measure-rate" in (r2.stdout + r2.stderr)
 
 
 class TestFindDubScriptPackageInternal:
@@ -1811,3 +1827,343 @@ class TestDubMeasureRate:
         report, _, code = self._run(wav=wav, text="  你好，世界！  ")
         assert code == 0
         assert report["chars"] == 6
+
+
+# ----------------------------------------------------------------------------
+# dub gate (ticket 05): the length gate, wired into the cook command surface
+# and driven by the MEASURED speech rate — never an assumed one. The public
+# seam is cmd_dub_gate (argv: output_root/name/--rate/--self-measure/--json).
+# Hand-worked fixtures: budgets are cue start → next cue start (identity
+# clock); est_s = count_chars(line)/rate (the reflux budget math inverted).
+# ----------------------------------------------------------------------------
+
+def _make_gate_inputs(tmp_path, cues, lines, name="video"):
+    """Write transcript/<name>.en.full.srt + translations_dub.txt.
+    cues = [("00:00:00,000", "00:00:04,000"), ...] raw SRT timestamps."""
+    root = tmp_path / "author" / name
+    _make_srt(root / "transcript" / f"{name}.en.full.srt",
+              [(i + 1, f"{s} --> {e}", f"English cue {i + 1}")
+               for i, (s, e) in enumerate(cues)])
+    _make_translations(root / "transcript" / "translations_dub.txt", lines)
+    return root
+
+
+class TestDubGateRateRequired:
+    """Ticket 05's core ruling: without a measured rate the gate refuses to
+    run — the assumed-rate path is what caused the 2026-10 rework."""
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        """Invoke cmd_dub_gate in-process, capture stdout JSON.
+        Returns (report_or_None, stdout_text, exit_code_or_None)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def test_missing_rate_refuses_and_points_at_measure_rate(self, tmp_path):
+        """No --rate, no --self-measure: nonzero exit, error names the
+        command that produces the rate. A fixture with valid inputs proves
+        the refusal is about the RATE, not about the files."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己", "甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己"])
+        report, _, code = self._run(root, rate=None)
+        assert code != 0
+        assert report is not None and report["ok"] is False
+        assert "measure-rate" in report["error"]
+
+    def test_zero_and_negative_rate_refuse(self, tmp_path):
+        """--rate 0 / negative: nonzero exit with a clear error — a 0 rate
+        would make every estimate infinite."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸", "甲乙丙丁戊己庚辛壬癸"])
+        for bad in (0.0, -6.9):
+            report, _, code = self._run(root, rate=bad)
+            assert code != 0
+            assert report["ok"] is False
+            assert "--rate" in report["error"]
+
+
+class TestDubGateVerdict:
+    """The three gate criteria, all computed from the passed rate:
+    est_s = count_chars(line)/rate (punctuation counted — the rate's unit).
+    Hand-worked fixture: budgets 4.5/6.0/4.0 (=14.5 total; cue start → next
+    cue start), rate 5.0, chars 20/24/22 → est 4.0/4.8/4.4 (=13.2),
+    factors 0.89/0.80/1.10, coverage 13.2/14.5 = 91.0% PASS. The OLD
+    syllable-bucket algorithm would estimate 4.76/5.24/5.00 → 103.4% — so
+    these assertions pin the chars/rate math, not a compatible overlap."""
+
+    CUES = [("00:00:00,000", "00:00:04,000"),
+            ("00:00:04,500", "00:00:09,500"),
+            ("00:00:10,500", "00:00:14,500")]
+    LINES = ["甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉",
+             "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥，。",
+             "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌！"]
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def test_healthy_pass_computes_est_from_chars_over_rate(self, tmp_path):
+        root = _make_gate_inputs(tmp_path, self.CUES, self.LINES)
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["verdict"] == "pass"
+        assert report["rate"] == 5.0
+        assert report["rate_source"] == "flag"
+        assert report["lines"] == 3
+        assert report["short"] == [] and report["over"] == [] \
+            and report["under"] == []
+        # hand-worked totals: est 13.2s over 14.5s of windows
+        assert report["total_est_s"] == pytest.approx(13.2, abs=0.05)
+        assert report["total_window_s"] == pytest.approx(14.5, abs=0.05)
+        assert report["coverage"] == pytest.approx(13.2 / 14.5, abs=0.002)
+
+    def test_fail_path_lists_short_over_and_thin_coverage(self, tmp_path):
+        """Hand-worked FAIL fixture: cue1 budget 10.5s with a 4-char line
+        (3 sylls → short, est 0.8s vs 10.5s → deep under), cue2 budget 0.5s
+        with a 30-char line (est 6.0s → factor 12x over). Totals 6.8/11.0 =
+        61.8% coverage — out of band. Exit 1 with all three findings."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:10,000"),
+             ("00:00:10,500", "00:00:11,000")],
+            ["你好呀。",
+             "子丑寅卯辰巳午未申酉戌亥" * 2 + "甲乙丙丁戊己"])
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 1
+        assert report["ok"] is False
+        assert report["verdict"] == "fail"
+        assert report["short"][0]["line"] == 1
+        assert report["short"][0]["sylls"] == 3  # 你好呀 — the 。 is not a syll
+        assert report["over"][0]["line"] == 2
+        assert report["over"][0]["factor"] == pytest.approx(12.0, abs=0.1)
+        assert report["coverage"] == pytest.approx(6.8 / 11.0, abs=0.005)
+        # the 4-char line is also deep under-budget (0.8s est vs 10.5s window)
+        assert report["under"][0]["line"] == 1
+
+    def test_under_budget_alone_is_advisory_pass(self, tmp_path):
+        """Under-budget lines alone do not fail the gate (the assembler pads
+        the shortfall) — verdict pass, advisory_under flagged, exit 0.
+        Fixture: budget1 3.8s/9 chars (est 1.8s, factor 0.47 → under),
+        budget2 6.0s/36 chars (est 7.2s, factor 1.2); coverage 9.0/9.8 =
+        91.8% in band."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:03,400"),
+             ("00:00:03,800", "00:00:09,800")],
+            ["甲乙丙丁戊己庚辛壬",
+             "子丑寅卯辰巳午未申酉戌亥" * 3])
+        report, _, code = self._run(root, rate=5.0)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["verdict"] == "pass"
+        assert report["advisory_under"] is True
+        assert [u["line"] for u in report["under"]] == [1]
+        assert report["coverage"] == pytest.approx(9.0 / 9.8, abs=0.005)
+
+
+class TestDubGateSelfMeasure:
+    """--self-measure: derive the rate from dubbed/_full/_segments (synth's
+    takes) via measure_rate's pairing + VAD, print it, then gate by the
+    MEASURED value. Synthetic wavs: sine = speech, zeros = silence."""
+
+    def _run(self, root, rate=None, self_measure=False, as_json=True):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "output_root": str(root),
+            "name": "video",
+            "rate": rate,
+            "self_measure": self_measure,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def _run_with_segments(self, tmp_path):
+        """2 takes of 2.0 s voiced speech for 10-char lines → measured rate
+        20 chars / 4.0 s = 5.0 chars/s. Cue budgets 2.4/2.0 → est 2.0/2.0,
+        coverage 4.0/4.4 = 90.9% → PASS by the measured rate."""
+        pytest.importorskip("soundfile")
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:02,000"),
+             ("00:00:02,400", "00:00:04,400")],
+            ["甲乙丙丁戊己庚辛壬癸", "子丑寅卯辰巳午未申酉"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.2, False), (2.0, True)])
+        _make_wav(segs / "sent_0002.wav", [(0.2, False), (2.0, True)])
+        return root
+
+    def test_self_measures_then_gates_by_the_measured_rate(self, tmp_path):
+        root = self._run_with_segments(tmp_path)
+        report, _, code = self._run(root, self_measure=True)
+        assert code == 0
+        assert report["ok"] is True
+        assert report["rate_source"] == "self-measured"
+        # measured: 20 chars over ~4.0 s of voiced sine
+        assert 4.8 <= report["rate"] <= 5.2
+        # gate math runs on the measured rate: est 4.0s over 4.4s of windows
+        assert report["coverage"] == pytest.approx(20 / (5.0 * 4.4), abs=0.02)
+        assert report["short"] == [] and report["over"] == []
+
+    def test_rate_and_self_measure_are_mutually_exclusive(self, tmp_path):
+        root = self._run_with_segments(tmp_path)
+        report, _, code = self._run(root, rate=6.9, self_measure=True)
+        assert code != 0
+        assert report["ok"] is False
+        assert "--self-measure" in report["error"]
+
+    def test_self_measure_without_segments_is_refused(self, tmp_path):
+        """No synthesized takes yet (pre-synth run): the refusal names the
+        segments layout and the explicit-rate alternative."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000")],
+            ["甲乙丙丁戊己庚辛壬癸"])
+        report, _, code = self._run(root, self_measure=True)
+        assert code != 0
+        assert report["ok"] is False
+        assert "_segments" in report["error"]
+
+
+class TestDubGateContract:
+    """Remaining contract edges: unit lockstep, output channel, parser
+    wiring, count mismatch."""
+
+    def test_count_chars_stays_in_lockstep_with_measure_rate(self):
+        """The unit closeout (ticket 05): the gate estimates in the SAME
+        char convention the rate is calibrated in. length_gate.count_chars
+        is a second copy of measure_rate.count_chars (kept so the gate
+        module stays import-light) — this tripwire fails the day the two
+        counting conventions drift apart."""
+        mr = cook._import_stage_module("dub", "measure_rate.py",
+                                       "cook_stages_dub_measure")
+        lg = cook._import_stage_module("dub", "length_gate.py",
+                                       "cook_stages_dub_gate")
+        samples = [
+            "你好，世界！",             # CJK + fullwidth punctuation
+            "  padded whitespace  ",   # external whitespace not counted
+            "hello world",             # latin words
+            "混合 mixed 中文 line。",
+            "AI 编程 2026！",
+            "",
+        ]
+        for s in samples:
+            assert lg.count_chars(s) == mr.count_chars(s), repr(s)
+
+    def test_human_output_keeps_stdout_empty(self, tmp_path, capsys):
+        """Without --json: stdout stays empty (agents opt in with --json);
+        the human summary — including the rate it ran on — goes to stderr."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸" * 2 + "甲",
+             "甲乙丙丁戊己庚辛壬癸" * 2 + "甲乙丙"])
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "rate": 5.0, "self_measure": False, "json": False,
+        })()
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                assert e.code == 0
+        assert buf.getvalue() == ""  # stdout is pure-JSON-only territory
+        err = capsys.readouterr().err
+        assert "rate: 5.000 chars/s (flag)" in err
+        assert "coverage" in err
+
+    def test_cue_line_count_mismatch_is_refused(self, tmp_path):
+        """3 srt cues vs 2 translation lines: refuse rather than pair N
+        against N-1 silently."""
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"),
+             ("00:00:04,500", "00:00:08,000"),
+             ("00:00:08,500", "00:00:12,000")],
+            ["甲乙丙丁戊己庚辛壬癸", "甲乙丙丁戊己庚辛壬癸"])
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "rate": 5.0, "self_measure": False, "json": True,
+        })()
+        import io
+        import contextlib
+        buf = io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(args)
+            except SystemExit as e:
+                code = e.code
+        report = json.loads(buf.getvalue().strip())
+        assert code == 1
+        assert report["ok"] is False
+        assert "3" in report["error"] and "2" in report["error"]
+
+    def test_parser_wires_dub_gate(self):
+        """The argparse surface: dub gate takes output_root/name, --rate is
+        typed float (non-numeric is argparse's own nonzero exit), and
+        --rate/--self-measure default to absent."""
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "gate", "some/root", "name",
+                             "--rate", "6.932"])
+        assert args.func is cook.cmd_dub_gate
+        assert args.rate == 6.932
+        assert args.self_measure is False
+        args = p.parse_args(["dub", "gate", "some/root", "name"])
+        assert args.rate is None
+        args = p.parse_args(["dub", "gate", "some/root", "name",
+                             "--self-measure"])
+        assert args.self_measure is True
+        with pytest.raises(SystemExit) as ei:
+            p.parse_args(["dub", "gate", "r", "n", "--rate", "fast"])
+        assert ei.value.code != 0
