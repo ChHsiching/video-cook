@@ -3142,15 +3142,15 @@ class TestRetimePlan:
         assert [p["kind"] for p in plan] == ["ANCHOR", "DWELL", "ANCHOR"]
         assert plan[0]["start"] == 9.95
         assert plan[1]["start"] == 9.95 + 0.04
-        assert plan[1]["end"] == plan[2]["start"] - 0.02
+        assert plan[1]["end"] == plan[2]["start"]  # exact handover
 
     def test_end_is_next_start_minus_gap_and_last_uses_dub_dur(self):
         mod = _load_retime()
         cues = [self._cue(9.0, 12.0, "甲乙"), self._cue(12.0, 15.0, "丙丁")]
         plan = mod.retime_plan(cues, "甲乙丙丁",
                                [10.0, 10.5, 20.0, 20.5], 30.0)
-        assert plan[0]["end"] == plan[1]["start"] - 0.02
-        assert plan[1]["end"] == 30.0 - 0.02   # last end = dub duration - 0.02
+        assert plan[0]["end"] == plan[1]["start"]  # exact handover
+        assert plan[1]["end"] == 30.0   # last end = dub duration verbatim
 
     def test_last_end_falls_back_to_input_when_no_dub_dur(self):
         """Without a dub.wav to anchor the tail, the last end keeps the
@@ -3193,7 +3193,7 @@ class TestRetimePlan:
         plan = mod.retime_plan(cues, "甲乙丙丁",
                                [10.0, 10.5, 101.048, 101.5], 110.0)
         assert plan[1]["start"] == 100.998
-        # normal rule would be 100.998 - 0.02 = 100.978; snap trim wins:
+        # next start 100.998 carries; snap trim wins over exact handover:
         assert plan[0]["end"] == 100 + 0.10 - 0.04
 
     def test_no_snap_trim_below_carry_threshold(self):
@@ -3204,7 +3204,7 @@ class TestRetimePlan:
         plan = mod.retime_plan(cues, "甲乙丙丁",
                                [10.0, 10.5, 101.044, 101.5], 110.0)
         assert plan[1]["start"] == 100.994
-        assert plan[0]["end"] == 100.994 - 0.02
+        assert plan[0]["end"] == pytest.approx(100.994)
 
     def test_punctuation_only_cue_inherits(self):
         """A cue whose zh filters to nothing cannot anchor; it inherits
@@ -3280,8 +3280,8 @@ class TestRetimeStage:
         assert "00:00:09,950 -->" in out          # anchor 1
         assert "00:00:09,990 -->" in out          # dwell clamped
         assert "00:00:19,950 -->" in out          # anchor 2
-        # end of cue 2 = dwell-clamped start - 0.02
-        assert "--> 00:00:09,970" in out
+        # end of cue 2 = dwell-clamped start exactly (seamless handover)
+        assert "--> 00:00:09,990" in out  # exact handover to dwell start
         # text lines preserved verbatim
         assert "en one" in out and "en two" in out
         # report + char-map cache written

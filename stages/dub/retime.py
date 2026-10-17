@@ -67,7 +67,11 @@ from pathlib import Path
 # ---- calibrated constants (leerob r12 regression, 778/778 starts exact) ----
 ANCHOR_LEAD_S = 0.05     # anchor start = first char time - 0.05
 MIN_GAP_S = 0.04         # monotonic clamp: start >= prev start + 0.04
-END_GAP_S = 0.02         # display end = next start - 0.02
+END_GAP_S = 0.0          # display end == next start EXACTLY: a 20ms
+                         # gap blanks one frame at 30fps — the visible
+                         # 'blink' on cue switch (sample90 clip eye-check).
+                         # libass renders end==start as seamless handover;
+                         # the SRT reader contract is end <= next start.
 ASS_SNAP_MARGIN_S = 0.04 # EN grid-snap pre-trim: end = snap point - 0.04
 MAP_MIN_COVERAGE = 0.5   # below: ASR transcript untrusted -> no char times
 FW_MODEL = "small"       # resource rule: small only
@@ -267,7 +271,7 @@ def retime_plan(bil_cues: list[dict], stream: str,
     for k in range(len(starts)):
         if k + 1 < len(starts):
             nxt = starts[k + 1]
-            end = nxt - END_GAP_S
+            end = nxt  # exact handover: end == next start (no blank frame)
             # EN grid-snap pre-trim: the next start's centisecond rounding
             # carries (ASS "SS.100" -> libass reads SS.10, ~0.9s early).
             if round((nxt - int(nxt)) * 100) >= 100:
@@ -275,9 +279,8 @@ def retime_plan(bil_cues: list[dict], stream: str,
         else:
             # no dub.wav to anchor the tail: keep the input end verbatim
             # (a -0.02 here would drift 20ms on every re-run)
-            base = dub_dur if dub_dur is not None else (
-                bil_cues[k]["end"] + END_GAP_S)
-            end = base - END_GAP_S
+            base = dub_dur if dub_dur is not None else bil_cues[k]["end"]
+            end = base  # keep verbatim; no subtraction (idempotent re-runs)
         ends.append(end)
     return [{"start": starts[k], "end": ends[k], "kind": kinds[k]}
             for k in range(len(bil_cues))]
