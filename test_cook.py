@@ -1605,3 +1605,209 @@ class TestShortenExemptionUnchanged:
         text = "这是一条宽度刚好超过豁免带上限一点点的中文字幕用来确认必须切分路径仍会触发"
         pieces = _shorten_cue_texts(tmp_path, text, max_zh=56)
         assert len(pieces) >= 2
+
+
+# ----------------------------------------------------------------------------
+# dub measure-rate (ticket 04): measure the real speech rate of audition
+# wavs / synthesized takes via energy VAD. Tests synthesize tiny wavs
+# (sine = speech, zeros = silence) — no real audio is ever loaded.
+# ----------------------------------------------------------------------------
+
+def _make_wav(path: Path, spans: list[tuple[float, bool]], sr: int = 16000) -> None:
+    """Write a tiny synthetic wav. spans = [(seconds, voiced), ...]; voiced
+    spans are a 0.5-amplitude 440 Hz sine (-9 dBFS RMS), silent spans zeros.
+    ~64 KB for 2 s at 16 kHz — tens of KB per file, per the test contract."""
+    import numpy as np
+    import soundfile as sf
+    frames = []
+    phase_t = 0.0
+    for dur, voiced in spans:
+        n = int(round(dur * sr))
+        if voiced:
+            t = np.arange(n) / sr + phase_t
+            frames.append(0.5 * np.sin(2 * np.pi * 440.0 * t))
+            phase_t += n / sr
+        else:
+            frames.append(np.zeros(n, dtype=np.float64))
+            phase_t += n / sr
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), np.concatenate(frames), sr, subtype="PCM_16")
+
+
+class TestDubMeasureRate:
+    """cook dub measure-rate — the public seam is cmd_dub_measure_rate
+    (argv: wav/--text/--from-segments/--json)."""
+
+    def _run(self, wav=None, text=None, from_segments=None, as_json=True):
+        """Invoke cmd_dub_measure_rate in-process, capture stdout JSON.
+        Returns (report_or_None, stdout_text, exit_code_or_None)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {
+            "wav": str(wav) if wav else None,
+            "text": text,
+            "from_segments": from_segments,
+            "json": as_json,
+        })()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_measure_rate(args)
+            except SystemExit as e:
+                code = e.code
+        text_out = buf.getvalue().strip()
+        report = json.loads(text_out) if text_out else None
+        return report, text_out, code
+
+    def test_explicit_mode_happy_path(self, tmp_path):
+        """wav + --text: 1.0 s of sine between silence paddles, 6 CJK chars.
+        Voiced seconds must track the constructed sine span; rate = chars/voiced."""
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "audition.wav"
+        _make_wav(wav, [(0.3, False), (1.0, True), (0.3, False)])
+        report, _, code = self._run(wav=wav, text="你好世界测试")
+        assert code == 0
+        assert report["ok"] is True
+        assert report["chars"] == 6
+        # voiced tracks the 1.0 s sine span (frame-quantized, 30 ms frames)
+        assert 0.9 <= report["voiced_seconds"] <= 1.1
+        # rate = 6 chars over ~1 s of speech
+        assert 5.4 <= report["rate"] <= 6.7
+        assert report["files"][0]["voiced_seconds"] == report["voiced_seconds"]
+
+    def test_silent_wav_is_nonzero_exit_with_clear_error(self, tmp_path):
+        """A fully-silent take is an error, not a rate of 0 — a silent take
+        means synthesis failed and a 0-rate would poison downstream gates."""
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "silent.wav"
+        _make_wav(wav, [(1.5, False)])
+        report, _, code = self._run(wav=wav, text="你好世界测试")
+        assert code == 1
+        assert report["ok"] is False
+        assert "no speech" in report["error"]
+        assert str(wav) in report["error"]
+
+    def test_from_segments_pairs_lines_with_wavs(self, tmp_path):
+        """--from-segments mode: sorted sent_NNNN.wav pairs with line order;
+        per-file voiced/chars plus aggregate totals and rate come back."""
+        pytest.importorskip("soundfile")
+        root = tmp_path / "author" / "video"
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["甲乙丙丁戊己", "甲乙丙丁戊己庚辛", "甲乙丙丁"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.2, False), (1.0, True)])
+        _make_wav(segs / "sent_0002.wav", [(0.2, False), (2.0, True)])
+        _make_wav(segs / "sent_0003.wav", [(0.2, False), (0.5, True)])
+        report, _, code = self._run(
+            from_segments=[str(root), "video"])
+        assert code == 0
+        assert report["ok"] is True
+        assert report["mode"] == "segments"
+        assert report["files_measured"] == 3
+        # per-file rows carry relative labels and track the sine spans
+        by_file = {r["file"]: r for r in report["files"]}
+        assert "dubbed/_full/_segments/sent_0001.wav" in by_file
+        assert 0.9 <= by_file["dubbed/_full/_segments/sent_0001.wav"]["voiced_seconds"] <= 1.1
+        assert 1.9 <= by_file["dubbed/_full/_segments/sent_0002.wav"]["voiced_seconds"] <= 2.1
+        assert 0.4 <= by_file["dubbed/_full/_segments/sent_0003.wav"]["voiced_seconds"] <= 0.6
+        # totals: 18 chars over 3.5 s of speech
+        assert report["chars"] == 18
+        assert 3.3 <= report["voiced_seconds"] <= 3.7
+        assert 4.9 <= report["rate"] <= 5.4
+
+    def test_from_segments_count_mismatch_is_error(self, tmp_path):
+        """3 lines vs 2 wavs: refuse rather than mis-pair line N with wav N."""
+        pytest.importorskip("soundfile")
+        root = tmp_path / "author" / "video"
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["甲", "乙", "丙"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.5, True)])
+        _make_wav(segs / "sent_0002.wav", [(0.5, True)])
+        report, _, code = self._run(from_segments=[str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "3" in report["error"] and "2" in report["error"]
+
+    def test_from_segments_missing_translations_is_error(self, tmp_path):
+        pytest.importorskip("soundfile")
+        root = tmp_path / "author" / "video"
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.5, True)])
+        report, _, code = self._run(from_segments=[str(root), "video"])
+        assert code == 1
+        assert "translations_dub.txt" in report["error"]
+
+    def test_from_segments_silent_take_fails_naming_file(self, tmp_path):
+        """One silent take in the batch aborts the measurement, naming it."""
+        pytest.importorskip("soundfile")
+        root = tmp_path / "author" / "video"
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["甲乙", "丙丁"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        _make_wav(segs / "sent_0001.wav", [(0.5, True)])
+        _make_wav(segs / "sent_0002.wav", [(0.5, False)])  # silent take
+        report, _, code = self._run(from_segments=[str(root), "video"])
+        assert code == 1
+        assert "no speech" in report["error"]
+        assert "sent_0002.wav" in report["error"]
+
+    def test_bad_invocations_are_rejected(self, tmp_path):
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "a.wav"
+        _make_wav(wav, [(0.5, True)])
+        # neither mode given
+        report, _, code = self._run()
+        assert code == 1 and report["ok"] is False
+        # wav without text
+        report, _, code = self._run(wav=wav)
+        assert code == 1 and report["ok"] is False
+        # text without wav
+        report, _, code = self._run(text="你好")
+        assert code == 1 and report["ok"] is False
+        # both modes at once
+        report, _, code = self._run(wav=wav, text="你好",
+                                    from_segments=[str(tmp_path), "v"])
+        assert code == 1 and report["ok"] is False
+        # wav path that does not exist
+        report, _, code = self._run(wav=tmp_path / "missing.wav", text="你好")
+        assert code == 1 and "not found" in report["error"]
+
+    def test_default_output_is_human_readable_not_json(self, tmp_path):
+        """Without --json: stdout stays empty (agents opt in with --json);
+        the human summary carries the rate on stderr."""
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "audition.wav"
+        _make_wav(wav, [(0.2, False), (1.0, True)])
+        report, text_out, code = self._run(wav=wav, text="你好世界测试",
+                                           as_json=False)
+        assert code == 0
+        assert text_out == ""  # stdout is pure-JSON-only territory
+        assert report is None
+
+    def test_voiced_is_the_span_not_the_frame_sum(self, tmp_path):
+        """Voiced seconds = the speech SPAN (first voiced frame to last
+        voiced frame): intra-sentence pauses are bridged, leading/trailing
+        silence excluded. This is the semantic calibrated against the
+        reflux run's hand measurement (6.93 on the 361 leerob takes)."""
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "span.wav"
+        # 0.4s speech, 0.4s pause, 0.4s speech: span = 1.2s, frame-sum = 0.8s
+        _make_wav(wav, [(0.2, False), (0.4, True), (0.4, False),
+                        (0.4, True), (0.2, False)])
+        report, _, code = self._run(wav=wav, text="甲乙丙丁戊己")
+        assert code == 0
+        assert 1.1 <= report["voiced_seconds"] <= 1.3
+
+    def test_char_convention_is_line_length_with_punctuation(self, tmp_path):
+        """Chars = len() of the stripped line, punctuation INCLUDED — the
+        counting the reflux budget math used (预算=实测率×窗口), and the
+        convention the 6.93 calibration is anchored to. External whitespace
+        is not counted."""
+        pytest.importorskip("soundfile")
+        wav = tmp_path / "conv.wav"
+        _make_wav(wav, [(0.5, True)])
+        report, _, code = self._run(wav=wav, text="  你好，世界！  ")
+        assert code == 0
+        assert report["chars"] == 6
