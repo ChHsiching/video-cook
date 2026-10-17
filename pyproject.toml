@@ -40,7 +40,13 @@ Homepage = "https://github.com/ChHsiching/video-cook"
 Repository = "https://github.com/ChHsiching/video-cook"
 
 [tool.setuptools]
+# cook.py stays a single top-level module; the stage scripts (deterministic
+# pipeline stages vendored from the skill repos) ship as the stages package
+# tree next to it, resolved by path at runtime.
 py-modules = ["cook"]
+
+[tool.setuptools.packages.find]
+include = ["stages*"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

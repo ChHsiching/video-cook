@@ -984,3 +984,180 @@ class TestQualityGuardR2:
         src = Path(cook.__file__).read_text(encoding="utf-8")
         assert "args.quality < 120" in src            # early sanity guard
         assert "args.quality + 1" in src              # post-download compare
+
+
+# ----------------------------------------------------------------------------
+# dub stage scripts physically consolidated into the cook package (reflux
+# tk-02): the seven deterministic dub scripts live in stages/dub/, the dub
+# subcommands execute the PACKAGE-INTERNAL copy (not whatever video-dubbing
+# skill copy happens to be installed), and each script keeps __main__
+# direct-call capability.
+# ----------------------------------------------------------------------------
+
+_DUB_STAGE_SCRIPTS = [
+    "full_dub.py",
+    "loudness_match.py",
+    "scan_reference.py",
+    "extract_reference.py",
+    "make_zh_dub_srt.py",
+    "build_merge.py",
+    "length_gate.py",
+]
+
+
+def _stages_dub_dir() -> Path:
+    """The package-internal dub stage dir, derived the way cook derives it:
+    next to cook.py (dev checkout) / next to the installed module (wheel)."""
+    return Path(cook.__file__).resolve().parent / "stages" / "dub"
+
+
+class TestDubScriptsInPackage:
+    """All seven dub stage scripts are vendored in stages/dub/ and stay
+    directly runnable (python <script> ...) — the skill repo no longer needs
+    to be installed for the pipeline to run."""
+
+    def test_all_seven_scripts_present(self):
+        d = _stages_dub_dir()
+        for name in _DUB_STAGE_SCRIPTS:
+            assert (d / name).is_file(), f"stages/dub/{name} missing"
+
+    def test_scripts_run_directly_without_traceback(self):
+        """__main__ direct-call capability: each script, invoked with no args,
+        exits non-zero with usage/doc text (argparse or manual check) — NOT
+        with an ImportError/AttributeError traceback or a missing file."""
+        d = _stages_dub_dir()
+        for name in _DUB_STAGE_SCRIPTS:
+            r = subprocess.run(
+                [sys.executable, str(d / name)],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert r.returncode != 0, f"{name}: no-args should not succeed"
+            tb = r.stderr + r.stdout
+            assert "Traceback" not in tb, f"{name}: {r.stderr[-400:]}"
+            assert "No such file" not in tb, f"{name}: {r.stderr[-400:]}"
+            assert ("usage" in tb.lower()) or ("python" in tb.lower()), \
+                f"{name}: no usage/doc text printed"
+
+    def test_make_zh_dub_srt_direct_run_writes_srt(self, tmp_path):
+        """End-to-end direct run of the pure-stdlib script: en.full.srt +
+        translations -> zh.dub.srt with inherited timestamps."""
+        d = _stages_dub_dir()
+        en = tmp_path / "video.en.full.srt"
+        _make_srt(en, [
+            (1, "00:00:01,000 --> 00:00:03,000", "hello there"),
+            (2, "00:00:04,000 --> 00:00:06,000", "second cue"),
+        ])
+        zh = tmp_path / "translations_dub.txt"
+        _make_translations(zh, ["你好呀", "第二条"])
+        out = tmp_path / "zh.dub.srt"
+        r = subprocess.run(
+            [sys.executable, str(d / "make_zh_dub_srt.py"),
+             str(en), str(zh), str(out)],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert r.returncode == 0, r.stderr
+        text = out.read_text(encoding="utf-8")
+        assert "00:00:01,000 --> 00:00:03,000" in text
+        assert "你好呀" in text and "第二条" in text
+
+    def test_length_gate_direct_run_reports_coverage(self, tmp_path):
+        """End-to-end direct run of the pure-arithmetic gate: prints the
+        coverage line and exits with a defined code (no ffmpeg involved)."""
+        d = _stages_dub_dir()
+        root = tmp_path / "vid"
+        # two 5s windows with 1s gaps -> budgets 6s each; 2x ~4s est lines
+        _make_srt(root / "transcript" / "video.en.full.srt", [
+            (1, "00:00:00,000 --> 00:00:05,000", "one two three four five"),
+            (2, "00:00:06,000 --> 00:00:11,000", "six seven eight nine ten"),
+        ])
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["一句话占个位子而已", "两句话占个位子而已呀"])
+        r = subprocess.run(
+            [sys.executable, str(d / "length_gate.py"), str(root), "video"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert "coverage" in r.stdout
+        assert r.returncode in (0, 1), r.stdout + r.stderr
+
+
+class TestFindDubScriptPackageInternal:
+    """_find_dub_script resolves the package-internal stages/dub/full_dub.py —
+    the consolidation removes the 'installed skill copy may be older' failure
+    mode the --keep-subs version probe guarded against."""
+
+    def test_resolves_package_internal_path(self):
+        script = cook._find_dub_script()
+        assert script == _stages_dub_dir() / "full_dub.py"
+        assert script.is_file()
+
+    def test_ignores_installed_skill_copies(self, tmp_path, monkeypatch):
+        """Stale skill copies under any of the old home-dir locations must
+        never win over the package file."""
+        fake_home = tmp_path / "fakehome"
+        for sub in (".agents", ".zcode", ".claude"):
+            d = fake_home / sub / "skills" / "video-dubbing" / "scripts"
+            d.mkdir(parents=True)
+            (d / "full_dub.py").write_text("# stale copy\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        script = cook._find_dub_script()
+        assert script == _stages_dub_dir() / "full_dub.py"
+
+
+class TestDubStageLaunchesPackageScript:
+    """cook dub synth/assemble build their subprocess command around the
+    package-internal full_dub.py (still launched via --python so the
+    indextts venv can import its deps), with --keep-subs passed through."""
+
+    def _capture_cmd(self, monkeypatch, tmp_path, stage: str,
+                     keep_subs: bool = False) -> list[str] | None:
+        root = tmp_path / "vid"
+        # stage every prerequisite so the gate passes
+        self._touch(root / "transcript" / "translations_dub.txt")
+        self._touch(root / "dubbed" / "_reference" / "ref.wav")
+        self._touch(root / "dubbed" / "_full" / "_segments" / "sent_0001.wav")
+        captured: dict = {}
+
+        def fake_run_long_task(cmd, cwd, log_file, err_file, detach=False):
+            captured["cmd"] = cmd
+            return {"ok": True, "returncode": 0}
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run_long_task)
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": False, "keep_subs": keep_subs,
+        })()
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                fn = {"synth": cook.cmd_dub_synth,
+                      "assemble": cook.cmd_dub_assemble}[stage]
+                fn(args)
+            except SystemExit as e:
+                if e.code not in (0, None):
+                    raise
+        return captured.get("cmd")
+
+    def _touch(self, path: Path, content: bytes = b"x" * 2000) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    def test_synth_launches_package_internal_script(self, monkeypatch, tmp_path):
+        cmd = self._capture_cmd(monkeypatch, tmp_path, "synth")
+        assert cmd is not None, "stage never launched"
+        assert cmd[1] == str(_stages_dub_dir() / "full_dub.py")
+        assert cmd[2] == "synth"
+
+    def test_assemble_launches_package_internal_script(self, monkeypatch, tmp_path):
+        cmd = self._capture_cmd(monkeypatch, tmp_path, "assemble")
+        assert cmd is not None, "stage never launched"
+        assert cmd[1] == str(_stages_dub_dir() / "full_dub.py")
+        assert cmd[2] == "assemble"
+
+    def test_keep_subs_passed_through_to_subprocess(self, monkeypatch, tmp_path):
+        """--keep-subs reaches full_dub.py's argv and no pre-launch probe
+        dies (the version probe was deleted with the consolidation)."""
+        cmd = self._capture_cmd(monkeypatch, tmp_path, "assemble", keep_subs=True)
+        assert cmd is not None, "stage never launched — probe may still be dying"
+        assert "--keep-subs" in cmd

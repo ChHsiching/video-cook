@@ -971,16 +971,18 @@ def _run_subs(mod, argv: list[str]) -> None:
 
 
 def _find_dub_script() -> Path:
-    """Locate full_dub.py from the video-dubbing skill scripts."""
-    candidates = [
-        Path.home() / ".agents" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
-        Path.home() / ".zcode" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
-        Path.home() / ".claude" / "skills" / "video-dubbing" / "scripts" / "full_dub.py",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            return cand
-    _die("full_dub.py not found. Install video-dubbing skill: npx skills add ChHsiching/video-dubbing-skill")
+    """Locate full_dub.py inside the cook package (stages/dub/).
+
+    The dub stage scripts are physically vendored next to cook.py (dev
+    checkout) / next to the installed module (wheel), so this always resolves
+    to the copy version-locked to the running cook — installed skill copies
+    can no longer drift out of sync, which is why the old --keep-subs version
+    probe was deleted."""
+    script = Path(__file__).resolve().parent / "stages" / "dub" / "full_dub.py"
+    if not script.is_file():
+        _die(f"package-internal full_dub.py missing: {script} — reinstall video-cook",
+             obj={"stage": "dub", "missing": str(script)})
+    return script
 
 
 # ----------------------------------------------------------------------------
@@ -1731,9 +1733,9 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 
 # ----------------------------------------------------------------------------
 # dub subcommands: synth / assemble / full
-# Thin wrappers over video-dubbing skill's full_dub.py. Each loads the module
-# via importlib and calls the corresponding stage function. Same pattern as
-# cmd_subtitles → subtitles.py.
+# Thin wrappers over the package-internal stages/dub/full_dub.py — launched
+# as a subprocess (under --python, so the indextts/demucs venv can supply
+# the heavy deps). Same calling convention as cmd_subtitles → subtitles.py.
 # ----------------------------------------------------------------------------
 
 def cmd_dub_synth(args: argparse.Namespace) -> None:
@@ -1759,18 +1761,11 @@ def cmd_dub_assemble(args: argparse.Namespace) -> None:
     in dubbed/_full/ — the recovery path after a post-burn quality-gate fix
     (dubbing SKILL.md Step 5) edited dubbing.bilingual.srt or the merged
     SRTs by hand (regenerating would wipe those edits). The ASS is still
-    rebuilt from the on-disk bilingual SRT."""
-    if getattr(args, "keep_subs", False):
-        # The flag is honored by full_dub.py, resolved from the INSTALLED
-        # video-dubbing skill — which may still be an older copy that ignores
-        # extra argv and silently regenerates (wiping the hand edits the
-        # flag exists to protect). Probe before assembling anything.
-        script_src = Path(_find_dub_script()).read_text(encoding="utf-8", errors="replace")
-        if "keep_subs" not in script_src:
-            _die("--keep-subs needs a full_dub.py that supports it — the installed "
-                 "video-dubbing skill is older. Update it "
-                 "(npx skills add ChHsiching/video-dubbing-skill) or drop the flag.",
-                 obj={"stage": "assemble", "flag": "--keep-subs"})
+    rebuilt from the on-disk bilingual SRT.
+
+    No version probe: the flag is honored by the package-internal
+    stages/dub/full_dub.py, which ships with this cook and cannot be an
+    older copy."""
     _run_dub_stage("assemble", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    detach=getattr(args, "detach", False),
@@ -1927,8 +1922,9 @@ def build_parser() -> argparse.ArgumentParser:
     pdv.add_argument("name")
     pdv.set_defaults(func=cmd_dub_verify)
 
-    # Identity-timeline pipeline (IndexTTS2). Thin wrappers over
-    # video-dubbing skill's full_dub.py — loaded via importlib at call time.
+    # Identity-timeline pipeline (IndexTTS2). Thin wrappers over the
+    # package-internal stages/dub/full_dub.py — run as a subprocess via
+    # --python so the indextts/demucs venv can supply the heavy deps.
     # Helper: every dub stage needs --python (for the indextts/demucs venv).
     # The long stages (synth, assemble, and full which runs them) also get --detach.
     def _add_dub_common(parser, with_detach=False):
