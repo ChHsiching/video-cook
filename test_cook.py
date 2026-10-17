@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1098,7 +1099,8 @@ class TestQualityGuardR2:
         args = type("A", (), {"url": "https://x", "quality": 119,
                               "cookies": None, "cookies_from_browser": None,
                               "author": None, "name": None})()
-        import io, contextlib
+        import contextlib
+        import io
         import pytest as _pytest
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1273,7 +1275,8 @@ class TestDubStageLaunchesPackageScript:
             "output_root": str(root), "name": "video",
             "python": None, "detach": False, "keep_subs": keep_subs,
         })()
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
@@ -1624,6 +1627,818 @@ class TestShortenExemptionUnchanged:
 
 
 # ----------------------------------------------------------------------------
+# synth multi-worker (ticket 10 / issue #21): band split + stagger + exit-code
+# aggregation. All tests are pure or monkeypatched — fake IndexTTS2/torch via a
+# temp INDEXTTS_DIR package, fake Popen for cook's orchestration. No network,
+# no ffmpeg, no real model, no real synthesis.
+# ----------------------------------------------------------------------------
+
+def _load_full_dub(tmp_path: Path, monkeypatch) -> tuple[object, Path]:
+    """Load stages/dub/full_dub.py fresh with INDEXTTS_DIR pointed at a temp
+    package of test doubles (fake indextts.infer_v2_5.IndexTTS2 writing real
+    stdlib-wave silence wavs) and a fake torch injected straight into
+    sys.modules — the injection must win even when the REAL torch is already
+    imported by an earlier test in the same process (real torch refuses a
+    second set_num_interop_threads call). Returns (module, fake_pkg_dir).
+
+    The module-level import of full_dub is stdlib-only, so in-process loading
+    is safe; the heavy deps only load inside stage_synth — and there they hit
+    the doubles via sys.modules (torch) and the sys.path.insert(0,
+    INDEXTTS_DIR) the stage itself performs (indextts)."""
+    import importlib.util
+    import sys
+    import types
+    pkg = tmp_path / "fakedeps"
+    (pkg / "indextts").mkdir(parents=True)
+    (pkg / "indextts" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "indextts" / "infer_v2_5.py").write_text(
+        "import pathlib, wave\n"
+        "CALLS = []\n"  # (kind, ...) events: ('init',), ('infer', text, path)
+        "class IndexTTS2:\n"
+        "    def __init__(self, **kw):\n"
+        "        CALLS.append(('init',))\n"
+        "    def infer(self, spk_audio_prompt, text, output_path, lang,\n"
+        "              use_random, duration_factor):\n"
+        "        CALLS.append(('infer', text, output_path))\n"
+        "        p = pathlib.Path(output_path)\n"
+        "        p.parent.mkdir(parents=True, exist_ok=True)\n"
+        "        with wave.open(str(p), 'wb') as w:\n"
+        "            w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)\n"
+        "            w.writeframes(b'\\x00' * 4410)  # 0.2s silence, 8820 bytes > 1KB\n",
+        encoding="utf-8")
+    fake_torch = types.ModuleType("torch")
+    fake_torch.set_num_threads = lambda n: None
+    fake_torch.set_num_interop_threads = lambda n: None
+    fake_torch.__file__ = str(pkg / "torch.py")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("INDEXTTS_DIR", str(pkg))
+    spec = importlib.util.spec_from_file_location(
+        f"full_dub_test_{id(tmp_path):x}", _stages_dub_dir() / "full_dub.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, pkg
+
+
+def _fake_tts_calls(pkg: Path) -> list[tuple]:
+    """Read the CALLS log from the fake indextts package (loaded under the
+    name the stage's own `from indextts.infer_v2_5 import ...` resolves to).
+    None means the stage never imported it — e.g. a fully-cached band, which
+    is itself an assertion the callers make on the returned empty list."""
+    import sys
+    mod = sys.modules.get("indextts.infer_v2_5")
+    return [] if mod is None else list(mod.CALLS)
+
+
+@pytest.fixture
+def _restore_sys_path():
+    """stage_synth internally does sys.path.insert(0, INDEXTTS_DIR) (pointing
+    at the test-double package) and never removes it. Snapshot sys.path and the
+    fake-package module entries, restore both afterwards, so the doubles never
+    leak into later tests (e.g. a fake torch shadowing the real one)."""
+    import sys
+    path_before = [Path(p) for p in sys.path]
+
+    def _is_foreign(mod) -> bool:
+        f = getattr(mod, "__file__", None)
+        return bool(f) and Path(f).resolve().parent not in path_before
+
+    mods_before = set(sys.modules)
+    yield
+    for name in list(sys.modules):
+        if name not in mods_before and _is_foreign(sys.modules[name]):
+            del sys.modules[name]
+    sys.path[:] = [str(p) for p in path_before]
+
+
+class TestSynthBands:
+    """synth_bands(n_cues, n_bands): even inclusive (lo, hi) bands over cue
+    positions 1..n_cues for the multi-worker split — earlier bands absorb the
+    remainder, empty trailing bands are dropped (more workers than cues spawns
+    fewer workers, never a zero-cue one)."""
+
+    def _mod(self, tmp_path, monkeypatch):
+        mod, _ = _load_full_dub(tmp_path, monkeypatch)
+        return mod
+
+    def test_single_band_is_the_whole_range(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(10, 1) == [(1, 10)]
+
+    def test_even_split_has_no_remainder(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(10, 2) == [(1, 5), (6, 10)]
+
+    def test_remainder_goes_to_earlier_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        # 11 = 4+4+3, not 3+4+4 — determinism matters: band k must be
+        # computable without seeing the others (worker argv is built from it)
+        assert f(11, 3) == [(1, 4), (5, 8), (9, 11)]
+
+    def test_production_shape_361_cues_2_workers(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        # the leerob run: 361 cues, supervisor + 1 worker
+        assert f(361, 2) == [(1, 181), (182, 361)]
+
+    def test_more_bands_than_cues_drops_empty_trailing_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(3, 5) == [(1, 1), (2, 2), (3, 3)]
+
+    def test_zero_cues_yields_no_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(0, 2) == []
+
+    def test_bands_cover_all_cues_exactly_once(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        for n_cues, n_bands in [(361, 2), (100, 3), (7, 4), (5, 8)]:
+            bands = f(n_cues, n_bands)
+            seen = []
+            for lo, hi in bands:
+                assert lo <= hi, f"empty band survived: {(lo, hi)}"
+                seen.extend(range(lo, hi + 1))
+            assert seen == list(range(1, n_cues + 1)), (n_cues, n_bands)
+            sizes = [hi - lo + 1 for lo, hi in bands]
+            assert max(sizes) - min(sizes) <= 1, (n_cues, n_bands, sizes)
+
+    def test_invalid_band_count_raises(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        with pytest.raises(ValueError):
+            f(10, 0)
+
+
+class TestSynthWorkerStage:
+    """stage_synth band mode (--lo/--hi/--stagger via the synth-worker CLI):
+    descending order within the band, skip-if-exists (>1KB) unchanged, model
+    loaded only when the band has pending work, stagger sleep BEFORE any heavy
+    import, and a final marker that cannot false-trigger the supervisor's
+    'Stage 1 DONE' poller."""
+
+    def _stage_video(self, tmp_path: Path, mod, n_cues: int) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt",
+                  _fake_en_cues(n_cues))
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           [f"第{i}句中文配音" for i in range(1, n_cues + 1)])
+        return root
+
+    def _run_stage(self, mod, root: Path, **kw) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_synth(str(root), "video", **kw)
+        return buf.getvalue()
+
+    def _segments(self, root: Path) -> Path:
+        return root / "dubbed" / "_full" / "_segments"
+
+    def _infer_idx_order(self, calls: list[tuple]) -> list[int]:
+        """Cue positions (1-based) in the order infer() synthesized them,
+        derived from the output filename sent_{idx:04d}.wav."""
+        import re
+        out = []
+        for c in calls:
+            if c[0] == "infer":
+                out.append(int(re.search(r"sent_(\d{4})\.wav", c[2]).group(1)))
+        return out
+
+    def test_supervisor_path_unchanged_full_ascending(self, tmp_path, monkeypatch, _restore_sys_path):
+        """No band kwargs = the pre-ticket behavior: every cue synthesized in
+        ascending order and the 'Stage 1 DONE' marker literal intact (the
+        detached poller's done_marker depends on it)."""
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 5)
+        out = self._run_stage(mod, root)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [1, 2, 3, 4, 5]
+        assert "Stage 1 DONE: 5 cues synthesized" in out
+
+    def test_worker_synthesizes_only_band_in_descending_order(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 10)
+        out = self._run_stage(mod, root, lo=3, hi=6)
+        # descending so the ascending supervisor and this worker meet at one
+        # band edge only (the reference synth_worker.py contract)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3]
+        assert "[worker 3-6] ALL DONE" in out
+        # the worker marker must never contain the supervisor's poller literal
+        assert "Stage 1 DONE" not in out
+
+    def test_worker_skips_existing_over_1kb_and_regenerates_truncated(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 6)
+        segs = self._segments(root)
+        segs.mkdir(parents=True)
+        (segs / "sent_0002.wav").write_bytes(b"x" * 2000)  # cached: skip
+        (segs / "sent_0004.wav").write_bytes(b"x" * 100)   # truncated: redo
+        self._run_stage(mod, root, lo=1, hi=6)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3, 1]
+
+    def test_fully_cached_band_loads_no_model(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 3)
+        segs = self._segments(root)
+        segs.mkdir(parents=True)
+        for i in (1, 2, 3):
+            (segs / f"sent_{i:04d}.wav").write_bytes(b"x" * 2000)
+        out = self._run_stage(mod, root, lo=1, hi=3)
+        calls = _fake_tts_calls(pkg)
+        assert not any(c[0] == "init" for c in calls)
+        assert not any(c[0] == "infer" for c in calls)
+        assert "[worker 1-3] ALL DONE" in out
+
+    def test_worker_stagger_sleeps_before_model_load_and_logs_it(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        out = self._run_stage(mod, root, lo=1, hi=2, stagger=7.5)
+        assert sleeps == [7.5]
+        # observable in the log (ticket acceptance) and ordered before the
+        # heavy imports begin
+        assert "[worker 1-2] staggering 7.5s" in out
+        assert out.index("staggering") < out.index("loading IndexTTS2")
+
+    def test_worker_zero_stagger_never_sleeps(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        self._run_stage(mod, root, lo=1, hi=2)
+        assert sleeps == []
+
+    def test_cli_synth_worker_dispatches_band(self, tmp_path, monkeypatch, _restore_sys_path):
+        """`python full_dub.py synth-worker <root> <name> --lo --hi --stagger`
+        is the argv cook spawns — the CLI dispatch must reach the banded
+        stage with parsed values."""
+        import contextlib
+        import io
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 10)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod._cli_main(["synth-worker", str(root), "video",
+                           "--lo", "3", "--hi", "6", "--stagger", "0"])
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3]
+        assert "[worker 3-6] ALL DONE" in buf.getvalue()
+
+    def test_cli_stagger_reaches_stage(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod._cli_main(["synth-worker", str(root), "video",
+                           "--lo", "1", "--hi", "2", "--stagger", "4.5"])
+        assert sleeps == [4.5]
+
+    def test_cli_synth_stage_still_rejects_worker_flags(self, tmp_path, monkeypatch, _restore_sys_path):
+        """The supervisor CLI contract is frozen: `synth` takes only
+        --keep-subs-style flags; band flags belong to synth-worker only."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        with pytest.raises(SystemExit) as ei:
+            mod._cli_main(["synth", str(tmp_path), "video", "--lo", "3"])
+        assert ei.value.code != 0
+
+
+class TestSynthWorkersOrchestration:
+    """`cook dub synth --workers N --stagger S` (ticket 10): the supervisor
+    subprocess argv is UNCHANGED (full list, ascending); N-1 worker
+    subprocesses are spawned with descending band argv --lo/--hi/--stagger
+    k*S and their own log files; exit codes aggregate (any non-zero = the
+    whole stage fails). N=1 (default) spawns nothing and behaves exactly as
+    before. All process launching is monkeypatched — nothing executes."""
+
+    def _stage_run(self, monkeypatch, tmp_path, workers: int, stagger: float = 0.0,
+                   worker_rcs: list[int] | None = None,
+                   supervisor_rc: int = 0, n_cues: int = 10):
+        """Drive cmd_dub_synth with fake _run_long_task (supervisor) and fake
+        subprocess.Popen (workers). Returns (json_dict_or_None, supervisor_cmd,
+        popen_cmds, exit_code_or_None)."""
+        root = tmp_path / "vid"
+        trans = root / "transcript" / "translations_dub.txt"
+        trans.parent.mkdir(parents=True, exist_ok=True)
+        trans.write_text(
+            "\n".join(f"第{i}句" for i in range(1, n_cues + 1)) + "\n", encoding="utf-8")
+        ref = root / "dubbed" / "_reference" / "ref.wav"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"x" * 2000)
+
+        sup: dict = {}
+        pops: list[list[str]] = []
+
+        def fake_run_long_task(cmd, cwd, log_file, err_file, detach=False):
+            sup["cmd"] = cmd
+            return {"ok": supervisor_rc == 0, "returncode": supervisor_rc}
+
+        rcs = worker_rcs if worker_rcs is not None else []
+
+        class _FakeProc:
+            def __init__(self, cmd, rc):
+                self.cmd, self.rc, self.pid = cmd, rc, 4242
+
+            def wait(self):
+                return self.rc
+
+        def fake_popen(cmd, **kw):
+            rc = rcs[len(pops)] if len(pops) < len(rcs) else 0
+            proc = _FakeProc(list(cmd), rc)
+            pops.append(proc.cmd)
+            return proc
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run_long_task)
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": False,
+            "workers": workers, "stagger": stagger,
+        })()
+        import contextlib
+        import io
+        import json as _json
+        buf = io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_synth(args)
+            except SystemExit as e:
+                code = e.code
+        # stdout carries only _emit_json's (multi-line, indent=2) payload;
+        # _log/_die COOK-RESULT both go to stderr
+        try:
+            js = _json.loads(buf.getvalue())
+        except ValueError:
+            js = None
+        return (js, sup.get("cmd"), pops, code)
+
+    def test_single_worker_default_spawns_nothing(self, monkeypatch, tmp_path):
+        """--workers 1 (the default): zero Popen calls and the supervisor argv
+        is byte-identical to the pre-ticket command (no band flags)."""
+        js, sup_cmd, pops, code = self._stage_run(monkeypatch, tmp_path, workers=1)
+        assert pops == []
+        assert sup_cmd == [cook.sys.executable,
+                           str(_stages_dub_dir() / "full_dub.py"),
+                           "synth", str(tmp_path / "vid"), "video"]
+        assert js["ok"] is True and js["returncode"] == 0
+        assert code in (None, 0)
+
+    def test_three_workers_spawn_two_descending_bands_with_stagger(self, monkeypatch, tmp_path):
+        js, sup_cmd, pops, _code = self._stage_run(
+            monkeypatch, tmp_path, workers=3, stagger=30.0, n_cues=10)
+        assert len(pops) == 2
+        py = cook.sys.executable
+        script = str(_stages_dub_dir() / "full_dub.py")
+        root = str(tmp_path / "vid")
+        assert pops[0] == [py, script, "synth-worker", root, "video",
+                           "--lo", "1", "--hi", "5", "--stagger", "30.0"]
+        assert pops[1] == [py, script, "synth-worker", root, "video",
+                           "--lo", "6", "--hi", "10", "--stagger", "60.0"]
+        # the supervisor argv is untouched by the fan-out
+        assert sup_cmd == [py, script, "synth", root, "video"]
+        assert js["ok"] is True
+        assert js["returncode"] == 0
+        assert [w["worker"] for w in js["workers"]] == [1, 2]
+        assert js["workers"][0]["band"] == [1, 5]
+        assert js["workers"][1]["band"] == [6, 10]
+        assert js["workers"][1]["log"].endswith("synth.worker2.log")
+
+    def test_worker_log_files_created_per_band(self, monkeypatch, tmp_path):
+        _js, _sup, _pops, _code = self._stage_run(monkeypatch, tmp_path, workers=2, n_cues=4)
+        root = tmp_path / "vid"
+        for k in (1,):
+            assert (root / "dubbed" / f"synth.worker{k}.log").exists()
+            assert (root / "dubbed" / f"synth.worker{k}.err.log").exists()
+
+    def test_any_worker_failure_fails_the_whole_stage(self, monkeypatch, tmp_path):
+        """Exit-code aggregation: one worker exiting 2 makes ok:false and
+        _die names that worker's err log (ticket acceptance)."""
+        js, _sup, _pops, code = self._stage_run(
+            monkeypatch, tmp_path, workers=3, worker_rcs=[0, 2], n_cues=10)
+        assert code not in (None, 0), "a failed worker must fail the stage"
+        assert js is not None and js["ok"] is False
+        assert js["returncode"] == 2
+        fails = [w for w in js["workers"] if w["returncode"] != 0]
+        assert len(fails) == 1 and fails[0]["worker"] == 2
+
+    def test_supervisor_failure_fails_even_with_green_workers(self, monkeypatch, tmp_path):
+        js, _sup, _pops, code = self._stage_run(
+            monkeypatch, tmp_path, workers=2, supervisor_rc=3, n_cues=4)
+        assert code not in (None, 0)
+        assert js["ok"] is False and js["returncode"] == 3
+
+    def test_more_workers_than_cues_spawns_fewer_bands(self, monkeypatch, tmp_path):
+        js, _, pops, _code = self._stage_run(monkeypatch, tmp_path, workers=4, n_cues=2)
+        # 3 bands wanted, only 2 cues -> 2 workers spawned (no empty band)
+        assert len(pops) == 2
+        assert js["ok"] is True
+
+    def test_workers_below_one_dies_before_spawning(self, monkeypatch, tmp_path):
+        _js, sup_cmd, pops, code = self._stage_run(monkeypatch, tmp_path, workers=0)
+        assert code not in (None, 0)
+        assert pops == [] and sup_cmd is None
+
+    def test_detach_with_multiple_workers_rejected(self, monkeypatch, tmp_path):
+        root = tmp_path / "vid"
+        trans = root / "transcript" / "translations_dub.txt"
+        trans.parent.mkdir(parents=True, exist_ok=True)
+        trans.write_text("句\n", encoding="utf-8")
+        ref = root / "dubbed" / "_reference" / "ref.wav"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"x" * 2000)
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": True, "workers": 2, "stagger": 0.0,
+        })()
+        with pytest.raises(SystemExit) as ei:
+            cook.cmd_dub_synth(args)
+        assert ei.value.code not in (0, None)
+
+    def test_parser_defaults_workers_one_stagger_zero(self):
+        p = cook.build_parser()
+        a = p.parse_args(["dub", "synth", "root", "name"])
+        assert a.workers == 1 and a.stagger == 0.0
+        a2 = p.parse_args(["dub", "synth", "root", "name",
+                           "--workers", "3", "--stagger", "45"])
+        assert a2.workers == 3 and a2.stagger == 45.0
+
+
+# ----------------------------------------------------------------------------
+# cook dub merge: the ONLY legal way to merge cues — en.full.srt and
+# translations_dub.txt are merged in lockstep (one side hand-edited alone is
+# the 2026-10 incident: zh/en off by one line, 8 dubbed sentences 4-14s late).
+# ============================================================================
+
+class _DubMergeHarness:
+    """Shared harness for dub-merge tests. Seam: cmd_dub_merge in-process;
+    observed via the on-disk files under transcript/ (en.full.srt,
+    translations_dub.txt, their .v1 backups), the exit code, and stdout JSON.
+    Fake SRTs in temp dirs only."""
+
+    def _setup(self, tmp_path: Path, en_cues, zh_lines, name="video"):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / f"{name}.en.full.srt"
+        zh_txt = root / "transcript" / "translations_dub.txt"
+        _make_srt(en_srt, en_cues)
+        _make_translations(zh_txt, zh_lines)
+        return root, en_srt, zh_txt
+
+    def _run(self, root: Path, groups, name="video"):
+        """Invoke cmd_dub_merge in-process. Returns (exit_code, stdout_json).
+        exit_code None = returned normally (exit 0)."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": name,
+                              "group": list(groups)})()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_merge(args)
+            except SystemExit as e:
+                code = e.code
+        try:
+            report = json.loads(buf.getvalue())
+        except ValueError:
+            report = None
+        return code, report
+
+    def _blocks(self, path: Path):
+        """Parse an SRT on disk into [(num, ts, text), ...]."""
+        text = path.read_text(encoding="utf-8").strip()
+        out = []
+        for b in re.split(r"\n\s*\n", text):
+            lines = b.splitlines()
+            out.append((int(lines[0]), lines[1], " ".join(lines[2:])))
+        return out
+
+    def _assert_refused_untouched(self, root, en_srt, zh_txt,
+                                  orig_en, orig_zh, code, report):
+        assert code == 1  # _die's non-zero exit
+        assert report is None or report.get("ok") is False
+        # zero side effects: working files byte-identical, no backups created
+        assert en_srt.read_text(encoding="utf-8") == orig_en
+        assert zh_txt.read_text(encoding="utf-8") == orig_zh
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+        assert not (zh_txt.parent / "translations_dub.txt.v1").exists()
+
+
+class TestDubMerge(_DubMergeHarness):
+
+    def test_single_group_merges_both_sides_in_lockstep(self, tmp_path):
+        """The happy path: --group 2,3 merges cue 2+3 on BOTH sides in one
+        atomic action — en text space-joined, zh text directly joined, the
+        merged window = first start + last end, untouched cues verbatim,
+        numbering resequenced, and .v1 backups holding the pre-merge files."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+            (3, "00:00:05,300 --> 00:00:06,400", "third cue"),
+            (4, "00:00:07,500 --> 00:00:08,600", "fourth cue"),
+        ]
+        zh = ["第一句", "第二句", "第三句", "第四句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+
+        code, report = self._run(root, ["2,3"])
+
+        assert code is None  # returned normally -> exit 0
+        assert report["ok"] is True
+        assert report["cues_before"] == 4
+        assert report["cues_after"] == 3
+
+        # en side: 3 cues, untouched ones byte-identical, merged window spans
+        # first start -> last end, texts space-joined
+        blocks = self._blocks(en_srt)
+        assert [b[0] for b in blocks] == [1, 2, 3]
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,000", "first cue")
+        assert blocks[1] == (2, "00:00:03,100 --> 00:00:06,400",
+                             "second cue third cue")
+        assert blocks[2] == (3, "00:00:07,500 --> 00:00:08,600", "fourth cue")
+
+        # zh side: 3 lines, group 2+3 directly concatenated, others verbatim
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["第一句", "第二句第三句", "第四句"]
+
+        # backups hold the pristine pre-merge files
+        assert (en_srt.parent / "video.en.full.srt.v1").read_text(
+            encoding="utf-8") == orig_en
+        assert (zh_txt.parent / "translations_dub.txt.v1").read_text(
+            encoding="utf-8") == orig_zh
+
+    def test_existing_v1_backup_is_never_overwritten(self, tmp_path):
+        """A second merge run must NOT clobber the .v1 backups: they hold the
+        pristine pre-any-merge state (the recovery point), matching the
+        *.v1 convention the dub pipeline already relies on."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first"),
+            (2, "00:00:03,000 --> 00:00:04,000", "second"),
+            (3, "00:00:05,000 --> 00:00:06,000", "third"),
+            (4, "00:00:07,000 --> 00:00:08,000", "fourth"),
+        ]
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        pristine_en = en_srt.read_text(encoding="utf-8")
+        pristine_zh = zh_txt.read_text(encoding="utf-8")
+        en_bak = en_srt.parent / "video.en.full.srt.v1"
+        zh_bak = zh_txt.parent / "translations_dub.txt.v1"
+
+        # first merge: groups 1,2 -> backups created from the pristine files
+        code, _ = self._run(root, ["1,2"])
+        assert code is None
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+
+        # second merge on the renumbered file (groups now 2,3 = old 3,4):
+        # current files change, .v1 stays pristine
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["cues_after"] == 2
+        assert en_bak.read_text(encoding="utf-8") == pristine_en
+        assert zh_bak.read_text(encoding="utf-8") == pristine_zh
+        # and the second merge really did rewrite the working files
+        assert [b[2] for b in self._blocks(en_srt)] == \
+            ["first second", "third fourth"]
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三四"]
+
+    # -- refusals: every invariant failure leaves ZERO side effects ----------
+
+    def _pristine(self, en_cues, zh):
+        en = [
+            (i + 1, f"00:00:{i + 1:02d},000 --> 00:00:{i + 1:02d},500",
+             f"cue {i + 1}")
+            for i in range(len(zh))
+        ]
+        return en
+
+    def test_reject_out_of_bounds_group(self, tmp_path):
+        zh = ["一", "二", "三", "四"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,9"])  # 9 > 4 cues
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_zero_index(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["0,1"])  # 1-based: 0 is invalid
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_consecutive_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,3"])  # skips line 2
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_overlapping_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,2", "2,3"])  # line 2 claimed twice
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_singleton_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2"])  # merging one line is a no-op
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_non_integer_group(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["one,two"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_no_groups(self, tmp_path):
+        zh = ["一", "二", "三"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, [])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_line_count_mismatch_one_side_hand_merged(self, tmp_path):
+        """THE incident shape: someone already merged cue groups by hand on
+        the en side only (3 en cues left, zh still 4 lines). The pairing
+        invariant must refuse the merge — running it would pair zh line 3
+        with the wrong en cue and ship 4-14s-late audio again."""
+        # en side: 3 cues, cue 2 already absorbed cue 3's text by hand
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "cue 1"),
+            (2, "00:00:03,000 --> 00:00:06,000", "cue 2 cue 3"),
+            (3, "00:00:07,000 --> 00:00:08,000", "cue 4"),
+        ]
+        zh = ["一", "二", "三", "四"]  # zh side: still 4 separate lines
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_reject_missing_translations_file(self, tmp_path):
+        root = tmp_path / "author" / "video"
+        en_srt = root / "transcript" / "video.en.full.srt"
+        _make_srt(en_srt, self._pristine(None, ["一", "二"]))
+        code, report = self._run(root, ["1,2"])
+        assert code == 1
+        assert not (en_srt.parent / "video.en.full.srt.v1").exists()
+
+    # -- several groups in one run ------------------------------------------
+
+    def test_multiple_groups_one_run_out_of_order_flags(self, tmp_path):
+        """--group is repeatable; flags may arrive in any order and a group
+        may span 3 lines. 6 cues, groups {1,2} and {4,5,6} -> 3 output cues."""
+        zh = ["一", "二", "三", "四", "五", "六"]
+        root, en_srt, zh_txt = self._setup(tmp_path, self._pristine(None, zh), zh)
+        code, report = self._run(root, ["4,5,6", "1,2"])  # deliberately unordered
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_before"] == 6
+        assert report["cues_after"] == 3
+        assert report["merged"] == [[1, 2], [4, 5, 6]]
+        blocks = self._blocks(en_srt)
+        # merged windows: group 1 spans cue1.start->cue2.end; group 2 spans
+        # cue4.start->cue6.end; cue 3 passes through verbatim
+        assert blocks[0] == (1, "00:00:01,000 --> 00:00:02,500", "cue 1 cue 2")
+        assert blocks[1] == (2, "00:00:03,000 --> 00:00:03,500", "cue 3")
+        assert blocks[2] == (3, "00:00:04,000 --> 00:00:06,500",
+                             "cue 4 cue 5 cue 6")
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一二", "三", "四五六"]
+
+
+# ----------------------------------------------------------------------------
+# Regression fixture: the 2026-10 "flywheel + 群聊" misalignment incident.
+# Real texts from leerob/stanford-cs146s-always-on-agents
+# (transcript/*.v1, cues 330-333). The hand-merge folded the short group-chat
+# sentence into the flywheel paragraph cue on the en side only; zh drifted
+# one line (dangling "所以说，") and 8 dubbed sentences landed 4-14s late.
+# ============================================================================
+
+# flywheel paragraph sentence (en), verbatim minus the absorbed tail
+_FLY_EN = ("And ideally the new models are learning from all of these bugs "
+           "and these failures, and they're kind of climbing on the evals to "
+           "get better at the things that you care about. And you can drop "
+           "the new versions into the product and make sure that they're "
+           "improving in all these different things.")
+# its zh, verbatim minus the dangling "所以说，" the incident left behind
+_FLY_ZH = ("理想状态下，新模型会从这一大堆 bug 和失败里学习，在你真正关心的那些 "
+           "eval 指标上不断爬升。你把新版本放进产品里，确认各项东西确实都在变好。")
+# the short group-chat sentence that got folded into the flywheel cue
+_CHAT_EN = ("So There hasn't really been a lot of training data, for "
+            "example, on using bots in a group chat.")
+_CHAT_ZH = "比如 bot 在群聊里该怎么表现，就没有多少训练数据。"
+# the sentence AFTER the pair — in the incident state it was paired with
+# _CHAT_ZH (one line of drift); after a legal merge it must get its own zh.
+_NEXT_EN = ("This is kind of an emergent thing that's being figured out, "
+            "and it's important to get it right.")
+_NEXT_ZH = "这是一件正在摸索中、逐渐成型的新事物，而把它做对非常重要。"
+# the cue before the flywheel pair (verbatim from the incident, v1 cue 329)
+_PREV_EN = ("But then there's this outer loop, which is like every few "
+            "months or every month or however long you're training new models.")
+_PREV_ZH = "而外面还有一层外环：每隔几个月、或者每个月，总之按某种周期，训练新模型。"
+
+
+class TestDubMergeFlywheelRegression(_DubMergeHarness):
+    """Same seam as TestDubMerge (in-process cmd_dub_merge, temp dirs), but
+    the material is the real incident text so the shape that broke the run
+    can never quietly come back."""
+
+    def _pristine(self, tmp_path):
+        """The pre-incident state: 4 clean en/zh pairs around the flywheel
+        paragraph. Cue 3's reconstructed timestamps keep the incident's
+        merged window (…,357 --> …15,946) as first-start/last-end."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:07,900", _FLY_EN),
+            (3, "00:37:08,000 --> 00:37:15,946", _CHAT_EN),
+            (4, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        zh = [_PREV_ZH, _FLY_ZH, _CHAT_ZH, _NEXT_ZH]
+        return self._setup(tmp_path, en_cues, zh)
+
+    def test_legal_merge_keeps_flywheel_pairing_in_lockstep(self, tmp_path):
+        """Merging the flywheel cue with the group-chat cue through the tool:
+        both sides move together, the 群聊 zh lands in the SAME cue as its en
+        sentence, and the following cue is paired with ITS zh (exactly the
+        pairing the hand-merge destroyed)."""
+        root, en_srt, zh_txt = self._pristine(tmp_path)
+        code, report = self._run(root, ["2,3"])
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_after"] == 3
+
+        blocks = self._blocks(en_srt)
+        zh_out = zh_txt.read_text(encoding="utf-8").splitlines()
+
+        # en cue 2 = flywheel + group-chat, window = first start + last end
+        assert blocks[1][1] == "00:36:50,357 --> 00:37:15,946"
+        assert blocks[1][2] == _FLY_EN + " " + _CHAT_EN
+        # zh line 2 = flywheel zh + 群聊 zh, directly joined — the group-chat
+        # translation travels WITH its english sentence
+        assert zh_out[1] == _FLY_ZH + _CHAT_ZH
+        # the next pair stays paired (the one-line drift never happens)
+        assert blocks[2][2] == _NEXT_EN
+        assert zh_out[2] == _NEXT_ZH
+        # untouched neighbours pass through verbatim
+        assert blocks[0][2] == _PREV_EN and zh_out[0] == _PREV_ZH
+        # both sides carry the same number of entries
+        assert len(blocks) == len(zh_out) == 3
+
+    def test_incident_shape_one_side_hand_merged_is_refused(self, tmp_path):
+        """The incident re-run: the en side has ALREADY been hand-merged
+        (flywheel cue absorbed the group-chat sentence, 3 en cues) while zh
+        still has 4 lines with the dangling tail. The pairing invariant must
+        refuse and leave everything untouched — merging on top of a
+        desynchronized pair is what shipped 8 late sentences."""
+        en_cues = [
+            (1, "00:36:44,690 --> 00:36:49,736", _PREV_EN),
+            (2, "00:36:50,357 --> 00:37:15,946", _FLY_EN + " " + _CHAT_EN),
+            (3, "00:37:16,046 --> 00:37:20,109", _NEXT_EN),
+        ]
+        # zh side still 4 lines, cue 2 ends with the incident's dangling tail
+        zh = [_PREV_ZH, _FLY_ZH + "所以说，", _CHAT_ZH, _NEXT_ZH]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+
+class TestDubMergeCliSurface:
+    """The ticket's command shape: cook dub merge <root> <name> --group "a,b,c"
+    (repeatable). Pinned at the argparse surface like TestQualityParserInt."""
+
+    def test_group_flag_repeatable_appends(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "merge", "author/video", "video", "--group", "1,2",
+             "--group", "5,6,7"])
+        assert args.group == ["1,2", "5,6,7"]
+        assert args.output_root == "author/video"
+        assert args.name == "video"
+        assert args.func is cook.cmd_dub_merge
+
+
 # dub measure-rate (ticket 04): measure the real speech rate of audition
 # wavs / synthesized takes via energy VAD. Tests synthesize tiny wavs
 # (sine = speech, zeros = silence) — no real audio is ever loaded.

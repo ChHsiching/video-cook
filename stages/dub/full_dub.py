@@ -16,8 +16,11 @@ cache. Designed to be called by the `cook dub` CLI (thin wrapper that runs this
 script as a subprocess), or directly.
 
 Usage (CLI):
-  python full_dub.py synth    <output-root> <name>   # stage 1: TTS synthesis
-  python full_dub.py assemble <output-root> <name> [--keep-subs]  # stage 2: fit + place + subtitles + burn
+  python full_dub.py synth        <output-root> <name>   # stage 1: TTS synthesis (supervisor: all cues, ascending)
+  python full_dub.py synth-worker <output-root> <name> --lo N --hi M [--stagger S]
+                                                          # stage 1 band: cues N..M descending, staggered S seconds
+                                                          # (spawned by `cook dub synth --workers N --stagger S`)
+  python full_dub.py assemble     <output-root> <name> [--keep-subs]  # stage 2: fit + place + subtitles + burn
   python full_dub.py full     <output-root> <name>   # both, in sequence
 
 Usage (from cook via importlib):
@@ -232,29 +235,40 @@ def clamp_factor(factor, lo=0.5, hi=2.0):
     return max(lo, min(hi, factor))
 
 
+def synth_bands(n_cues: int, n_bands: int) -> list[tuple[int, int]]:
+    """Split cue positions 1..n_cues into n_bands inclusive (lo, hi) bands,
+    as evenly as possible — earlier bands absorb the remainder, so band k is
+    computable on its own (the worker argv is built from it without seeing the
+    other bands). Trailing empty bands are dropped: more workers than cues
+    spawns fewer workers, never a zero-cue one. Pure — unit tested in
+    test_cook.py (ticket 10: synth multi-worker band split)."""
+    if n_bands < 1:
+        raise ValueError(f"n_bands must be >= 1, got {n_bands}")
+    base, rem = divmod(max(n_cues, 0), n_bands)
+    bands = []
+    lo = 1
+    for k in range(n_bands):
+        size = base + (1 if k < rem else 0)
+        if size == 0:
+            break
+        bands.append((lo, lo + size - 1))
+        lo += size
+    return bands
+
+
 # ===== Stage 1: TTS synthesis =====
 
-def stage_synth(output_root, name: str):
-    p = _paths(output_root, name)
-    p["segments"].mkdir(parents=True, exist_ok=True)
+def _load_synth_speakers(p: dict, cues: list):
+    """Two-voice support: optional per-cue speaker map. dubbed/_reference/
+    speakers.txt holds one speaker name per cue; each named speaker needs
+    dubbed/_reference/ref_<speaker>.wav. Without the map, every cue uses the
+    single ref.wav. NOTE: the sent_NNNN.wav cache is keyed by cue index only —
+    after changing speakers.txt or a ref wav, delete the affected segments or
+    the stale voice is reused.
 
-    sys.path.insert(0, INDEXTTS_DIR)
-    for mod in list(sys.modules):
-        if mod.startswith("indextts"):
-            del sys.modules[mod]
-    import torch
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-
-    cues = load_cues(p["en_full_srt"], p["zh_dub_txt"])
-    log(f"Stage 1 (synth): {len(cues)} cues (single-threaded IndexTTS2)")
-
-    # Two-voice support: optional per-cue speaker map. dubbed/_reference/speakers.txt
-    # holds one speaker name per cue; each named speaker needs
-    # dubbed/_reference/ref_<speaker>.wav. Without the map, every cue uses the
-    # single ref.wav. NOTE: the sent_NNNN.wav cache is keyed by cue index only —
-    # after changing speakers.txt or a ref wav, delete the affected segments or
-    # the stale voice is reused.
+    Returns (speakers, refs): the per-cue label list (or None) and the
+    label -> ref wav map. Exits non-zero when speakers.txt names a speaker
+    whose ref wav is missing, so cook reports ok:false."""
     speakers = None
     refs = {}
     spk_file = p["ref_wav"].parent / "speakers.txt"
@@ -273,17 +287,69 @@ def stage_synth(output_root, name: str):
             log(f"  two-voice mode: {counts}")
         else:
             log(f"  WARNING: speakers.txt has {len(labels)} lines, expected {len(cues)}; ignoring it")
+    return speakers, refs
+
+
+def stage_synth(output_root, name: str, lo: int | None = None,
+                hi: int | None = None, stagger: float = 0.0):
+    """Synthesize the Chinese takes. Two modes share one body (ticket 10):
+
+    - supervisor (no lo/hi): every cue, ascending — the pre-multi-worker
+      behavior, byte-for-byte in its log contract. With N>1 workers the
+      supervisor still scans the full list ascending; skip-if-exists means
+      cues the descending workers finished are skipped, so the ascending
+      supervisor and each descending worker only ever meet at one band edge.
+    - worker (lo/hi given): only cue positions lo..hi (inclusive, 1-based
+      position in translations_dub.txt), DESCENDING. stagger > 0 sleeps that
+      many seconds before any heavy import (torch DLL + model load are the
+      disk-thrash events the flag exists to space out); the worker's final
+      marker is '[worker lo-hi] ALL DONE', deliberately NOT containing the
+      supervisor's 'Stage 1 DONE' literal, so a poller on the supervisor log
+      can never false-trigger off a worker's log."""
+    p = _paths(output_root, name)
+    p["segments"].mkdir(parents=True, exist_ok=True)
+
+    banded = lo is not None or hi is not None
+    label = f"[worker {lo}-{hi}]" if banded else None
+    if banded and stagger > 0:
+        log(f"{label} staggering {stagger}s before model load")
+        time.sleep(stagger)
+
+    sys.path.insert(0, INDEXTTS_DIR)
+    for mod in list(sys.modules):
+        if mod.startswith("indextts"):
+            del sys.modules[mod]
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+    cues = load_cues(p["en_full_srt"], p["zh_dub_txt"])
+    if banded:
+        band_lo = lo if lo is not None else 1
+        band_hi = hi if hi is not None else len(cues)
+        work = [(gi, cue) for gi, cue in enumerate(cues)
+                if band_lo <= gi + 1 <= band_hi]
+        work.reverse()  # descending: meet the ascending supervisor at one edge
+        log(f"Stage 1 (synth worker {band_lo}-{band_hi}): {len(work)} cues (descending)")
+    else:
+        work = list(enumerate(cues))
+        log(f"Stage 1 (synth): {len(cues)} cues (single-threaded IndexTTS2)")
+
+    speakers, refs = _load_synth_speakers(p, cues)
 
     done = sum(
-        1 for idx, _, _, _, _ in cues
-        if (p["segments"] / f"sent_{idx:04d}.wav").exists()
-        and (p["segments"] / f"sent_{idx:04d}.wav").stat().st_size > 1000
+        1 for gi, cue in work
+        if (p["segments"] / f"sent_{cue[0]:04d}.wav").exists()
+        and (p["segments"] / f"sent_{cue[0]:04d}.wav").stat().st_size > 1000
     )
-    log(f"  cached: {done}/{len(cues)}")
+    if banded:
+        log(f"  {label} cached: {done}/{len(work)}")
+    else:
+        log(f"  cached: {done}/{len(cues)}")
 
     df = float(os.environ.get("DUB_DURATION_FACTOR", "1.0"))
 
-    if done < len(cues):
+    if done < len(work):
         log("loading IndexTTS2...")
         t0 = time.time()
         from indextts.infer_v2_5 import IndexTTS2
@@ -299,12 +365,11 @@ def stage_synth(output_root, name: str):
     chunk_cache.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     n_done = done
-    for i, (idx, s, e, en, zh) in enumerate(cues):
+    for n, (gi, (idx, s, e, en, zh)) in enumerate(work):
         out = p["segments"] / f"sent_{idx:04d}.wav"
         if out.exists() and out.stat().st_size > 1000:
             continue
-        t1 = time.time()
-        ref = refs[speakers[i]] if speakers else p["ref_wav"]
+        ref = refs[speakers[gi]] if speakers else p["ref_wav"]
         if len(zh) > CHUNK_ON:
             # long-line collapse guard: synthesize sentence chunks, concat
             chunks = split_chunks(zh)
@@ -322,9 +387,15 @@ def stage_synth(output_root, name: str):
         n_done += 1
         elapsed = time.time() - t_start
         rate = (n_done - done) / max(elapsed, 1) if elapsed > 0 else 0
-        eta = (len(cues) - n_done) / rate if rate > 0 else 0
-        log(f"  [{i+1}/{len(cues)}] idx{idx} {dur:.2f}s zh='{zh[:30]}' elapsed={elapsed/60:.1f}min ETA={eta/60:.1f}min")
-    log(f"Stage 1 DONE: {len(cues)} cues synthesized")
+        eta = (len(work) - n_done) / rate if rate > 0 else 0
+        if banded:
+            log(f"  {label} [{n+1}/{len(work)}] idx{idx} {dur:.2f}s zh='{zh[:30]}' elapsed={elapsed/60:.1f}min ETA={eta/60:.1f}min")
+        else:
+            log(f"  [{gi+1}/{len(cues)}] idx{idx} {dur:.2f}s zh='{zh[:30]}' elapsed={elapsed/60:.1f}min ETA={eta/60:.1f}min")
+    if banded:
+        log(f"{label} ALL DONE")
+    else:
+        log(f"Stage 1 DONE: {len(cues)} cues synthesized")
 
 
 # ===== Stage 2: identity-timeline assembly =====
@@ -589,27 +660,66 @@ _STAGES = {
 }
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
+def _cli_main(argv: list[str]) -> None:
+    """Argv dispatch, extracted from the __main__ block so it is testable
+    in-process. Stages: synth / synth-worker / assemble / full."""
+    if len(argv) < 3:
         print(__doc__)
         sys.exit(1)
-    cmd = sys.argv[1]
-    output_root = sys.argv[2]
-    name = sys.argv[3] if len(sys.argv) > 3 else None
-    flags = [a for a in sys.argv[4:] if a.startswith("--")]
-    keep_subs = "--keep-subs" in flags
+    cmd = argv[0]
+    output_root = argv[1]
+    name = argv[2] if len(argv) > 2 else None
+    rest = argv[3:]
+
+    def _take_flag_value(flag: str):
+        if flag in rest:
+            i = rest.index(flag)
+            if i + 1 >= len(rest):
+                print(f"{flag} needs a value")
+                sys.exit(1)
+            return rest[i + 1]
+        return None
+
+    keep_subs = "--keep-subs" in rest
     if keep_subs and cmd != "assemble":
         print("--keep-subs applies to the assemble stage only")
         sys.exit(1)
-    if cmd == "full":
+
+    if cmd == "synth-worker":
+        # spawned by `cook dub synth --workers N --stagger S` (ticket 10):
+        # one descending band of cue positions, self-staggered before any
+        # heavy import. Band flags are legal ONLY here.
+        try:
+            lo = int(_take_flag_value("--lo"))
+            hi = int(_take_flag_value("--hi"))
+        except (TypeError, ValueError):
+            print("synth-worker needs integer --lo and --hi")
+            sys.exit(1)
+        stag_raw = _take_flag_value("--stagger")
+        try:
+            stagger = float(stag_raw) if stag_raw is not None else 0.0
+        except ValueError:
+            print("synth-worker --stagger must be a number of seconds")
+            sys.exit(1)
+        stage_synth(output_root, name, lo=lo, hi=hi, stagger=stagger)
+    elif cmd == "full":
         stage_synth(output_root, name)
         stage_assemble(output_root, name)
         log("all stages complete")
     elif cmd in _STAGES:
         if cmd == "assemble":
             stage_assemble(output_root, name, keep_subs=keep_subs)
+        elif rest:
+            # `synth` accepts no flags (pre-existing contract, kept frozen:
+            # the supervisor argv cook builds must never grow band flags)
+            print(f"unknown flags for {cmd}: {rest}\n{__doc__}")
+            sys.exit(1)
         else:
             _STAGES[cmd](output_root, name)
     else:
         print(f"unknown stage: {cmd}\n{__doc__}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    _cli_main(sys.argv[1:])
