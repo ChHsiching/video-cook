@@ -1107,6 +1107,21 @@ def _stage_script(stage: str, script: str) -> Path:
     )
 
 
+def _import_stage_module(stage: str, script: str, modname: str):
+    """Import a stage module shipped in the cook distribution, in-process.
+
+    Used for stage logic whose deps are light enough to live in cook's own
+    python (subtitles.py: jieba, lazily; measure_rate.py: soundfile+numpy) —
+    unlike the dub synth/assemble stages, which run as subprocesses under
+    --python because indextts/demucs need their own venv."""
+    path = _stage_script(stage, script)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(modname, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _import_subtitles_module():
     """Import the packaged subtitles module (stages/subtitle/subtitles.py).
 
@@ -1114,12 +1129,8 @@ def _import_subtitles_module():
     shorten) is optional and imported lazily — the module degrades with a
     stderr warning when it is absent — so in-process loading via importlib
     works everywhere cook itself runs."""
-    path = _stage_script("subtitle", "subtitles.py")
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("cook_stages_subtitle", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return _import_stage_module("subtitle", "subtitles.py",
+                                "cook_stages_subtitle")
 
 
 def _run_subs(mod, argv: list[str]) -> None:
@@ -2153,6 +2164,107 @@ def cmd_dub_merge(args: argparse.Namespace) -> None:
                 "backup_suffix": ".v1"})
 
 
+# dub subcommand: measure-rate — the real speech rate, measured not assumed.
+# Wraps stages/dub/measure_rate.py IN-PROCESS (soundfile+numpy only, no
+# indextts venv needed). Exit 0 = rate measured; exit 1 = bad invocation or
+# no speech detected in an input.
+# ----------------------------------------------------------------------------
+
+def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
+    """Measure the real speech rate (chars per voiced second) of dub audio.
+
+    Two input modes:
+      explicit:       --wav <audition.wav> --text <the exact spoken text>
+      from-segments:  --from-segments <output_root> <name> — pairs each
+                      non-empty line of transcript/translations_dub.txt with
+                      dubbed/_full/_segments/sent_NNNN.wav (synth's layout).
+
+    Energy VAD (soundfile streaming blocks + RMS floor) measures each wav's
+    voiced seconds; the measured rate is total chars / total voiced seconds.
+    With --json the machine-readable report goes to stdout (cook's agent
+    contract); without it only the human summary is printed (stderr) and
+    stdout stays empty.
+
+    An input with NO detected speech is an error, not a rate of 0 — a silent
+    take means synthesis failed, and a 0-rate would poison every downstream
+    estimate that consumes it."""
+    import importlib.util
+    if importlib.util.find_spec("soundfile") is None:
+        _die("soundfile not installed — cook dub measure-rate needs it for "
+             "VAD. Run: pip install soundfile numpy")
+
+    mr = _import_stage_module("dub", "measure_rate.py",
+                              "cook_stages_dub_measure")
+
+    # --- resolve the input mode (exactly one) ---
+    if args.from_segments:
+        if args.wav or args.text:
+            _die("--from-segments cannot be combined with --wav/--text",
+                 obj={"stage": "measure-rate"})
+        root = _video_dir(args.from_segments[0])
+        try:
+            pairs = mr.pair_segments(root)
+        except (FileNotFoundError, ValueError) as e:
+            _die(str(e), obj={"stage": "measure-rate"})
+        labels = [w.relative_to(root).as_posix() for w, _ in pairs]
+        mode = "segments"
+    elif args.wav and args.text:
+        wav = Path(args.wav).resolve()
+        if not wav.is_file():
+            _die(f"--wav not found: {wav}", obj={"stage": "measure-rate"})
+        pairs = [(wav, args.text)]
+        labels = [str(wav)]
+        mode = "explicit"
+    else:
+        _die("measure-rate needs either --wav FILE --text TEXT (one audition "
+             "take) or --from-segments OUTPUT_ROOT NAME (a synthesized run)",
+             obj={"stage": "measure-rate"})
+
+    # --- measure (serially: one wav's blocks in memory at a time) ---
+    rows, silent = [], []
+    total_chars = 0
+    total_voiced = 0.0
+    for (wav, text), label in zip(pairs, labels):
+        chars = mr.count_chars(text)
+        voiced = mr.voiced_seconds(wav)
+        if chars <= 0:
+            _die(f"text for {label} has no countable characters", {
+                "stage": "measure-rate", "file": label})
+        if voiced <= 0.0:
+            silent.append(label)
+            continue
+        total_chars += chars
+        total_voiced += voiced
+        rows.append({"file": label, "voiced_seconds": round(voiced, 3),
+                     "chars": chars, "rate": round(chars / voiced, 3)})
+    if silent:
+        _die(f"no speech detected in {len(silent)} file(s) — the take is "
+             f"silent (synthesis failed?): {', '.join(silent[:5])}"
+             + (" ..." if len(silent) > 5 else ""), {
+                 "stage": "measure-rate", "silent_files": silent})
+    if total_voiced <= 0.0:
+        _die("no speech detected in any input", obj={"stage": "measure-rate"})
+
+    rate = total_chars / total_voiced
+    report = {
+        "ok": True,
+        "mode": mode,
+        "files": rows,
+        "files_measured": len(rows),
+        "chars": total_chars,
+        "voiced_seconds": round(total_voiced, 3),
+        "rate": round(rate, 3),
+    }
+    if getattr(args, "json", False):
+        _emit_json(report)
+    else:
+        _log(f"measured rate: {rate:.2f} chars/s "
+             f"({total_chars} chars / {total_voiced:.1f}s voiced, "
+             f"{len(rows)} file(s))")
+    print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+    sys.exit(0)
+
+
 # ============================================================================
 # CLI entry point
 # ============================================================================
@@ -2330,6 +2442,27 @@ def build_parser() -> argparse.ArgumentParser:
                            "the file is renumbered, so the next --group uses "
                            "the new numbers)")
     pdmg.set_defaults(func=cmd_dub_merge)
+
+
+    # measure-rate: in-process (soundfile+numpy only — no indextts venv).
+    pmr = dub_sub.add_parser(
+        "measure-rate",
+        help="measure the REAL speech rate (chars per voiced second) of an "
+             "audition take or a whole synthesized run, via energy VAD")
+    pmr.add_argument("wav", nargs="?",
+                     help="audition wav (explicit mode; pair with --text)")
+    pmr.add_argument("--text",
+                     help="the exact text spoken in --wav (explicit mode)")
+    pmr.add_argument("--from-segments", nargs=2,
+                     metavar=("OUTPUT_ROOT", "NAME"),
+                     help="measure a synthesized run: pairs each non-empty "
+                          "line of transcript/translations_dub.txt with "
+                          "dubbed/_full/_segments/sent_NNNN.wav")
+    pmr.add_argument("--json", action="store_true",
+                     help="emit the machine-readable report on stdout "
+                          "(per-file voiced seconds, chars, and the rate). "
+                          "Without it only a human summary goes to stderr.")
+    pmr.set_defaults(func=cmd_dub_measure_rate)
 
     return p
 
