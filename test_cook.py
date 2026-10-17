@@ -1098,7 +1098,8 @@ class TestQualityGuardR2:
         args = type("A", (), {"url": "https://x", "quality": 119,
                               "cookies": None, "cookies_from_browser": None,
                               "author": None, "name": None})()
-        import io, contextlib
+        import contextlib
+        import io
         import pytest as _pytest
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1257,7 +1258,8 @@ class TestDubStageLaunchesPackageScript:
             "output_root": str(root), "name": "video",
             "python": None, "detach": False, "keep_subs": keep_subs,
         })()
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
@@ -1605,3 +1607,439 @@ class TestShortenExemptionUnchanged:
         text = "这是一条宽度刚好超过豁免带上限一点点的中文字幕用来确认必须切分路径仍会触发"
         pieces = _shorten_cue_texts(tmp_path, text, max_zh=56)
         assert len(pieces) >= 2
+
+
+# ----------------------------------------------------------------------------
+# synth multi-worker (ticket 10 / issue #21): band split + stagger + exit-code
+# aggregation. All tests are pure or monkeypatched — fake IndexTTS2/torch via a
+# temp INDEXTTS_DIR package, fake Popen for cook's orchestration. No network,
+# no ffmpeg, no real model, no real synthesis.
+# ----------------------------------------------------------------------------
+
+def _load_full_dub(tmp_path: Path, monkeypatch) -> tuple[object, Path]:
+    """Load stages/dub/full_dub.py fresh with INDEXTTS_DIR pointed at a temp
+    package of test doubles (fake indextts.infer_v2_5.IndexTTS2 writing real
+    stdlib-wave silence wavs) and a fake torch injected straight into
+    sys.modules — the injection must win even when the REAL torch is already
+    imported by an earlier test in the same process (real torch refuses a
+    second set_num_interop_threads call). Returns (module, fake_pkg_dir).
+
+    The module-level import of full_dub is stdlib-only, so in-process loading
+    is safe; the heavy deps only load inside stage_synth — and there they hit
+    the doubles via sys.modules (torch) and the sys.path.insert(0,
+    INDEXTTS_DIR) the stage itself performs (indextts)."""
+    import importlib.util
+    import sys
+    import types
+    pkg = tmp_path / "fakedeps"
+    (pkg / "indextts").mkdir(parents=True)
+    (pkg / "indextts" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "indextts" / "infer_v2_5.py").write_text(
+        "import pathlib, wave\n"
+        "CALLS = []\n"  # (kind, ...) events: ('init',), ('infer', text, path)
+        "class IndexTTS2:\n"
+        "    def __init__(self, **kw):\n"
+        "        CALLS.append(('init',))\n"
+        "    def infer(self, spk_audio_prompt, text, output_path, lang,\n"
+        "              use_random, duration_factor):\n"
+        "        CALLS.append(('infer', text, output_path))\n"
+        "        p = pathlib.Path(output_path)\n"
+        "        p.parent.mkdir(parents=True, exist_ok=True)\n"
+        "        with wave.open(str(p), 'wb') as w:\n"
+        "            w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)\n"
+        "            w.writeframes(b'\\x00' * 4410)  # 0.2s silence, 8820 bytes > 1KB\n",
+        encoding="utf-8")
+    fake_torch = types.ModuleType("torch")
+    fake_torch.set_num_threads = lambda n: None
+    fake_torch.set_num_interop_threads = lambda n: None
+    fake_torch.__file__ = str(pkg / "torch.py")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("INDEXTTS_DIR", str(pkg))
+    spec = importlib.util.spec_from_file_location(
+        f"full_dub_test_{id(tmp_path):x}", _stages_dub_dir() / "full_dub.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, pkg
+
+
+def _fake_tts_calls(pkg: Path) -> list[tuple]:
+    """Read the CALLS log from the fake indextts package (loaded under the
+    name the stage's own `from indextts.infer_v2_5 import ...` resolves to).
+    None means the stage never imported it — e.g. a fully-cached band, which
+    is itself an assertion the callers make on the returned empty list."""
+    import sys
+    mod = sys.modules.get("indextts.infer_v2_5")
+    return [] if mod is None else list(mod.CALLS)
+
+
+@pytest.fixture
+def _restore_sys_path():
+    """stage_synth internally does sys.path.insert(0, INDEXTTS_DIR) (pointing
+    at the test-double package) and never removes it. Snapshot sys.path and the
+    fake-package module entries, restore both afterwards, so the doubles never
+    leak into later tests (e.g. a fake torch shadowing the real one)."""
+    import sys
+    path_before = [Path(p) for p in sys.path]
+
+    def _is_foreign(mod) -> bool:
+        f = getattr(mod, "__file__", None)
+        return bool(f) and Path(f).resolve().parent not in path_before
+
+    mods_before = set(sys.modules)
+    yield
+    for name in list(sys.modules):
+        if name not in mods_before and _is_foreign(sys.modules[name]):
+            del sys.modules[name]
+    sys.path[:] = [str(p) for p in path_before]
+
+
+class TestSynthBands:
+    """synth_bands(n_cues, n_bands): even inclusive (lo, hi) bands over cue
+    positions 1..n_cues for the multi-worker split — earlier bands absorb the
+    remainder, empty trailing bands are dropped (more workers than cues spawns
+    fewer workers, never a zero-cue one)."""
+
+    def _mod(self, tmp_path, monkeypatch):
+        mod, _ = _load_full_dub(tmp_path, monkeypatch)
+        return mod
+
+    def test_single_band_is_the_whole_range(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(10, 1) == [(1, 10)]
+
+    def test_even_split_has_no_remainder(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(10, 2) == [(1, 5), (6, 10)]
+
+    def test_remainder_goes_to_earlier_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        # 11 = 4+4+3, not 3+4+4 — determinism matters: band k must be
+        # computable without seeing the others (worker argv is built from it)
+        assert f(11, 3) == [(1, 4), (5, 8), (9, 11)]
+
+    def test_production_shape_361_cues_2_workers(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        # the leerob run: 361 cues, supervisor + 1 worker
+        assert f(361, 2) == [(1, 181), (182, 361)]
+
+    def test_more_bands_than_cues_drops_empty_trailing_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(3, 5) == [(1, 1), (2, 2), (3, 3)]
+
+    def test_zero_cues_yields_no_bands(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        assert f(0, 2) == []
+
+    def test_bands_cover_all_cues_exactly_once(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        for n_cues, n_bands in [(361, 2), (100, 3), (7, 4), (5, 8)]:
+            bands = f(n_cues, n_bands)
+            seen = []
+            for lo, hi in bands:
+                assert lo <= hi, f"empty band survived: {(lo, hi)}"
+                seen.extend(range(lo, hi + 1))
+            assert seen == list(range(1, n_cues + 1)), (n_cues, n_bands)
+            sizes = [hi - lo + 1 for lo, hi in bands]
+            assert max(sizes) - min(sizes) <= 1, (n_cues, n_bands, sizes)
+
+    def test_invalid_band_count_raises(self, tmp_path, monkeypatch):
+        f = self._mod(tmp_path, monkeypatch).synth_bands
+        with pytest.raises(ValueError):
+            f(10, 0)
+
+
+class TestSynthWorkerStage:
+    """stage_synth band mode (--lo/--hi/--stagger via the synth-worker CLI):
+    descending order within the band, skip-if-exists (>1KB) unchanged, model
+    loaded only when the band has pending work, stagger sleep BEFORE any heavy
+    import, and a final marker that cannot false-trigger the supervisor's
+    'Stage 1 DONE' poller."""
+
+    def _stage_video(self, tmp_path: Path, mod, n_cues: int) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt",
+                  _fake_en_cues(n_cues))
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           [f"第{i}句中文配音" for i in range(1, n_cues + 1)])
+        return root
+
+    def _run_stage(self, mod, root: Path, **kw) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_synth(str(root), "video", **kw)
+        return buf.getvalue()
+
+    def _segments(self, root: Path) -> Path:
+        return root / "dubbed" / "_full" / "_segments"
+
+    def _infer_idx_order(self, calls: list[tuple]) -> list[int]:
+        """Cue positions (1-based) in the order infer() synthesized them,
+        derived from the output filename sent_{idx:04d}.wav."""
+        import re
+        out = []
+        for c in calls:
+            if c[0] == "infer":
+                out.append(int(re.search(r"sent_(\d{4})\.wav", c[2]).group(1)))
+        return out
+
+    def test_supervisor_path_unchanged_full_ascending(self, tmp_path, monkeypatch, _restore_sys_path):
+        """No band kwargs = the pre-ticket behavior: every cue synthesized in
+        ascending order and the 'Stage 1 DONE' marker literal intact (the
+        detached poller's done_marker depends on it)."""
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 5)
+        out = self._run_stage(mod, root)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [1, 2, 3, 4, 5]
+        assert "Stage 1 DONE: 5 cues synthesized" in out
+
+    def test_worker_synthesizes_only_band_in_descending_order(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 10)
+        out = self._run_stage(mod, root, lo=3, hi=6)
+        # descending so the ascending supervisor and this worker meet at one
+        # band edge only (the reference synth_worker.py contract)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3]
+        assert "[worker 3-6] ALL DONE" in out
+        # the worker marker must never contain the supervisor's poller literal
+        assert "Stage 1 DONE" not in out
+
+    def test_worker_skips_existing_over_1kb_and_regenerates_truncated(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 6)
+        segs = self._segments(root)
+        segs.mkdir(parents=True)
+        (segs / "sent_0002.wav").write_bytes(b"x" * 2000)  # cached: skip
+        (segs / "sent_0004.wav").write_bytes(b"x" * 100)   # truncated: redo
+        self._run_stage(mod, root, lo=1, hi=6)
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3, 1]
+
+    def test_fully_cached_band_loads_no_model(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 3)
+        segs = self._segments(root)
+        segs.mkdir(parents=True)
+        for i in (1, 2, 3):
+            (segs / f"sent_{i:04d}.wav").write_bytes(b"x" * 2000)
+        out = self._run_stage(mod, root, lo=1, hi=3)
+        calls = _fake_tts_calls(pkg)
+        assert not any(c[0] == "init" for c in calls)
+        assert not any(c[0] == "infer" for c in calls)
+        assert "[worker 1-3] ALL DONE" in out
+
+    def test_worker_stagger_sleeps_before_model_load_and_logs_it(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        out = self._run_stage(mod, root, lo=1, hi=2, stagger=7.5)
+        assert sleeps == [7.5]
+        # observable in the log (ticket acceptance) and ordered before the
+        # heavy imports begin
+        assert "[worker 1-2] staggering 7.5s" in out
+        assert out.index("staggering") < out.index("loading IndexTTS2")
+
+    def test_worker_zero_stagger_never_sleeps(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        self._run_stage(mod, root, lo=1, hi=2)
+        assert sleeps == []
+
+    def test_cli_synth_worker_dispatches_band(self, tmp_path, monkeypatch, _restore_sys_path):
+        """`python full_dub.py synth-worker <root> <name> --lo --hi --stagger`
+        is the argv cook spawns — the CLI dispatch must reach the banded
+        stage with parsed values."""
+        import contextlib
+        import io
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, mod, 10)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod._cli_main(["synth-worker", str(root), "video",
+                           "--lo", "3", "--hi", "6", "--stagger", "0"])
+        assert self._infer_idx_order(_fake_tts_calls(pkg)) == [6, 5, 4, 3]
+        assert "[worker 3-6] ALL DONE" in buf.getvalue()
+
+    def test_cli_stagger_reaches_stage(self, tmp_path, monkeypatch, _restore_sys_path):
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        sleeps: list[float] = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+        root = self._stage_video(tmp_path, mod, 2)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod._cli_main(["synth-worker", str(root), "video",
+                           "--lo", "1", "--hi", "2", "--stagger", "4.5"])
+        assert sleeps == [4.5]
+
+    def test_cli_synth_stage_still_rejects_worker_flags(self, tmp_path, monkeypatch, _restore_sys_path):
+        """The supervisor CLI contract is frozen: `synth` takes only
+        --keep-subs-style flags; band flags belong to synth-worker only."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        with pytest.raises(SystemExit) as ei:
+            mod._cli_main(["synth", str(tmp_path), "video", "--lo", "3"])
+        assert ei.value.code != 0
+
+
+class TestSynthWorkersOrchestration:
+    """`cook dub synth --workers N --stagger S` (ticket 10): the supervisor
+    subprocess argv is UNCHANGED (full list, ascending); N-1 worker
+    subprocesses are spawned with descending band argv --lo/--hi/--stagger
+    k*S and their own log files; exit codes aggregate (any non-zero = the
+    whole stage fails). N=1 (default) spawns nothing and behaves exactly as
+    before. All process launching is monkeypatched — nothing executes."""
+
+    def _stage_run(self, monkeypatch, tmp_path, workers: int, stagger: float = 0.0,
+                   worker_rcs: list[int] | None = None,
+                   supervisor_rc: int = 0, n_cues: int = 10):
+        """Drive cmd_dub_synth with fake _run_long_task (supervisor) and fake
+        subprocess.Popen (workers). Returns (json_dict_or_None, supervisor_cmd,
+        popen_cmds, exit_code_or_None)."""
+        root = tmp_path / "vid"
+        trans = root / "transcript" / "translations_dub.txt"
+        trans.parent.mkdir(parents=True, exist_ok=True)
+        trans.write_text(
+            "\n".join(f"第{i}句" for i in range(1, n_cues + 1)) + "\n", encoding="utf-8")
+        ref = root / "dubbed" / "_reference" / "ref.wav"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"x" * 2000)
+
+        sup: dict = {}
+        pops: list[list[str]] = []
+
+        def fake_run_long_task(cmd, cwd, log_file, err_file, detach=False):
+            sup["cmd"] = cmd
+            return {"ok": supervisor_rc == 0, "returncode": supervisor_rc}
+
+        rcs = worker_rcs if worker_rcs is not None else []
+
+        class _FakeProc:
+            def __init__(self, cmd, rc):
+                self.cmd, self.rc, self.pid = cmd, rc, 4242
+
+            def wait(self):
+                return self.rc
+
+        def fake_popen(cmd, **kw):
+            rc = rcs[len(pops)] if len(pops) < len(rcs) else 0
+            proc = _FakeProc(list(cmd), rc)
+            pops.append(proc.cmd)
+            return proc
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run_long_task)
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": False,
+            "workers": workers, "stagger": stagger,
+        })()
+        import contextlib
+        import io
+        import json as _json
+        buf = io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_synth(args)
+            except SystemExit as e:
+                code = e.code
+        # stdout carries only _emit_json's (multi-line, indent=2) payload;
+        # _log/_die COOK-RESULT both go to stderr
+        try:
+            js = _json.loads(buf.getvalue())
+        except ValueError:
+            js = None
+        return (js, sup.get("cmd"), pops, code)
+
+    def test_single_worker_default_spawns_nothing(self, monkeypatch, tmp_path):
+        """--workers 1 (the default): zero Popen calls and the supervisor argv
+        is byte-identical to the pre-ticket command (no band flags)."""
+        js, sup_cmd, pops, code = self._stage_run(monkeypatch, tmp_path, workers=1)
+        assert pops == []
+        assert sup_cmd == [cook.sys.executable,
+                           str(_stages_dub_dir() / "full_dub.py"),
+                           "synth", str(tmp_path / "vid"), "video"]
+        assert js["ok"] is True and js["returncode"] == 0
+        assert code in (None, 0)
+
+    def test_three_workers_spawn_two_descending_bands_with_stagger(self, monkeypatch, tmp_path):
+        js, sup_cmd, pops, _code = self._stage_run(
+            monkeypatch, tmp_path, workers=3, stagger=30.0, n_cues=10)
+        assert len(pops) == 2
+        py = cook.sys.executable
+        script = str(_stages_dub_dir() / "full_dub.py")
+        root = str(tmp_path / "vid")
+        assert pops[0] == [py, script, "synth-worker", root, "video",
+                           "--lo", "1", "--hi", "5", "--stagger", "30.0"]
+        assert pops[1] == [py, script, "synth-worker", root, "video",
+                           "--lo", "6", "--hi", "10", "--stagger", "60.0"]
+        # the supervisor argv is untouched by the fan-out
+        assert sup_cmd == [py, script, "synth", root, "video"]
+        assert js["ok"] is True
+        assert js["returncode"] == 0
+        assert [w["worker"] for w in js["workers"]] == [1, 2]
+        assert js["workers"][0]["band"] == [1, 5]
+        assert js["workers"][1]["band"] == [6, 10]
+        assert js["workers"][1]["log"].endswith("synth.worker2.log")
+
+    def test_worker_log_files_created_per_band(self, monkeypatch, tmp_path):
+        _js, _sup, _pops, _code = self._stage_run(monkeypatch, tmp_path, workers=2, n_cues=4)
+        root = tmp_path / "vid"
+        for k in (1,):
+            assert (root / "dubbed" / f"synth.worker{k}.log").exists()
+            assert (root / "dubbed" / f"synth.worker{k}.err.log").exists()
+
+    def test_any_worker_failure_fails_the_whole_stage(self, monkeypatch, tmp_path):
+        """Exit-code aggregation: one worker exiting 2 makes ok:false and
+        _die names that worker's err log (ticket acceptance)."""
+        js, _sup, _pops, code = self._stage_run(
+            monkeypatch, tmp_path, workers=3, worker_rcs=[0, 2], n_cues=10)
+        assert code not in (None, 0), "a failed worker must fail the stage"
+        assert js is not None and js["ok"] is False
+        assert js["returncode"] == 2
+        fails = [w for w in js["workers"] if w["returncode"] != 0]
+        assert len(fails) == 1 and fails[0]["worker"] == 2
+
+    def test_supervisor_failure_fails_even_with_green_workers(self, monkeypatch, tmp_path):
+        js, _sup, _pops, code = self._stage_run(
+            monkeypatch, tmp_path, workers=2, supervisor_rc=3, n_cues=4)
+        assert code not in (None, 0)
+        assert js["ok"] is False and js["returncode"] == 3
+
+    def test_more_workers_than_cues_spawns_fewer_bands(self, monkeypatch, tmp_path):
+        js, _, pops, _code = self._stage_run(monkeypatch, tmp_path, workers=4, n_cues=2)
+        # 3 bands wanted, only 2 cues -> 2 workers spawned (no empty band)
+        assert len(pops) == 2
+        assert js["ok"] is True
+
+    def test_workers_below_one_dies_before_spawning(self, monkeypatch, tmp_path):
+        _js, sup_cmd, pops, code = self._stage_run(monkeypatch, tmp_path, workers=0)
+        assert code not in (None, 0)
+        assert pops == [] and sup_cmd is None
+
+    def test_detach_with_multiple_workers_rejected(self, monkeypatch, tmp_path):
+        root = tmp_path / "vid"
+        trans = root / "transcript" / "translations_dub.txt"
+        trans.parent.mkdir(parents=True, exist_ok=True)
+        trans.write_text("句\n", encoding="utf-8")
+        ref = root / "dubbed" / "_reference" / "ref.wav"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"x" * 2000)
+        args = type("A", (), {
+            "output_root": str(root), "name": "video",
+            "python": None, "detach": True, "workers": 2, "stagger": 0.0,
+        })()
+        with pytest.raises(SystemExit) as ei:
+            cook.cmd_dub_synth(args)
+        assert ei.value.code not in (0, None)
+
+    def test_parser_defaults_workers_one_stagger_zero(self):
+        p = cook.build_parser()
+        a = p.parse_args(["dub", "synth", "root", "name"])
+        assert a.workers == 1 and a.stagger == 0.0
+        a2 = p.parse_args(["dub", "synth", "root", "name",
+                           "--workers", "3", "--stagger", "45"])
+        assert a2.workers == 3 and a2.stagger == 45.0

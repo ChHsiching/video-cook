@@ -1138,6 +1138,29 @@ def _run_subs(mod, argv: list[str]) -> None:
         sys.argv = old
 
 
+def _import_full_dub_module():
+    """Import the packaged dub stage module (stages/dub/full_dub.py) for its
+    pure helpers (synth_bands — the multi-worker band split). The module
+    level is stdlib-only; the heavy deps (torch, indextts) load inside the
+    stage functions and are never touched by this import, so in-process
+    loading works everywhere cook itself runs."""
+    import importlib.util
+    path = _stage_script("dub", "full_dub.py")
+    spec = importlib.util.spec_from_file_location("cook_stages_dub_full", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _count_dub_cues(root: Path) -> int:
+    """Cue count for band splitting = non-empty lines in
+    transcript/translations_dub.txt, counted exactly the way full_dub's
+    load_cues counts them (lines with truthy strip())."""
+    zh = root / "transcript" / "translations_dub.txt"
+    with open(zh, encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
 # ----------------------------------------------------------------------------
 # Dub stage prerequisites.
 #
@@ -1199,7 +1222,8 @@ def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
 
 def _run_dub_stage(stage: str, output_root: str, name: str,
                    python: str | None = None, detach: bool = False,
-                   log_name: str | None = None, extra_args: list[str] | None = None) -> None:
+                   log_name: str | None = None, extra_args: list[str] | None = None,
+                   workers: int = 1, stagger: float = 0.0) -> None:
     """Run one full_dub.py stage as a subprocess under the chosen interpreter.
 
     This is the fix for the IndexTTS2 environment split: full_dub.py needs
@@ -1217,7 +1241,26 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
     dies with a clear message naming the file and the command that produces it.
     This fires before any subprocess launch (including the detached path), so
     no IndexTTS2/demucs/ffmpeg work begins on a doomed run.
+
+    Multi-worker synth (ticket 10): workers > 1 spawns N-1 band workers
+    (synth-worker, descending cue order, self-staggered k*S seconds) before
+    the unchanged supervisor subprocess runs in the foreground; exit codes
+    aggregate — any non-zero (supervisor or worker) fails the stage.
     """
+    if workers < 1:
+        _die(f"--workers must be >= 1 (got {workers})",
+             obj={"stage": stage, "workers": workers})
+    if stagger < 0:
+        _die(f"--stagger must be >= 0 seconds (got {stagger})",
+             obj={"stage": stage, "stagger": stagger})
+    if workers > 1 and detach:
+        _die(
+            "cook dub synth --workers N does not support --detach: cook must "
+            "stay in the foreground to wait for the N-1 band workers and "
+            "aggregate their exit codes. Run foreground (an outer task "
+            "manager can supervise cook itself), or use --workers 1 --detach.",
+            obj={"stage": stage, "flag": "--detach", "workers": workers})
+
     root = _video_dir(output_root)
     _check_dub_stage_prerequisites(stage, root, name)
 
@@ -1251,15 +1294,66 @@ def _run_dub_stage(stage: str, output_root: str, name: str,
         })
         return
 
+    # ---- multi-worker fan-out (synth only; workers==1 skips this block) ----
+    spawned: list[dict] = []
+    if stage == "synth" and workers > 1:
+        total_cues = _count_dub_cues(root)
+        bands = _import_full_dub_module().synth_bands(total_cues, workers - 1)
+        _log(f"{label}: {len(bands)} worker band(s) over {total_cues} cues "
+             f"(supervisor scans all cues ascending; workers descend, "
+             f"stagger={stagger}s)")
+        for k, (band_lo, band_hi) in enumerate(bands, start=1):
+            wlog = root / "dubbed" / f"synth.worker{k}.log"
+            werr = root / "dubbed" / f"synth.worker{k}.err.log"
+            wcmd = [py_bin, str(script), "synth-worker", str(root), name,
+                    "--lo", str(band_lo), "--hi", str(band_hi),
+                    "--stagger", str(k * stagger)]
+            _log(f"{label}: worker {k}/{len(bands)} band {band_lo}-{band_hi} "
+                 f"stagger {k * stagger}s -> {wlog.name}")
+            # stdout/stderr handles are duplicated into the child at Popen
+            # time, so closing ours right after is safe on every platform
+            with open(wlog, "w", encoding="utf-8") as lf, \
+                 open(werr, "w", encoding="utf-8") as ef:
+                proc = subprocess.Popen(wcmd, cwd=str(root), stdout=lf,
+                                        stderr=ef, stdin=subprocess.DEVNULL)
+            spawned.append({"k": k, "lo": band_lo, "hi": band_hi,
+                            "proc": proc, "log": wlog, "err_log": werr})
+
     res = _run_long_task(cmd, cwd=root, log_file=log_file, err_file=err_file)
-    _emit_json({
-        "ok": res["ok"], "detached": False, "returncode": res["returncode"],
+
+    # ---- join the workers and aggregate exit codes (any non-zero fails) ----
+    worker_rows = []
+    for w in spawned:
+        rc = w["proc"].wait()
+        worker_rows.append({
+            "worker": w["k"], "band": [w["lo"], w["hi"]],
+            "returncode": rc,
+            "log": str(w["log"].relative_to(root)),
+            "err_log": str(w["err_log"].relative_to(root)),
+        })
+        if rc != 0:
+            _log(f"{label}: worker {w['k']} (band {w['lo']}-{w['hi']}) exited {rc}")
+
+    workers_ok = all(r["returncode"] == 0 for r in worker_rows)
+    ok = res["ok"] and workers_ok
+    aggregate_rc = res["returncode"] if res["returncode"] != 0 else next(
+        (r["returncode"] for r in worker_rows if r["returncode"] != 0), 0)
+    payload = {
+        "ok": ok, "detached": False, "returncode": aggregate_rc,
         "stage": stage, "python": py_bin,
         "log": str(log_file.relative_to(root)),
         "err_log": str(err_file.relative_to(root)),
-    })
-    if not res["ok"]:
-        _die(f"dub {stage} failed (exit {res['returncode']}); see {err_file}")
+    }
+    if worker_rows:
+        payload["workers"] = worker_rows
+    _emit_json(payload)
+    if not ok:
+        failing = "; ".join(
+            f"worker {r['worker']} (band {r['band'][0]}-{r['band'][1]}): "
+            f"see {r['err_log']}"
+            for r in worker_rows if r["returncode"] != 0)
+        detail = f"; {failing}" if failing else ""
+        _die(f"dub {stage} failed (exit {aggregate_rc}); see {err_file}{detail}")
 
 
 # ============================================================================
@@ -1895,13 +1989,22 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 # ----------------------------------------------------------------------------
 
 def cmd_dub_synth(args: argparse.Namespace) -> None:
-    """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2 (single-threaded).
-    Produces dubbed/_full/_segments/sent_NNNN.wav. Cost is per cue: ~3.5 min/cue
-    (~8h for 141 cues — see video-dubbing SKILL.md Step 4)."""
+    """Stage 1: synthesize Chinese TTS for each cue via IndexTTS2.
+    Produces dubbed/_full/_segments/sent_NNNN.wav. Cost is per cue: ~3.5
+    min/cue (~8h for 141 cues — see video-dubbing SKILL.md Step 4), which is
+    what --workers exists to cut down (ticket 10: 361 cues 21h -> 9h).
+
+    --workers N (default 1, single process, unchanged behavior): N > 1 adds
+    N-1 band workers (descending cue order) beside the unchanged ascending
+    supervisor; --stagger S spaces each worker k's heavy model load k*S
+    seconds apart so N simultaneous loads don't thrash the disk. Worker exit
+    codes aggregate: any non-zero fails the stage."""
     _run_dub_stage("synth", args.output_root, args.name,
                    python=getattr(args, "python", None),
                    detach=getattr(args, "detach", False),
-                   log_name="synth.log")
+                   log_name="synth.log",
+                   workers=getattr(args, "workers", 1),
+                   stagger=getattr(args, "stagger", 0.0))
 
 
 def cmd_dub_assemble(args: argparse.Namespace) -> None:
@@ -2097,6 +2200,14 @@ def build_parser() -> argparse.ArgumentParser:
     pdsyn = dub_sub.add_parser("synth",
                                help="Stage 1: IndexTTS2 synthesis → dubbed/_full/_segments/")
     _add_dub_common(pdsyn, with_detach=True)
+    pdsyn.add_argument("--workers", type=int, default=1, metavar="N",
+                       help="N > 1 spawns N-1 band workers (descending cue order, "
+                            "evenly split bands) beside the unchanged ascending "
+                            "supervisor. Default 1 = single process, unchanged.")
+    pdsyn.add_argument("--stagger", type=float, default=0.0, metavar="S",
+                       help="seconds to space each spawned worker's model load: "
+                            "worker k sleeps k*S before loading (IO-thrash guard "
+                            "for simultaneous model loads). Default 0.")
     pdsyn.set_defaults(func=cmd_dub_synth)
 
     pdas = dub_sub.add_parser("assemble",
