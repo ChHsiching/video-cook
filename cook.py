@@ -611,7 +611,15 @@ def cmd_download(args: argparse.Namespace) -> None:
             f"downloaded height {height} exceeds requested cap {args.quality}")
     orig_lang = (info.get("language") or "").split("-")[0].lower()
     got_lang = (cargo.get("audio_language") or "").split("-")[0].lower()
-    if orig_lang and got_lang and got_lang != orig_lang:
+    # merging into mp4 drops the audio language tag ('und'); when the pinned
+    # itag already proves the original-language track, an absent tag is not
+    # evidence of a dub — only a contradicting tag still warns
+    pinned_native_audio = bool(
+        selection and selection["audio"]
+        and (selection["audio"].get("language") or "").split("-")[0].lower()
+        == orig_lang)
+    if (orig_lang and got_lang and got_lang != orig_lang
+            and not (pinned_native_audio and got_lang in ("", "und"))):
         cargo_warnings.append(
             f"audio language '{got_lang}' != original '{orig_lang}' — "
             "a dub track may have been grabbed instead of the original")
