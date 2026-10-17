@@ -248,7 +248,11 @@ def retime_plan(bil_cues: list[dict], stream: str,
     prev = None
     for cue, kind, r in zip(bil_cues, kinds, raw):
         if kind == "ANCHOR" and r is not None:
-            v = r - ANCHOR_LEAD_S
+            # clamped at zero: a first word earlier than the lead (speech
+            # starting <0.05s into the cue) must not produce a negative
+            # start — fmt_ts renders negatives as the malformed
+            # '-1:59:59,970' (negative divmod artifact)
+            v = max(0.0, r - ANCHOR_LEAD_S)
         elif kind == "GAP" or (kind == "ANCHOR" and r is None):
             v = cue["start"]        # no trusted word time: keep what's there
         else:

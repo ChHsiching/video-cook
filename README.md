@@ -53,7 +53,12 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 | `cook show-source <root> <name>` | Extract key fields (title/uploader/links/description) from source.json | (new — surfaces the source context for translation + upload metadata) |
 | `cook verify-align <root> <name>` | DP-align `en.srt` vs `translations.txt`, catch missing/drifted translations | (new — no prior equivalent) |
 | `cook verify-shipment <root> <name>` | Check the full release set exists; exit 0 = ready to ship | (new — no prior equivalent) |
-| `cook dub <stage> <root> <name> --python <venv>` | Dub pipeline (separate/synth/timeline/retime/burn, or `full`) under the IndexTTS2 venv; `burn --keep-subs` reuses hand-edited subtitle files | video-dubbing Steps 1, 4-7 |
+| `cook dub <stage> <root> <name> --python <venv>` | Dub stages under the IndexTTS2 venv: `separate` (Demucs vocal split), `verify` (dub shipment check), or `full` (synth + assemble in sequence) | video-dubbing Steps 1-7 |
+| `cook dub synth <root> <name> --python <venv>` | Stage 1: IndexTTS2 synthesis → `dubbed/_full/_segments/` (supervisor scans all cues ascending; skip-if-exists resumes). `--workers N` spawns N-1 band workers (descending cue order, evenly split bands) beside the unchanged supervisor; `--stagger S` spaces each worker's model load by k*S seconds (IO-thrash guard). Concurrent writers of the same cue publish atomically — no interleaved/corrupt `sent_NNNN.wav` | video-dubbing Step 4 |
+| `cook dub assemble <root> <name> --python <venv>` | Stage 2: identity-timeline assembly (video never re-timed) → `cooked/<name>.dubbed.mp4`; subtitle retime runs by default (ADR 0002), `--no-retime` keeps the old proportional-split starts; `--keep-subs` reuses hand-edited subtitle files in `dubbed/_full/` | video-dubbing Steps 5-7 |
+| `cook dub retime <root> <name> --python <venv>` | Rewrite `dubbing.bilingual.srt` starts onto the dubbed speech's real word times (faster-whisper word timestamps on the clean per-cue pad wavs); backs up the original as `.pre_retime` | (new — the ear-gate retime pass, also run inside assemble) |
+| `cook dub measure-rate [--wav f.wav --text "…" \| --from-segments ROOT NAME]` | Measure the REAL speech rate (chars per voiced second) of an audition take or a whole synthesized run via energy VAD; `--json` for the machine-readable report | (new — measured, not assumed) |
+| `cook dub gate <root> <name> --rate CHARS_PER_SEC` | Pre-synth length gate on `translations_dub.txt` computed against the MEASURED rate — refuses to run without one (`--rate` from `cook dub measure-rate`, or `--self-measure` from synth's own takes); `--json` for the machine-readable verdict | (new — refuses assumed rates) |
 | `cook dub merge <root> <name> --group "a,b,c"` | Merge cue groups in `en.full.srt` + `translations_dub.txt` in lockstep (`--group` repeatable, 1-based consecutive lines); refuses to write unless the zh/en pairing invariants hold, backs up both files as `*.v1` | hand-editing the SRT to merge cues (one side alone desynchronizes zh/en) |
 
 Every command prints a JSON object on stdout (machine-readable; agents parse this) and human-readable progress on stderr. Exit codes are meaningful: 0 = done criterion passed, non-zero = it didn't.
@@ -85,7 +90,13 @@ pip install -e .[dev]
 pytest test_cook.py -v
 ```
 
-Tests cover the subcommands whose correctness is non-obvious: `verify-align` (DP alignment edge cases), `verify-shipment` (file-presence checks), and the cloud-srt copy logic (the fix for the split leak). No network, no ffmpeg, no whisperx — all tests use temp dirs and fake files.
+Tests (199 as of this writing) cover every subcommand whose correctness is non-obvious:
+
+- `verify-align` (DP alignment edge cases), `verify-shipment` (file-presence checks), the cloud-srt copy logic (the fix for the split leak), and the width-based length gate;
+- the dub pipeline: synth band split + worker orchestration (`--workers/--stagger`), atomic cue publishing (two concurrent writers of the same `sent_NNNN.wav` never expose a partial file), `dub merge` lockstep invariants, `measure-rate`/`gate` (measured-rate contract), and the retime chain (char alignment, the two-pass rewrite incl. the negative-anchor clamp, assemble auto-retime markers);
+- packaging contracts: stage scripts resolve package-internally and never fall back to installed skill copies (ADR 0001).
+
+No network, no ffmpeg, no whisperx — all tests use temp dirs and fake files.
 
 ## License
 

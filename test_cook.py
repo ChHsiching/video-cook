@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -1229,6 +1230,87 @@ class TestDubScriptsInPackage:
         assert "measure-rate" in (r2.stdout + r2.stderr)
 
 
+class TestSkillFallbackRemoved:
+    """ADR 0001 (code-review residue): the dub stage scripts must NEVER
+    fall back to installed video-subtitle skill copies — the packaged
+    stages/ files are the only source, and a miss is an installation bug
+    that dies with the reinstall remedy. full_dub._import_subtitles_module
+    and extract_reference._find_subtitle_script both carried the old
+    home-dir/env fallbacks; these tests pin their removal."""
+
+    def _fake_home_with_decoys(self, tmp_path: Path) -> Path:
+        fake_home = tmp_path / "fakehome"
+        for sub in (".agents", ".zcode", ".claude"):
+            d = fake_home / sub / "skills" / "video-subtitle" / "scripts"
+            d.mkdir(parents=True, exist_ok=True)
+            for fname in ("subtitles.py", "transcribe.py"):
+                (d / fname).write_text("# stale skill copy\n", encoding="utf-8")
+        return fake_home
+
+    def _load_orphan_copy(self, src: Path, tmp_path: Path):
+        """Load a copy of `src` from a directory with NO stages/subtitle/
+        sibling, so its package-internal candidate does not exist."""
+        import importlib.util
+        orphan = tmp_path / "orphan"
+        orphan.mkdir()
+        dest = orphan / src.name
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            f"{src.stem}_orphan_{id(tmp_path):x}", dest)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_full_dub_dies_without_packaged_subtitles_despite_skill_decoys(
+            self, tmp_path, monkeypatch, capsys):
+        """Planted skill decoys must not satisfy the loader when the
+        packaged stages/subtitle/subtitles.py is missing: it dies non-zero
+        with the reinstall remedy (ADR 0001) instead of running a stale
+        copy."""
+        fake_home = self._fake_home_with_decoys(tmp_path)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        mod = self._load_orphan_copy(_stages_dub_dir() / "full_dub.py",
+                                     tmp_path)
+        with pytest.raises(SystemExit) as ei:
+            mod._import_subtitles_module()
+        assert ei.value.code == 1
+        out = capsys.readouterr()
+        assert "reinstall video-cook" in (out.out + out.err)
+
+    def test_extract_reference_dies_without_packaged_transcribe_despite_decoys(
+            self, tmp_path, monkeypatch, capsys):
+        fake_home = self._fake_home_with_decoys(tmp_path)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        # the pre-consolidation env override is equally out of contract
+        monkeypatch.setenv("VIDEO_SUBTITLE_SKILL_DIR", str(fake_home))
+        mod = self._load_orphan_copy(
+            _stages_dub_dir() / "extract_reference.py", tmp_path)
+        with pytest.raises(SystemExit) as ei:
+            mod._find_subtitle_script()
+        assert ei.value.code == 1
+        out = capsys.readouterr()
+        assert "reinstall video-cook" in (out.out + out.err)
+
+    def test_extract_reference_real_location_returns_packaged_script(
+            self, tmp_path, monkeypatch):
+        """Positive path: from its real in-package location, the resolver
+        returns the packaged transcribe.py even with decoy homes planted."""
+        import importlib.util
+        fake_home = self._fake_home_with_decoys(tmp_path)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        spec = importlib.util.spec_from_file_location(
+            f"extract_reference_real_{id(tmp_path):x}",
+            _stages_dub_dir() / "extract_reference.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        script = mod._find_subtitle_script()
+        assert Path(script) == (Path(cook.__file__).resolve().parent
+                                / "stages" / "subtitle" / "transcribe.py")
+
+
 class TestFindDubScriptPackageInternal:
     """_stage_script('dub', 'full_dub.py') resolves the package-internal
     stages/dub/full_dub.py — the consolidation removes the 'installed skill
@@ -1902,6 +1984,243 @@ class TestSynthWorkerStage:
         with pytest.raises(SystemExit) as ei:
             mod._cli_main(["synth", str(tmp_path), "video", "--lo", "3"])
         assert ei.value.code != 0
+
+
+class TestSynthAtomicPublish:
+    """code-review fix: multi-worker synth TOCTOU. The ascending supervisor
+    and a descending band worker can both pass the skip-if-exists check for
+    the same cue and synthesize it concurrently (the check-then-write race);
+    tts.infer used to write the FINAL sent_NNNN.wav path directly, so two
+    concurrent writers interleaved their bytes on one file — a corrupt wav,
+    or a >1KB partial write cached as done by the other process's skip
+    check. Synthesis must go to a UNIQUE temp sibling in the same directory
+    and be moved onto the final name with os.replace (atomic on the same
+    filesystem): whoever wins the race, every reader of sent_NNNN.wav sees
+    one writer's complete output, never a partial interleave."""
+
+    def _stage_video(self, tmp_path: Path, n_cues: int,
+                     zh_lines: list[str] | None = None) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt",
+                  _fake_en_cues(n_cues))
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           zh_lines if zh_lines is not None
+                           else [f"第{i}句中文配音" for i in range(1, n_cues + 1)])
+        return root
+
+    def _run_stage(self, mod, root: Path) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_synth(str(root), "video")
+        return buf.getvalue()
+
+    def _assert_complete_wav(self, path: Path, expected_frames: int) -> None:
+        import contextlib
+        import wave
+        with contextlib.closing(wave.open(str(path), "rb")) as w:
+            assert w.getnframes() == expected_frames, \
+                f"{path.name}: {w.getnframes()} frames"
+
+    def test_infer_receives_a_temp_sibling_never_the_final_path(
+            self, tmp_path, monkeypatch, _restore_sys_path):
+        """The mechanism contract: tts.infer (and the chunk concat) never
+        write the final sent path — they write a temp SIBLING in the same
+        directory (same filesystem, so the follow-up rename is atomic),
+        and no temp file survives the stage."""
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, 3)
+        self._run_stage(mod, root)
+        segs = root / "dubbed" / "_full" / "_segments"
+        calls = [c for c in _fake_tts_calls(pkg) if c[0] == "infer"]
+        assert len(calls) == 3
+        for _text, path in ((c[1], c[2]) for c in calls):
+            name = Path(path).name
+            assert name.endswith(".part"), \
+                f"infer wrote a non-temp path: {path}"
+            # same-dir sibling of some sent_NNNN.wav (os.replace atomicity
+            # precondition) with the final name as its prefix
+            assert name.startswith("sent_") and ".wav.tmp" in name, path
+            assert Path(path).parent == segs, path
+        for i in (1, 2, 3):
+            self._assert_complete_wav(segs / f"sent_{i:04d}.wav", 2205)
+        assert list(segs.glob("*.part")) == []
+
+    def test_chunked_long_cue_concats_via_temp_sibling_too(
+            self, tmp_path, monkeypatch, _restore_sys_path):
+        """The chunk-cache files and the chunk concat output are equally
+        racy between supervisor and worker — they publish the same way.
+        _concat_wavs is monkeypatched to a pure-stdlib copier (the suite
+        never shells out to ffmpeg)."""
+        mod, pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._stage_video(tmp_path, 1,
+                                 zh_lines=["长" * 100])  # > CHUNK_ON: chunked
+        concat_dsts: list[Path] = []
+
+        def fake_concat(files, dst):
+            import contextlib
+            import wave
+            with contextlib.closing(wave.open(str(dst), "wb")) as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(22050)
+                for f in files:
+                    with contextlib.closing(wave.open(str(f), "rb")) as w:
+                        out.writeframes(w.readframes(w.getnframes()))
+            concat_dsts.append(Path(dst))
+
+        monkeypatch.setattr(mod, "_concat_wavs", fake_concat)
+        self._run_stage(mod, root)
+        chunk_calls = [c for c in _fake_tts_calls(pkg) if c[0] == "infer"]
+        assert len(chunk_calls) >= 2, "100-char line must chunk"
+        for c in chunk_calls:
+            assert Path(c[2]).name.endswith(".part"), \
+                f"chunk infer wrote a non-temp path: {c[2]}"
+            assert Path(c[2]).parent.name == "_chunkcache", c[2]
+        assert len(concat_dsts) == 1
+        assert concat_dsts[0].name.endswith(".part"), \
+            f"concat wrote a non-temp path: {concat_dsts[0]}"
+        work = root / "dubbed" / "_full"
+        self._assert_complete_wav(
+            work / "_segments" / "sent_0001.wav", 2205 * len(chunk_calls))
+        assert list(work.rglob("*.part")) == []
+
+    def test_concurrent_writers_never_expose_a_partial_file(
+            self, tmp_path, monkeypatch, _restore_sys_path):
+        """The race itself: two stage_synth threads synthesize the same
+        single cue. The fake infer writes DISTINCT sizes per writer, then
+        PARKS mid-write on a test-gated Event — so both partial states are
+        held on disk simultaneously and deterministically while this
+        thread polls the final path. Old behavior: both wrote the final
+        path directly, so the parked window exposed partial bytes (and
+        after release the two open 'wb' handles interleaved). New
+        behavior: the final path only ever appears complete."""
+        import builtins
+        import contextlib
+        import itertools
+        import threading
+        import wave
+        mod, pkg = self._load_full_dub_racing(tmp_path, monkeypatch)
+        assert not hasattr(builtins, "_synth_race_state")
+        # pre-create the race state so this thread can watch it the moment
+        # the writers start (the fake reuses it via getattr on builtins)
+        st = builtins._synth_race_state = {
+            "go": threading.Event(),
+            "counter": itertools.count(1), "n": 0, "parked": 0,
+            "log": [], "broken": []}
+        root = self._stage_video(tmp_path, 1)
+
+        errors: list[str] = []
+
+        def run() -> None:
+            try:
+                mod.stage_synth(str(root), "video")
+            except Exception as e:  # pragma: no cover - surfaced via errors
+                errors.append(repr(e))
+
+        t1 = threading.Thread(target=run)
+        t2 = threading.Thread(target=run)
+        t1.start()
+        t2.start()
+        final = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        try:
+            # both writers parked mid-write? (deadline guards a crashed
+            # writer: go is set anyway and the assertions below fail)
+            deadline = time.time() + 15
+            while st["parked"] < 2 and time.time() < deadline:
+                time.sleep(0.001)
+            # deterministic observation window: both writers hold their
+            # partials while we poll the final path for 100ms
+            partial_seen = []
+            for _ in range(100):
+                if final.exists():
+                    try:
+                        with contextlib.closing(
+                                wave.open(str(final), "rb")) as w:
+                            n = w.getnframes()
+                        if n not in (4410, 6615):
+                            partial_seen.append(n)
+                    except PermissionError:
+                        # a handle collision, not evidence of a partial —
+                        # the states we CAN read are
+                        pass
+                    except Exception as e:
+                        partial_seen.append(repr(e))
+                time.sleep(0.001)
+            st["go"].set()
+            t1.join(30)
+            t2.join(30)
+            assert not errors
+            # the race was REAL: both writers synthesized the same cue
+            assert st["n"] == 2, f"expected 2 racing writers, got {st['n']}"
+            assert not st["broken"], "writers timed out parked — never released"
+            # the poller never caught a partial file
+            assert not partial_seen, \
+                f"partial/corrupt states observed mid-write: {partial_seen[:5]}"
+            # and the survivor is one writer's complete take (whichever
+            # writer's replace landed last — both wrote complete files)
+            with contextlib.closing(wave.open(str(final), "rb")) as w:
+                assert w.getnframes() in (4410, 6615)
+            assert list(final.parent.glob("*.part")) == []
+        finally:
+            st["go"].set()
+            del builtins._synth_race_state
+
+    def _load_full_dub_racing(self, tmp_path: Path, monkeypatch):
+        """_load_full_dub variant whose fake infer writes DISTINCT content
+        per writer (writer 1: 4410 frames of 'A', writer 2: 6615 of 'B'),
+        flushes the first half to disk, then parks on a test-gated Event
+        (shared via builtins — module re-imports by the second thread must
+        not fork the race state) until the test releases it."""
+        import importlib.util
+        import sys
+        import types
+        pkg = tmp_path / "racedeps"
+        (pkg / "indextts").mkdir(parents=True)
+        (pkg / "indextts" / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "indextts" / "infer_v2_5.py").write_text(
+            "import builtins, itertools, pathlib, threading, wave\n"
+            "st = getattr(builtins, '_synth_race_state', None)\n"
+            "if st is None:\n"
+            "    st = builtins._synth_race_state = {\n"
+            "        'go': threading.Event(),\n"
+            "        'counter': itertools.count(1), 'n': 0, 'parked': 0,\n"
+            "        'log': [], 'broken': []}\n"
+            "class IndexTTS2:\n"
+            "    def __init__(self, **kw):\n"
+            "        pass\n"
+            "    def infer(self, spk_audio_prompt, text, output_path, lang,\n"
+            "              use_random, duration_factor):\n"
+            "        wid = next(st['counter'])\n"
+            "        st['n'] = wid\n"
+            "        st['log'].append((wid, text, output_path))\n"
+            "        nframes = 4410 if wid == 1 else 6615\n"
+            "        marker = bytes([64 + wid])  # 'A' / 'B'\n"
+            "        p = pathlib.Path(output_path)\n"
+            "        p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        with wave.open(str(p), 'wb') as w:\n"
+            "            w.setnchannels(1); w.setsampwidth(2); "
+            "w.setframerate(22050)\n"
+            "            half = nframes // 2\n"
+            "            w.writeframes(marker * (half * 2))\n"
+            "            w._file.flush()  # partial bytes on disk NOW\n"
+            "            st['parked'] += 1\n"
+            "            if not st['go'].wait(30):\n"
+            "                st['broken'].append(wid)\n"
+            "            w.writeframes(marker * ((nframes - half) * 2))\n",
+            encoding="utf-8")
+        fake_torch = types.ModuleType("torch")
+        fake_torch.set_num_threads = lambda n: None
+        fake_torch.set_num_interop_threads = lambda n: None
+        fake_torch.__file__ = str(pkg / "torch.py")
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setenv("INDEXTTS_DIR", str(pkg))
+        spec = importlib.util.spec_from_file_location(
+            f"full_dub_race_{id(tmp_path):x}", _stages_dub_dir() / "full_dub.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod, pkg
 
 
 class TestSynthWorkersOrchestration:
@@ -2772,6 +3091,42 @@ class TestRetimePlan:
         assert plan[0]["kind"] == "ANCHOR"
         assert plan[0]["start"] == 10.0 - 0.05
         assert plan[1]["start"] == 20.0 - 0.05
+
+    def test_anchor_earlier_than_lead_clamps_to_zero(self):
+        """code-review fix (negative-boundary): a first word earlier than
+        ANCHOR_LEAD_S (speech starting 0.02s into the cue) used to yield
+        start = 0.02 - 0.05 = -0.03 — fmt_ts(-0.03) renders the malformed
+        '-1:59:59,970' (negative divmod artifact). The lead is now clamped
+        at zero: the earliest possible start is 0."""
+        mod = _load_retime()
+        cues = [self._cue(0.0, 9.0, "甲乙"), self._cue(9.0, 12.0, "丙丁")]
+        plan = mod.retime_plan(cues, "甲乙丙丁",
+                               [0.02, 0.5, 10.0, 10.5], 30.0)
+        assert plan[0]["start"] == 0.0
+        # anchors past the lead are untouched
+        assert plan[1]["start"] == 10.0 - 0.05
+
+    def test_anchor_exactly_at_lead_is_zero(self):
+        """Boundary: r - ANCHOR_LEAD_S == 0 stays 0 (not -0.0, not epsilon)."""
+        mod = _load_retime()
+        cues = [self._cue(0.0, 9.0, "甲乙")]
+        plan = mod.retime_plan(cues, "甲乙", [0.05, 0.5], 30.0)
+        assert plan[0]["start"] == 0.0
+
+    def test_clamped_anchor_formats_a_legal_timestamp(self):
+        """The user-visible symptom: the rewritten SRT line for a clamped
+        anchor must be a legal '00:00:00,000', never a negative-artifact
+        like '-1:59:59,970'."""
+        mod = _load_retime()
+        cues = [self._cue(0.0, 9.0, "甲乙")]
+        plan = mod.retime_plan(cues, "甲乙", [0.02, 0.5], 30.0)
+        assert mod.fmt_ts(plan[0]["start"]) == "00:00:00,000"
+        # and the monotonic clamp keeps the NEXT start non-negative too
+        cues2 = [self._cue(0.0, 0.01, "甲"), self._cue(0.01, 5.0, "乙")]
+        plan2 = mod.retime_plan(cues2, "甲乙", [0.01, 0.02], 30.0)
+        assert plan2[0]["start"] == 0.0
+        assert plan2[1]["start"] >= 0.0
+        assert mod.fmt_ts(plan2[1]["start"]) == "00:00:00,040"
 
     def test_dwell_inherits_then_min_gap_clamp(self):
         """A union repeat (same zh text as the cue just consumed) inherits

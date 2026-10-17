@@ -124,45 +124,34 @@ def pick_best_clip(vocals_path: str, target_dur: float, min_dur: float,
 def transcribe_clip(clip_path: str, out_txt: str, model: str, language: str) -> None:
     """Transcribe the clip with whisperX. Uses the same model as video-subtitle
     (large-v3) so consistency is maintained."""
-    # Try the video-subtitle skill's transcribe.py first (it handles caching,
-    # alignment, etc). If not found, call whisperx directly.
     subtitle_script = _find_subtitle_script()
-    if subtitle_script:
-        tmp_srt = clip_path.replace(".wav", ".srt")
-        subprocess.run(
-            ["python", subtitle_script, clip_path, tmp_srt, model, "float32", language, "cpu"],
-            check=True,
+    tmp_srt = clip_path.replace(".wav", ".srt")
+    subprocess.run(
+        ["python", subtitle_script, clip_path, tmp_srt, model, "float32", language, "cpu"],
+        check=True,
+    )
+    # Extract the text from the SRT (drop timestamps)
+    _srt_to_text(tmp_srt, out_txt)
+    os.remove(tmp_srt)
+
+
+def _find_subtitle_script() -> str:
+    """Locate the transcribe.py used to transcribe the reference clip: the
+    package-internal copy only (stages/subtitle/transcribe.py — vendored
+    alongside this file, version-locked to the cook release). Installed
+    video-subtitle skill copies are NEVER consulted (ADR 0001: an installed
+    copy can be older than the cook release driving it); a miss is an
+    installation bug and dies with the reinstall remedy."""
+    cand = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "subtitle", "transcribe.py")
+    if not os.path.exists(cand):
+        print(
+            f"ERROR: {cand} is missing from the cook distribution — "
+            "reinstall video-cook (pip install -U video-cook)",
+            file=sys.stderr, flush=True,
         )
-        # Extract the text from the SRT (drop timestamps)
-        _srt_to_text(tmp_srt, out_txt)
-        os.remove(tmp_srt)
-    else:
-        # Direct whisperx fallback
-        _whisperx_direct(clip_path, out_txt, model, language)
-
-
-def _find_subtitle_script() -> str | None:
-    """Look for the transcribe.py used to transcribe the reference clip.
-
-    Order: the package-internal copy first (stages/subtitle/transcribe.py —
-    vendored alongside this file, version-locked to the cook release), then
-    the VIDEO_SUBTITLE_SKILL_DIR env override, then the installed
-    video-subtitle skill copies."""
-    candidates = [
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), "subtitle", "transcribe.py"),
-    ]
-    env = os.environ.get("VIDEO_SUBTITLE_SKILL_DIR")
-    if env:
-        candidates.insert(0, os.path.join(env, "scripts", "transcribe.py"))
-    candidates += [
-        os.path.expanduser("~/.agents/skills/video-subtitle/scripts/transcribe.py"),
-        os.path.expanduser("~/.zcode/skills/video-subtitle/scripts/transcribe.py"),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
+        sys.exit(1)
+    return cand
 
 
 def _srt_to_text(srt_path: str, out_txt: str) -> None:
@@ -180,18 +169,6 @@ def _srt_to_text(srt_path: str, out_txt: str) -> None:
                 lines.append(text)
     with open(out_txt, "w", encoding="utf-8") as f:
         f.write(" ".join(lines).strip() + "\n")
-
-
-def _whisperx_direct(clip_path: str, out_txt: str, model: str, language: str) -> None:
-    import whisperx
-    device = "cpu"
-    compute_type = "float32"
-    audio = whisperx.load_audio(clip_path)
-    model_obj = whisperx.load_model(model, device, compute_type=compute_type, language=language)
-    result = model_obj.transcribe(audio, batch_size=16, language=language)
-    text = " ".join(seg["text"].strip() for seg in result["segments"])
-    with open(out_txt, "w", encoding="utf-8") as f:
-        f.write(text + "\n")
 
 
 def main():

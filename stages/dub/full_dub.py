@@ -38,7 +38,7 @@ Environment:
   DUB_DURATION_FACTOR  — IndexTTS2 duration_factor (default 1.0; ~0.85 is a
                          brisker house pace — see SKILL.md Step 3a)
 """
-import os, sys, time, re, json, subprocess, contextlib, wave, shutil
+import os, sys, time, re, json, subprocess, contextlib, wave, shutil, tempfile
 from pathlib import Path
 
 # ===== single-thread MUST be set before any numerical import (坑 5) =====
@@ -78,16 +78,6 @@ def _paths(output_root: str | Path, name: str) -> dict:
         "cloud_srt": root / "cloud-srt" / "zh.dub.srt",
         "cloud_srt_en": root / "cloud-srt" / "en.dub.srt",
     }
-
-
-def _raw_dur(raw_mp4: Path) -> float:
-    """Probe the raw video's duration."""
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(raw_mp4)],
-        capture_output=True, text=True,
-    )
-    return float(r.stdout.strip())
 
 
 def _probe_wh(video: Path) -> tuple[int, int]:
@@ -220,6 +210,42 @@ def _concat_wavs(files, dst):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"concat failed: {r.stderr[-200:]}")
+
+
+def _publish(dst: Path, produce) -> None:
+    """Write dst through a unique temp sibling + os.replace — the
+    multi-worker TOCTOU fix (code review): the ascending supervisor and a
+    descending band worker can both pass the skip-if-exists check for the
+    same cue and synthesize it concurrently (check-then-write race), and
+    tts.infer writing the FINAL path directly meant two writers
+    interleaved their bytes on one file — a corrupt wav, or a >1KB
+    partial write cached as done by the other process's skip check.
+    produce(tmp) writes a complete file to a mkstemp-unique temp name in
+    dst's own directory (same filesystem, so the rename is atomic);
+    os.replace then moves it onto dst. Every reader of dst sees one
+    writer's complete output, never a partial interleave, and two
+    concurrent producers of the same dst never share a temp name.
+
+    The replace retries briefly on PermissionError: on Windows the move
+    fails while ANY handle holds dst open (antivirus scans, a concurrent
+    skip-check stat, an indexer) — a transient condition, not a rival
+    writer, so waiting it out preserves liveness."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst.parent), prefix=f"{dst.name}.tmp", suffix=".part")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        produce(tmp)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, dst)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.01)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace
 
 
 def fit_factor(audio_dur, window):
@@ -372,17 +398,21 @@ def stage_synth(output_root, name: str, lo: int | None = None,
         ref = refs[speakers[gi]] if speakers else p["ref_wav"]
         if len(zh) > CHUNK_ON:
             # long-line collapse guard: synthesize sentence chunks, concat
+            # (chunks and the concat output publish atomically too — the
+            # supervisor/worker race applies to them as much as to `out`)
             chunks = split_chunks(zh)
             parts = []
             for ci, c in enumerate(chunks):
                 cp = chunk_cache / f"c{idx:04d}_{ci:02d}.wav"
-                tts.infer(spk_audio_prompt=str(ref), text=c, output_path=str(cp),
-                          lang="zh", use_random=False, duration_factor=df)
+                _publish(cp, lambda t, _c=c: tts.infer(
+                    spk_audio_prompt=str(ref), text=_c, output_path=str(t),
+                    lang="zh", use_random=False, duration_factor=df))
                 parts.append(cp)
-            _concat_wavs(parts, out)
+            _publish(out, lambda t: _concat_wavs(parts, t))
         else:
-            tts.infer(spk_audio_prompt=str(ref), text=zh, output_path=str(out),
-                      lang="zh", use_random=False, duration_factor=df)
+            _publish(out, lambda t: tts.infer(
+                spk_audio_prompt=str(ref), text=zh, output_path=str(t),
+                lang="zh", use_random=False, duration_factor=df))
         dur = get_dur(out)
         n_done += 1
         elapsed = time.time() - t_start
@@ -410,7 +440,7 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
                    no_retime: bool = False):
     p = _paths(output_root, name)
     cues = load_cues(p["en_full_srt"], p["zh_dub_txt"])
-    raw_dur = _raw_dur(p["raw_mp4"])
+    raw_dur = probe_dur(p["raw_mp4"])
     log(f"Stage 2 (assemble): identity timeline — {len(cues)} cues, video untouched ({raw_dur:.2f}s)")
 
     if keep_subs:
@@ -661,27 +691,22 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
 # ---------- video-subtitle module loader (mirrors cook's pattern) ----------
 
 def _import_subtitles_module():
-    """Load the subtitles module for the subtitle side of assembly.
-
-    Order: the package-internal copy first (stages/subtitle/subtitles.py —
-    vendored alongside this file, version-locked to the cook release), then
-    the installed video-subtitle skill copies as a fallback for layouts
-    predating the consolidation."""
-    here = Path(__file__).resolve().parent
-    candidates = [
-        here.parent / "subtitle" / "subtitles.py",
-        Path.home() / ".agents" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-        Path.home() / ".zcode" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-        Path.home() / ".claude" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("subtitles", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
-    raise FileNotFoundError("subtitles.py not found — install video-subtitle skill")
+    """Load the subtitles module for the subtitle side of assembly: the
+    package-internal copy (stages/subtitle/subtitles.py — vendored
+    alongside this file, version-locked to the cook release). Installed
+    video-subtitle skill copies are NEVER consulted (ADR 0001: an installed
+    copy can be older than the cook release driving it); a miss is an
+    installation bug and dies with the reinstall remedy."""
+    import importlib.util
+    cand = Path(__file__).resolve().parent.parent / "subtitle" / "subtitles.py"
+    if not cand.exists():
+        log(f"ERROR: {cand} is missing from the cook distribution — "
+            "reinstall video-cook (pip install -U video-cook)")
+        sys.exit(1)  # failed: exit non-zero so cook reports ok:false
+    spec = importlib.util.spec_from_file_location("subtitles", cand)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _run_subs(mod, argv):
