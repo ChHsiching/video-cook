@@ -749,12 +749,15 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
     language = args.language
     _log(f"cook transcribe: model={model} device={device} compute={compute} lang={language}")
 
-    # build the inner command — we re-invoke ourselves in a child python with
-    # the actual whisperx call, so detachment is uniform across platforms.
+    # build the inner command — run the PACKAGED stages/subtitle/transcribe.py
+    # in a child python (sys.executable) with the resolved device/compute, so
+    # detachment is uniform across platforms and the transcribe logic lives in
+    # exactly one place inside the distribution (2026-10 consolidation).
+    # Positional contract of transcribe.py:
+    #   <input> <output.srt> [model_size] [compute_type] [language] [device]
     inner_cmd = [
-        sys.executable, "-c",
-        _TRANSCRIBE_INNER,
-        str(wav), str(srt), model, device, compute, language,
+        sys.executable, str(_stage_script("subtitle", "transcribe.py")),
+        str(wav), str(srt), model, compute, language, device,
     ]
     log_file = _transcript(root, args.name, ".transcribe.log")
     err_file = _transcript(root, args.name, ".transcribe.err.log")
@@ -790,40 +793,10 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
         _die(f"transcribe failed (exit {res['returncode']}); see {err_file}")
 
 
-# This string is exec'd by the detached child. Kept inline so cook is a single
-# file with no transcribe.py dependency. Mirrors video-subtitle/scripts/transcribe.py
-# but with device/compute parameterized (fixes the hardcoded device="cpu" bug).
-_TRANSCRIBE_INNER = """
-import sys, time, os
-wav, out, model_size, device, compute, language = sys.argv[1:7]
-print(f"[transcribe] model={model_size} device={device} compute={compute} language={language}", flush=True)
-t0 = time.time()
-import whisperx
-model = whisperx.load_model(model_size, device=device, compute_type=compute)
-audio = whisperx.load_audio(wav)
-result = model.transcribe(audio, batch_size=8, language=language)
-print(f"[transcribe] base transcribe done in {time.time()-t0:.1f}s", flush=True)
-try:
-    am, meta = whisperx.load_align_model(language_code=language, device=device)
-    result = whisperx.align(result["segments"], am, meta, audio, device=device)
-    print(f"[transcribe] alignment done in {time.time()-t0:.1f}s", flush=True)
-except Exception as e:
-    print(f"[transcribe] alignment skipped: {e}", flush=True)
-os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-def fmt(ts):
-    h=int(ts//3600); m=int((ts%3600)//60); s=ts%60
-    return f"{h:02d}:{m:02d}:{int(s):02d},{int(round((s-int(s))*1000)):03d}"
-lines=[]
-for i,seg in enumerate(result["segments"],1):
-    t=seg["text"].strip()
-    if not t: continue
-    lines.append(f"{i}\\n{fmt(seg['start'])} --> {fmt(seg['end'])}\\n{t}")
-with open(out,"w",encoding="utf-8") as f:
-    f.write("\\n\\n".join(lines)+"\\n")
-elapsed=time.time()-t0
-dur=result["segments"][-1]["end"] if result["segments"] else 0
-print(f"[transcribe] done. {len(lines)} segments, audio~{dur:.1f}s, elapsed={elapsed:.1f}s ({dur/elapsed:.2f}x realtime) -> {out}", flush=True)
-"""
+# The inline transcribe script this command used to exec was removed in the
+# 2026-10 consolidation: cook now runs the packaged stages/subtitle/
+# transcribe.py (same whisperX flow, same "[transcribe] done." marker) via
+# sys.executable, so the logic exists in exactly one place.
 
 
 def _detect_device_compute() -> tuple[str, str]:
@@ -878,7 +851,7 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     if not en_srt.exists() or not zh_srt.exists():
         _die(f"need both {en_srt.name} and {zh_srt.name} to exist")
 
-    # import the vendor'd subtitles module
+    # import the packaged subtitles module (stages/subtitle/subtitles.py)
     subs = _import_subtitles_module()
 
     # Step 4a: shorten both languages (split long cues into single-line cues)
@@ -940,32 +913,70 @@ def cmd_subtitles(args: argparse.Namespace) -> None:
     })
 
 
+def _stage_script(stage: str, script: str) -> Path:
+    """Resolve a stage script shipped inside the video-cook distribution.
+
+    Stage scripts live in the stages/<stage>/ package that ships with cook
+    itself (the 2026-10 consolidation: deterministic scripts are owned by
+    the cook repo, NOT by installed skill copies — installed copies drifted
+    out of sync with the cook version driving them). Resolution order:
+
+    1. The stages/ tree next to cook.py — covers source checkouts and
+       normal wheel installs (both unpack cook.py and stages/ side by side
+       in site-packages), regardless of the caller's cwd.
+    2. importlib.resources on the stages.<stage> package — covers exotic
+       install layouts where the package is not a plain directory next to
+       cook.py.
+
+    A miss is an installation problem (pip install --force-reinstall
+    video-cook), so it dies with that remedy rather than falling back to
+    any installed-skill location.
+    """
+    rel = Path("stages") / stage / script
+    here = Path(__file__).resolve().parent / rel
+    if here.is_file():
+        return here
+    try:
+        from importlib.resources import files
+        candidate = Path(str(files(f"stages.{stage}"))) / script
+        if candidate.is_file():
+            return candidate
+    except (ModuleNotFoundError, TypeError, FileNotFoundError):
+        pass
+    _die(
+        f"stage script missing from the video-cook installation: {rel}. "
+        "The scripts ship inside the cook package — no skill install is "
+        "needed or consulted. Reinstall: pip install --force-reinstall "
+        "video-cook.",
+        obj={"stage": stage, "script": script},
+    )
+
+
 def _import_subtitles_module():
-    """Import the subtitles module from video-subtitle skill scripts, or
-    fall back to a vendored copy. The module has zero third-party deps
-    (only stdlib re/argparse/sys), so either path works."""
-    # try the skill install location first
-    candidates = [
-        Path.home() / ".agents" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-        Path.home() / ".zcode" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-        Path.home() / ".claude" / "skills" / "video-subtitle" / "scripts" / "subtitles.py",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("subtitles", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
-    _die("subtitles.py not found. Install video-subtitle skill, or vendor it.")
+    """Import the packaged subtitles module (stages/subtitle/subtitles.py).
+
+    The module has zero third-party deps (only stdlib re/argparse/sys), so
+    in-process loading via importlib works everywhere cook itself runs."""
+    path = _stage_script("subtitle", "subtitles.py")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cook_stages_subtitle", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _run_subs(mod, argv: list[str]) -> None:
-    """Invoke the subtitles module's main with a synthetic argv."""
+    """Invoke the subtitles module's main with a synthetic argv.
+
+    The stage script prints human-readable progress lines ([shorten] ...,
+    [biliteral] ...) to ITS stdout. cook's contract is a pure-JSON stdout,
+    so those lines are re-routed to stderr while the module runs."""
+    import contextlib
     old = sys.argv
     sys.argv = ["subtitles.py"] + argv
     try:
-        mod.main()
+        with contextlib.redirect_stdout(sys.stderr):
+            mod.main()
     finally:
         sys.argv = old
 

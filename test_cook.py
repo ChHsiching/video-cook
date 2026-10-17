@@ -984,3 +984,170 @@ class TestQualityGuardR2:
         src = Path(cook.__file__).read_text(encoding="utf-8")
         assert "args.quality < 120" in src            # early sanity guard
         assert "args.quality + 1" in src              # post-download compare
+
+
+# ----------------------------------------------------------------------------
+# Stage-script resolution: cook must find its stage scripts inside its own
+# distribution (stages/<stage>/), never in an installed skill copy. This is
+# the reflux 2026-10 consolidation (ticket 01) — the installed-skill lookup
+# caused version skew between cook and the scripts it drove.
+# ----------------------------------------------------------------------------
+
+class TestStageScriptResolution:
+    def test_resolves_subtitle_scripts_inside_the_repo(self):
+        p = cook._stage_script("subtitle", "subtitles.py")
+        assert p.is_file()
+        assert p.name == "subtitles.py"
+        assert "stages" in p.parts and "subtitle" in p.parts
+
+    def test_all_four_subtitle_scripts_resolve(self):
+        for name in ("subtitles.py", "make_full_srt.py",
+                     "make_zh.py", "transcribe.py"):
+            assert cook._stage_script("subtitle", name).is_file(), name
+
+    def test_resolution_ignores_installed_skills(self, tmp_path, monkeypatch):
+        """No lookup may fall back to ~/.agents|~/.zcode|~/.claude skills —
+        otherwise a stale installed copy silently shadows the packaged one
+        (the version-skew bug this consolidation fixes). Point home at an
+        empty dir: resolution must still succeed."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert cook._stage_script("subtitle", "subtitles.py").is_file()
+
+    def test_missing_script_dies_with_clear_error(self, capsys):
+        with pytest.raises(SystemExit) as ei:
+            cook._stage_script("subtitle", "nope.py")
+        assert ei.value.code == 1
+        err = capsys.readouterr().err
+        # the message names what is missing and where it should come from
+        assert "stages" in err and "nope.py" in err
+        assert "video-cook" in err          # names the distribution to reinstall
+
+
+# ----------------------------------------------------------------------------
+# cook subtitles end-to-end: with the stage scripts packaged inside the
+# distribution, the full pipeline (shorten -> merge-short -> biliteral ->
+# ass -> cloud-srt) must run with NO installed skill anywhere. Home is
+# pointed at an empty dir so any installed-skill fallback would fail loudly
+# instead of silently shadowing the packaged module.
+# ----------------------------------------------------------------------------
+
+class TestSubtitlesPipelineEndToEnd:
+    def _setup_video(self, tmp_path: Path) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "vid.en.srt", [
+            (1, "00:00:01,000 --> 00:00:03,000", "Hello world from line one."),
+            (2, "00:00:03,000 --> 00:00:05,000", "Second cue right here."),
+        ])
+        _make_srt(root / "transcript" / "vid.zh.srt", [
+            (1, "00:00:01,000 --> 00:00:03,000", "第一句中文"),
+            (2, "00:00:03,000 --> 00:00:05,000", "第二句中文"),
+        ])
+        return root
+
+    def _run(self, root: Path, monkeypatch) -> dict:
+        monkeypatch.setattr(Path, "home", lambda: root / "no-skill-home")
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "mode": "bottom-bar", "bar_px": 220})()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_subtitles(args)
+        return json.loads(buf.getvalue())
+
+    def test_full_pipeline_without_any_installed_skill(self, tmp_path, monkeypatch):
+        root = self._setup_video(tmp_path)
+        report = self._run(root, monkeypatch)
+        assert report["ok"] is True
+        assert report["length_issues"] == []
+
+        # products exist
+        bilingual = root / "subtitle" / "vid.bilingual.srt"
+        assert bilingual.is_file()
+        assert (root / "subtitle" / "vid.bilingual.ass").is_file()
+        assert (root / "subtitle" / "vid.bilingual.bar.ass").is_file()
+
+        # pairwise merge: 2 en cues + 2 zh cues -> 2 bilingual cues, zh on top
+        text = bilingual.read_text(encoding="utf-8")
+        assert "第一句中文\nHello world from line one." in text
+        assert "第二句中文\nSecond cue right here." in text
+
+        # cloud-srt is a byte-identical copy of the per-language merged SRTs
+        zh_merged = root / "transcript" / "vid.zh.merged.srt"
+        en_merged = root / "transcript" / "vid.en.merged.srt"
+        assert (root / "cloud-srt" / "zh.srt").read_bytes() == zh_merged.read_bytes()
+        assert (root / "cloud-srt" / "en.srt").read_bytes() == en_merged.read_bytes()
+
+        # the ASS carries the bottom-bar geometry the burn must match
+        ass = (root / "subtitle" / "vid.bilingual.bar.ass").read_text(encoding="utf-8")
+        assert "PlayResY: 1300" in ass  # 1080 + 220 bar
+
+    def test_uses_packaged_module_not_any_installed_skill(self, tmp_path, monkeypatch):
+        """Even with a decoy subtitles.py planted in the old skill locations,
+        cook must import the packaged copy (proves the module identity, not
+        just that some subtitles.py ran)."""
+        decoy = tmp_path / "home" / ".agents" / "skills" / "video-subtitle" / "scripts"
+        decoy.mkdir(parents=True)
+        (decoy / "subtitles.py").write_text("raise RuntimeError('decoy skill ran')\n",
+                                            encoding="utf-8")
+        root = self._setup_video(tmp_path)
+        report = self._run(root, monkeypatch)
+        assert report["ok"] is True  # ran the packaged module; decoy never executed
+
+
+# ----------------------------------------------------------------------------
+# cook transcribe: the inner whisperX invocation must run the packaged
+# stages/subtitle/transcribe.py via sys.executable — not an inline script
+# string (the pre-consolidation duplication) and not any installed skill.
+# ----------------------------------------------------------------------------
+
+class TestTranscribeUsesPackagedScript:
+    def _run(self, tmp_path: Path, monkeypatch) -> tuple[list, dict]:
+        root = tmp_path / "vid"
+        wav = root / "transcript" / "vid.audio.wav"
+        wav.parent.mkdir(parents=True)
+        wav.write_bytes(b"RIFF fake wav")
+
+        captured: dict = {}
+
+        def fake_run(cmd, cwd, log_file, err_file, detach=False):
+            captured["cmd"] = cmd
+            return {"ok": True, "detached": False, "returncode": 0}
+
+        monkeypatch.setattr(cook, "_run_long_task", fake_run)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        args = type("A", (), {"output_root": str(root), "name": "vid",
+                              "model": "large-v3", "compute": "auto",
+                              "language": "en", "detach": False})()
+        with contextlib.redirect_stdout(buf):
+            cook.cmd_transcribe(args)
+        return captured["cmd"], json.loads(buf.getvalue())
+
+    def test_inner_cmd_runs_packaged_transcribe_py(self, tmp_path, monkeypatch):
+        cmd, report = self._run(tmp_path, monkeypatch)
+        assert report["ok"] is True
+        # [python, <packaged transcribe.py>, wav, srt, model, compute, language, device]
+        assert cmd[0] == sys.executable
+        script = Path(cmd[1])
+        assert script.is_file()
+        assert script.name == "transcribe.py"
+        assert "stages" in script.parts and "subtitle" in script.parts
+        # transcribe.py positional contract: <input> <output.srt> [model]
+        # [compute_type] [language] [device]
+        root = tmp_path / "vid"
+        assert cmd[2] == str(root / "transcript" / "vid.audio.wav")
+        assert cmd[3] == str(root / "transcript" / "vid.en.srt")
+        assert cmd[4] == "large-v3"
+        assert cmd[7] in ("cpu", "cuda")
+        # compute/device pairing stays consistent with what cook reports
+        assert cmd[5] == report["compute"]
+        assert cmd[6] == report["language"]
+        assert cmd[7] == report["device"]
+
+    def test_packaged_script_has_same_done_marker(self):
+        """cook reports done_marker='[transcribe] done.' for pollers; the
+        packaged script must actually print that literal."""
+        src = cook._stage_script("subtitle", "transcribe.py").read_text(encoding="utf-8")
+        assert '[transcribe] done.' in src

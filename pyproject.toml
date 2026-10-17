@@ -40,7 +40,11 @@ Homepage = "https://github.com/ChHsiching/video-cook"
 Repository = "https://github.com/ChHsiching/video-cook"
 
 [tool.setuptools]
+# cook.py stays a top-level module; the stage scripts it drives ship as the
+# stages/ package (resolved by cook._stage_script — see docs/adr/). Dub-side
+# scripts join stages/dub in a later ticket.
 py-modules = ["cook"]
+packages = ["stages", "stages.subtitle"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
