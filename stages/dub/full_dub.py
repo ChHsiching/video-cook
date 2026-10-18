@@ -752,6 +752,14 @@ def _cli_main(argv: list[str]) -> None:
     """Argv dispatch, extracted from the __main__ block so it is testable
     in-process. Stages: synth / synth-worker / assemble / full."""
     if len(argv) < 3:
+        # __doc__ contains typographic arrows; Windows CI consoles run
+        # cp1252 and print() would die with UnicodeEncodeError before the
+        # usage text ever reaches the reader. Force utf-8 with replace.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
         print(__doc__)
         sys.exit(1)
     cmd = argv[0]
