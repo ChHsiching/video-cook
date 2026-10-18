@@ -17,7 +17,7 @@ rate`), which loads it in-process (soundfile/numpy are the only deps, both
 importable by cook's own python, unlike the indextts venv stages).
 
 Char counting is len() of the stripped line, punctuation INCLUDED — the
-counting the 2026-10 reflux run's budget math used (预算 = 实测率 × 窗口)
+counting the 2026-10 reflux run's budget math used (预算 = 实测率 x 窗口)
 and the convention the calibration below is anchored to. Note this is
 deliberately NOT length_gate.syllables: the gate plans durations from
 syllable counts, this command counts script characters. If ticket 05 wires
@@ -25,7 +25,7 @@ the measured rate into the gate, convert units there, not here.
 
 Calibration: FRAME_MS=30, FLOOR_DB=-50 reproduce the reflux run's hand
 measurement on the accepted leerob take set — 361 takes measure 6.931
-chars/s against the hand-measured 6.93 (band ±0.1). Changing either
+chars/s against the hand-measured 6.93 (band +/-0.1). Changing either
 constant shifts that number; re-validate against real takes before
 changing them.
 """
@@ -38,7 +38,7 @@ from pathlib import Path
 # letting attack ramps read as silence.
 FRAME_MS = 30
 # RMS floor in dBFS: frames strictly above this count as voiced. Clean TTS
-# output has digital silence (0 → -inf dB) before/after the speech, so any
+# output has digital silence (0 -> -inf dB) before/after the speech, so any
 # floor in the -40..-55 band separates speech from padding; -50 is the
 # calibrated value (see module docstring).
 FLOOR_DB = -50.0

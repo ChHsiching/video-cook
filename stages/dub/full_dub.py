@@ -1,9 +1,9 @@
-"""Chinese-dub pipeline: IndexTTS2 synthesis → identity-timeline assembly.
+"""Chinese-dub pipeline: IndexTTS2 synthesis -> identity-timeline assembly.
 
 The video is NEVER re-timed: every frame keeps its original timestamp and the
 dubbed release has exactly the raw video's duration. Each cue's synthesized
 audio is placed at its original start; audio that runs past its window (cue
-start → next cue's start) is compressed with atempo, but audio shorter than
+start -> next cue's start) is compressed with atempo, but audio shorter than
 its window is NEVER stretched — it keeps its natural pace and the window gets
 a breathing pause (a 44%-stretch round shipped and was rejected on the spot
 as "robotic"; see SKILL.md Step 5). Long cues (>= CHUNK_ON chars) are
@@ -752,9 +752,10 @@ def _cli_main(argv: list[str]) -> None:
     """Argv dispatch, extracted from the __main__ block so it is testable
     in-process. Stages: synth / synth-worker / assemble / full."""
     if len(argv) < 3:
-        # __doc__ contains typographic arrows; Windows CI consoles run
-        # cp1252 and print() would die with UnicodeEncodeError before the
-        # usage text ever reaches the reader. Force utf-8 with replace.
+        # Help text must print on any console codepage. Windows consoles
+        # default to cp1252 and die on non-ASCII (this pipeline prints
+        # Chinese video names in error messages too). Keep decorative
+        # symbols out of __doc__; this guard is for real domain text.
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")

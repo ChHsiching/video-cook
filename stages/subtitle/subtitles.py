@@ -42,7 +42,7 @@ Commands:
 Length control is the whole point of `shorten` and the reason this file
 exists as one module: long cues get rejected by platforms (Bilibili's limit
 is ~45 Chinese chars / ~90 ASCII per cue), and whisperX occasionally emits
-one cue spanning several sentences. `shorten` fixes both: split on 。！？；／.!?;,
+one cue spanning several sentences. `shorten` fixes both: split on 。！？；/.!?;,
 then hard-wrap at commas when a fragment still exceeds the limit.
 
 Sub-clauses that STILL exceed the limit after the punctuation ladder

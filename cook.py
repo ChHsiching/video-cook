@@ -534,7 +534,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     with yt_dlp.YoutubeDL(dl_opts) as ydl:
         ydl.download([url])
 
-    # --- Phase 4: fix thumbnail name + handle webp→jpg fallback ---
+    # --- Phase 4: fix thumbnail name + handle webp->jpg fallback ---
     # yt-dlp may leave the thumbnail as <name>.raw.jpg OR <name>.raw.webp
     # (convert_thumbnails:jpg sometimes fails on newer yt-dlp). Promote either
     # to <name>.jpg, converting via ffmpeg if only webp is present.
@@ -1189,7 +1189,7 @@ def _count_dub_cues(root: Path) -> int:
 # ----------------------------------------------------------------------------
 
 def _dub_prereqs() -> dict:
-    """Return the stage → prerequisites mapping. Built fresh each call so the
+    """Return the stage -> prerequisites mapping. Built fresh each call so the
     paths derive from the (resolved) video root passed to the check."""
     return {
         "synth": [
@@ -1651,7 +1651,7 @@ def _dp_align(en_cues: list[tuple[str, str]],
             tok_score = 0.3  # one-sided: weak signal
         # position-proximity bonus (secondary signal, matters when tokens absent)
         # reward when trans line index is close to its "expected" position
-        # (i.e., zi ≈ ei when counts are similar)
+        # (i.e., zi ~ ei when counts are similar)
         if NE > 0 and NZ > 0:
             expected_z = ei * NZ / NE
             dist = abs(zi - expected_z)
@@ -1874,7 +1874,7 @@ def _move_separated_stems(sep_root: Path, model: str, stem_name: str,
 def cmd_dub_separate(args: argparse.Namespace) -> None:
     """Separate vocals from the raw video via Demucs. Foreground by default;
     --detach opts out for long
-    videos (Demucs on CPU is ~1.5× audio duration). Produces vocals.wav +
+    videos (Demucs on CPU is ~1.5x audio duration). Produces vocals.wav +
     no_vocals.wav under dubbed/."""
     root = _video_dir(args.output_root)
     raw_mp4 = _raw(root, args.name, ".raw.mp4")
@@ -2023,7 +2023,7 @@ def cmd_dub_verify(args: argparse.Namespace) -> None:
 # dub subcommands: synth / assemble / full
 # Thin wrappers over the package-internal stages/dub/full_dub.py — launched
 # as a subprocess (under --python, so the indextts/demucs venv can supply
-# the heavy deps). Same calling convention as cmd_subtitles → subtitles.py.
+# the heavy deps). Same calling convention as cmd_subtitles -> subtitles.py.
 # ----------------------------------------------------------------------------
 
 def cmd_dub_synth(args: argparse.Namespace) -> None:
@@ -2046,7 +2046,7 @@ def cmd_dub_synth(args: argparse.Namespace) -> None:
 
 
 def cmd_dub_assemble(args: argparse.Namespace) -> None:
-    """Stage 2: identity-timeline assembly → cooked/<name>.dubbed.mp4.
+    """Stage 2: identity-timeline assembly -> cooked/<name>.dubbed.mp4.
     The video is never re-timed (the dubbed release has exactly the raw
     duration): audio over its window is compressed to fit, audio shorter
     keeps its natural pace (never stretched);
@@ -2106,7 +2106,7 @@ def cmd_dub_assemble(args: argparse.Namespace) -> None:
 
 
 def cmd_dub_full(args: argparse.Namespace) -> None:
-    """Run both stages in sequence: synth → assemble.
+    """Run both stages in sequence: synth -> assemble.
     Use for a fresh run; resume by running individual stages (cache-aware).
     synth is the long CPU-bound stage; the assemble encode is the other slow one.
     --detach is rejected here: a detached synth returns immediately, and the
@@ -2534,7 +2534,7 @@ def cmd_dub_gate(args: argparse.Namespace) -> None:
 
     Everything downstream — per-cue budget factor and total coverage — is
     computed as est = count_chars(line)/rate, the reflux budget math
-    (预算 = 实测率 × 窗口) inverted, in the same char convention the rate
+    (预算 = 实测率 x 窗口) inverted, in the same char convention the rate
     was calibrated in."""
     import math
 
@@ -2700,7 +2700,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub_sub = pdub.add_subparsers(dest="dub_cmd", required=True)
 
     pds = dub_sub.add_parser("separate",
-                             help="Demucs vocal separation → dubbed/{vocals,no_vocals}.wav")
+                             help="Demucs vocal separation -> dubbed/{vocals,no_vocals}.wav")
     pds.add_argument("output_root")
     pds.add_argument("name")
     pds.add_argument("--model", default="htdemucs",
@@ -2739,7 +2739,7 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="run detached. Default is foreground (see transcribe --detach).")
 
     pdsyn = dub_sub.add_parser("synth",
-                               help="Stage 1: IndexTTS2 synthesis → dubbed/_full/_segments/")
+                               help="Stage 1: IndexTTS2 synthesis -> dubbed/_full/_segments/")
     _add_dub_common(pdsyn, with_detach=True)
     pdsyn.add_argument("--workers", type=int, default=1, metavar="N",
                        help="N > 1 spawns N-1 band workers (descending cue order, "
@@ -2753,7 +2753,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pdas = dub_sub.add_parser("assemble",
                               help="Stage 2: identity assembly (video never "
-                                   "re-timed, auto-retime ON by default) → "
+                                   "re-timed, auto-retime ON by default) -> "
                                    "cooked/<name>.dubbed.mp4")
     _add_dub_common(pdas, with_detach=True)
     pdas.add_argument("--keep-subs", dest="keep_subs", action="store_true",
@@ -2769,7 +2769,7 @@ def build_parser() -> argparse.ArgumentParser:
     pdas.set_defaults(func=cmd_dub_assemble)
 
     pdfl = dub_sub.add_parser("full",
-                              help="Run both stages: synth → assemble")
+                              help="Run both stages: synth -> assemble")
     _add_dub_common(pdfl, with_detach=True)
     pdfl.set_defaults(func=cmd_dub_full)
 

@@ -298,7 +298,7 @@ class TestVerifyShipment:
 
     def test_dubbed_short_flagged_when_dubbed_under_half_raw(self, tmp_path: Path,
                                                              monkeypatch):
-        """Dubbed video duration < 0.5 * raw → issue naming both durations."""
+        """Dubbed video duration < 0.5 * raw -> issue naming both durations."""
         root = tmp_path / "author" / "video"
         n = "video"
         self._stage_full_cooked_set(root, n)
@@ -306,7 +306,7 @@ class TestVerifyShipment:
         self._touch(root / "cooked" / f"{n}.dubbed.mp4")
 
         # Drive the ffprobe helper: raw=732.0, cooked=732.0 (so the cooked
-        # mismatch check does NOT fire), dubbed=185.0 (short → fires).
+        # mismatch check does NOT fire), dubbed=185.0 (short -> fires).
         durations = {
             str(root / "raw" / f"{n}.raw.mp4"): 732.0,
             str(root / "cooked" / f"{n}.cooked.mp4"): 732.0,
@@ -325,7 +325,7 @@ class TestVerifyShipment:
         assert self.last_exit == 1
 
     def test_dubbed_short_not_flagged_when_healthy(self, tmp_path: Path, monkeypatch):
-        """Dubbed duration >= 0.5 * raw → no short issue, ok unchanged."""
+        """Dubbed duration >= 0.5 * raw -> no short issue, ok unchanged."""
         root = tmp_path / "author" / "video"
         n = "video"
         self._stage_full_cooked_set(root, n)
@@ -345,7 +345,7 @@ class TestVerifyShipment:
 
     def test_dubbed_short_not_flagged_when_no_dubbed_file(self, tmp_path: Path,
                                                           monkeypatch):
-        """No dubbed.mp4 → check does not run (non-dubbed shipments unaffected)."""
+        """No dubbed.mp4 -> check does not run (non-dubbed shipments unaffected)."""
         root = tmp_path / "author" / "video"
         n = "video"
         self._stage_full_cooked_set(root, n)
@@ -363,7 +363,7 @@ class TestVerifyShipment:
 
     def test_dubbed_short_not_flagged_when_raw_duration_zero(self, tmp_path: Path,
                                                              monkeypatch):
-        """Dubbed exists but raw probes to non-positive → check skipped."""
+        """Dubbed exists but raw probes to non-positive -> check skipped."""
         root = tmp_path / "author" / "video"
         n = "video"
         self._stage_full_cooked_set(root, n)
@@ -924,7 +924,7 @@ class TestBurnBarPxAssGeometry:
         monkeypatch.setattr(cook, "_run_long_task", fake_run)
 
     def test_warns_on_bar_px_mismatch(self, tmp_path: Path, monkeypatch):
-        """bar ASS PlayResY != 1080 + bar_px → warning naming both values."""
+        """bar ASS PlayResY != 1080 + bar_px -> warning naming both values."""
         root = tmp_path / "vid"
         # ASS built for 1080+200=1280, but burn --bar-px 220 (expects 1300)
         self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1280)
@@ -936,7 +936,7 @@ class TestBurnBarPxAssGeometry:
         assert report is None or report.get("ok") is True or self.last_exit == 0
 
     def test_no_warning_when_playresy_matches(self, tmp_path: Path, monkeypatch):
-        """PlayResY == 1080 + bar_px → no warning, burn proceeds."""
+        """PlayResY == 1080 + bar_px -> no warning, burn proceeds."""
         root = tmp_path / "vid"
         self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)  # 1080+220
         self._stub_ffmpeg(monkeypatch)
@@ -3768,7 +3768,7 @@ class TestCookAssembleRetimeSurface:
 # dub gate (ticket 05): the length gate, wired into the cook command surface
 # and driven by the MEASURED speech rate — never an assumed one. The public
 # seam is cmd_dub_gate (argv: output_root/name/--rate/--self-measure/--json).
-# Hand-worked fixtures: budgets are cue start → next cue start (identity
+# Hand-worked fixtures: budgets are cue start -> next cue start (identity
 # clock); est_s = count_chars(line)/rate (the reflux budget math inverted).
 # ----------------------------------------------------------------------------
 
@@ -3840,10 +3840,10 @@ class TestDubGateRateRequired:
 class TestDubGateVerdict:
     """The three gate criteria, all computed from the passed rate:
     est_s = count_chars(line)/rate (punctuation counted — the rate's unit).
-    Hand-worked fixture: budgets 4.5/6.0/4.0 (=14.5 total; cue start → next
-    cue start), rate 5.0, chars 20/24/22 → est 4.0/4.8/4.4 (=13.2),
+    Hand-worked fixture: budgets 4.5/6.0/4.0 (=14.5 total; cue start -> next
+    cue start), rate 5.0, chars 20/24/22 -> est 4.0/4.8/4.4 (=13.2),
     factors 0.89/0.80/1.10, coverage 13.2/14.5 = 91.0% PASS. The OLD
-    syllable-bucket algorithm would estimate 4.76/5.24/5.00 → 103.4% — so
+    syllable-bucket algorithm would estimate 4.76/5.24/5.00 -> 103.4% — so
     these assertions pin the chars/rate math, not a compatible overlap."""
 
     CUES = [("00:00:00,000", "00:00:04,000"),
@@ -3892,8 +3892,8 @@ class TestDubGateVerdict:
 
     def test_fail_path_lists_short_over_and_thin_coverage(self, tmp_path):
         """Hand-worked FAIL fixture: cue1 budget 10.5s with a 4-char line
-        (3 sylls → short, est 0.8s vs 10.5s → deep under), cue2 budget 0.5s
-        with a 30-char line (est 6.0s → factor 12x over). Totals 6.8/11.0 =
+        (3 sylls -> short, est 0.8s vs 10.5s -> deep under), cue2 budget 0.5s
+        with a 30-char line (est 6.0s -> factor 12x over). Totals 6.8/11.0 =
         61.8% coverage — out of band. Exit 1 with all three findings."""
         root = _make_gate_inputs(
             tmp_path,
@@ -3916,7 +3916,7 @@ class TestDubGateVerdict:
     def test_under_budget_alone_is_advisory_pass(self, tmp_path):
         """Under-budget lines alone do not fail the gate (the assembler pads
         the shortfall) — verdict pass, advisory_under flagged, exit 0.
-        Fixture: budget1 3.8s/9 chars (est 1.8s, factor 0.47 → under),
+        Fixture: budget1 3.8s/9 chars (est 1.8s, factor 0.47 -> under),
         budget2 6.0s/36 chars (est 7.2s, factor 1.2); coverage 9.0/9.8 =
         91.8% in band."""
         root = _make_gate_inputs(
@@ -3961,9 +3961,9 @@ class TestDubGateSelfMeasure:
         return report, text_out, code
 
     def _run_with_segments(self, tmp_path):
-        """2 takes of 2.0 s voiced speech for 10-char lines → measured rate
-        20 chars / 4.0 s = 5.0 chars/s. Cue budgets 2.4/2.0 → est 2.0/2.0,
-        coverage 4.0/4.4 = 90.9% → PASS by the measured rate."""
+        """2 takes of 2.0 s voiced speech for 10-char lines -> measured rate
+        20 chars / 4.0 s = 5.0 chars/s. Cue budgets 2.4/2.0 -> est 2.0/2.0,
+        coverage 4.0/4.4 = 90.9% -> PASS by the measured rate."""
         pytest.importorskip("soundfile")
         root = _make_gate_inputs(
             tmp_path,

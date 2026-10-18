@@ -47,15 +47,15 @@ ffmpeg and Node.js must be on PATH separately (cook can't pip-install those).
 | `cook download <url>` | yt-dlp download + cookie negotiation + thumbnail rename + ffprobe verify | video-download Steps 1-3 |
 | `cook extract <root> <name>` | ffmpeg 16kHz mono WAV extraction | video-subtitle Step 1 |
 | `cook transcribe <root> <name>` | whisperX transcription, auto-detects CUDA, foreground by default (`--detach` opts out) | video-subtitle Step 2 |
-| `cook subtitles <root> <name>` | shorten → merge-short → biliteral → ASS + cloud-srt in one shot | video-subtitle Step 4 + cloud-srt |
+| `cook subtitles <root> <name>` | shorten -> merge-short -> biliteral -> ASS + cloud-srt in one shot | video-subtitle Step 4 + cloud-srt |
 | `cook burn <root> <name>` | ffmpeg subtitle burning, foreground by default (`--detach` opts out), subprocess list-form | video-subtitle Step 5 |
 | `cook cover <root> <name>` | Place `cover.jpg` in `cooked/` (reuses raw thumbnail) | video-subtitle Step 6 cover task |
 | `cook show-source <root> <name>` | Extract key fields (title/uploader/links/description) from source.json | (new — surfaces the source context for translation + upload metadata) |
 | `cook verify-align <root> <name>` | DP-align `en.srt` vs `translations.txt`, catch missing/drifted translations | (new — no prior equivalent) |
 | `cook verify-shipment <root> <name>` | Check the full release set exists; exit 0 = ready to ship | (new — no prior equivalent) |
 | `cook dub <stage> <root> <name> --python <venv>` | Dub stages under the IndexTTS2 venv: `separate` (Demucs vocal split), `verify` (dub shipment check), or `full` (synth + assemble in sequence) | video-dubbing Steps 1-7 |
-| `cook dub synth <root> <name> --python <venv>` | Stage 1: IndexTTS2 synthesis → `dubbed/_full/_segments/` (supervisor scans all cues ascending; skip-if-exists resumes). `--workers N` spawns N-1 band workers (descending cue order, evenly split bands) beside the unchanged supervisor; `--stagger S` spaces each worker's model load by k*S seconds (IO-thrash guard). Concurrent writers of the same cue publish atomically — no interleaved/corrupt `sent_NNNN.wav` | video-dubbing Step 4 |
-| `cook dub assemble <root> <name> --python <venv>` | Stage 2: identity-timeline assembly (video never re-timed) → `cooked/<name>.dubbed.mp4`; subtitle retime runs by default (ADR 0002), `--no-retime` keeps the old proportional-split starts; `--keep-subs` reuses hand-edited subtitle files in `dubbed/_full/` | video-dubbing Steps 5-7 |
+| `cook dub synth <root> <name> --python <venv>` | Stage 1: IndexTTS2 synthesis -> `dubbed/_full/_segments/` (supervisor scans all cues ascending; skip-if-exists resumes). `--workers N` spawns N-1 band workers (descending cue order, evenly split bands) beside the unchanged supervisor; `--stagger S` spaces each worker's model load by k*S seconds (IO-thrash guard). Concurrent writers of the same cue publish atomically — no interleaved/corrupt `sent_NNNN.wav` | video-dubbing Step 4 |
+| `cook dub assemble <root> <name> --python <venv>` | Stage 2: identity-timeline assembly (video never re-timed) -> `cooked/<name>.dubbed.mp4`; subtitle retime runs by default (ADR 0002), `--no-retime` keeps the old proportional-split starts; `--keep-subs` reuses hand-edited subtitle files in `dubbed/_full/` | video-dubbing Steps 5-7 |
 | `cook dub retime <root> <name> --python <venv>` | Rewrite `dubbing.bilingual.srt` starts onto the dubbed speech's real word times (faster-whisper word timestamps on the clean per-cue pad wavs); backs up the original as `.pre_retime` | (new — the ear-gate retime pass, also run inside assemble) |
 | `cook dub measure-rate [--wav f.wav --text "…" \| --from-segments ROOT NAME]` | Measure the REAL speech rate (chars per voiced second) of an audition take or a whole synthesized run via energy VAD; `--json` for the machine-readable report | (new — measured, not assumed) |
 | `cook dub gate <root> <name> --rate CHARS_PER_SEC` | Pre-synth length gate on `translations_dub.txt` computed against the MEASURED rate — refuses to run without one (`--rate` from `cook dub measure-rate`, or `--self-measure` from synth's own takes); `--json` for the machine-readable verdict | (new — refuses assumed rates) |
@@ -75,7 +75,7 @@ cook is the deterministic executor for the [video-cooking](https://github.com/Ch
 | Thumbnail came out as `<name>.raw.jpg` not `<name>.jpg` | cook renames it after download |
 | Windows `C:` paths broke ffmpeg `ass` filter | cook uses subprocess list-form (never shell), runs from subtitle/ dir with bare filename |
 | `subtitles.py split` leaked single-language cues across zh.srt/en.srt | cook copies `*.merged.srt` to cloud-srt instead of splitting bilingual.srt |
-| `transcribe.py` hardcoded `device="cpu"`, float16 unusable on GPU | cook auto-detects CUDA → float16+cuda, else float32+cpu |
+| `transcribe.py` hardcoded `device="cpu"`, float16 unusable on GPU | cook auto-detects CUDA -> float16+cuda, else float32+cpu |
 | `source.json` downloaded but never read by downstream — author/links/description wasted | `cook show-source` surfaces the curated fields translation and upload metadata consume |
 | detached template only covered transcribe, not burn | cook's `_detach()` helper handles both uniformly |
 | No mechanical way to catch translation drift | `cook verify-align` runs DP global alignment |
