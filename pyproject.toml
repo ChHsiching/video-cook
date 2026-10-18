@@ -40,7 +40,7 @@ subtitle = ["jieba>=0.42"]
 # with a pip install hint.
 dub = ["numpy", "soundfile"]
 all = ["yt-dlp>=2026.3.3", "whisperx>=3.8.0", "jieba>=0.42", "numpy", "soundfile"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "numpy", "soundfile", "jieba>=0.42"]
 
 [project.scripts]
 cook = "cook:main"
