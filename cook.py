@@ -224,6 +224,29 @@ def _ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+def _probe_frame_height(video: Path) -> int | None:
+    """Return the video stream's frame height, or None when ffprobe is
+    missing or doesn't answer a clean WxH (the caller falls back to the
+    1080p assumption). Same ffprobe call shape as full_dub's _probe_wh; used
+    by cmd_burn's bar-px geometry check to scale the expected PlayResY to
+    the actual frame (a hardcoded 1080p expectation false-warned on 4K)."""
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=p=0:s=x", str(video)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return None
+        _w, h = r.stdout.strip().split("x")
+        return int(h)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return None
+
+
 def _measure_rms_db(path: Path) -> float:
     """Return the overall RMS level of an audio file in dB. Used by dub mix
     to detect whether no_vocals.wav actually contains BGM (RMS > -50dB) or
@@ -1439,27 +1462,34 @@ def cmd_burn(args: argparse.Namespace) -> None:
     if not ass.exists():
         _die(f"ASS not found: {ass}. Run 'cook subtitles' first.")
 
-    # Bar-px geometry check (bottom-bar only): the bar ASS's PlayResY is the
-    # frame height plus the bar height it was built for (1080 + bar-px). If the
-    # burn --bar-px differs from what the ASS was generated against, subtitles
-    # will be positioned for a strip of a different size than the one actually
-    # drawn. Warn only — don't error — so the operator can decide.
+    # Bar-px geometry check (bottom-bar only). Geometry model (same as
+    # full_dub step 2d): the bar ASS's coordinate system is 1920 x
+    # (1080 + bar_play) and libass scales it per-axis onto the padded frame,
+    # so a geometrically correct build has y-scale H/1080 — the real pad of
+    # bar_px pixels equals round(bar_px * 1080 / H) in ASS units. The
+    # expected PlayResY is therefore 1080 + that, with H probed from the
+    # actual raw video (the old check hardcoded H=1080 and false-warned on
+    # every non-1080p source, e.g. 4K burns of a dub-pipeline ASS). A probe
+    # failure falls back to the 1080p assumption. Warn only — don't error —
+    # so the operator can decide.
     #
     # Skipped in overlay mode (no bar geometry) and when the bar ASS is absent
-    # (the clearer existence error above takes precedence). The expected-PlayResY
-    # derivation assumes the standard 1080p frame height; supporting other frame
-    # heights would require deriving the frame height from the actual video and
-    # is intentionally out of scope for this change.
+    # (the clearer existence error above takes precedence).
     if args.mode == "bottom-bar":
         ass_play_res_y = _read_ass_playresy(ass)
         if ass_play_res_y is not None:
-            expected = 1080 + args.bar_px
+            frame_h = _probe_frame_height(raw_mp4)
+            if frame_h is None:
+                frame_h = 1080  # probe failed; legacy 1080p assumption
+            bar_play = round(args.bar_px * 1080 / frame_h)
+            expected = 1080 + bar_play
             if ass_play_res_y != expected:
                 _log(
                     f"cook burn: WARN bar-px geometry mismatch — "
                     f"ASS PlayResY={ass_play_res_y} but burn expects {expected} "
-                    f"(1080 + bar-px={args.bar_px}). Subtitles may be mispositioned. "
-                    f"Rerun 'cook subtitles --bar-px {args.bar_px}'."
+                    f"(frame {frame_h}p: bar-px {args.bar_px}px is {bar_play} in "
+                    f"ASS units, 1080 + {bar_play}). Subtitles may be "
+                    f"mispositioned. Rerun 'cook subtitles --bar-px {bar_play}'."
                 )
 
     cmd = [

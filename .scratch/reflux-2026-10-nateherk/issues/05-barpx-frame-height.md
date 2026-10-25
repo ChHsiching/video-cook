@@ -4,6 +4,6 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 非 1080p 源在几何正确时零警告；几何真错时仍警告
+- [x] 非 1080p 源在几何正确时零警告；几何真错时仍警告

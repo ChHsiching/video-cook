@@ -865,9 +865,19 @@ Dialogue: 0,0:00:00,0:00:02,Default,,0,0,0,,hello
 
 class TestBurnBarPxAssGeometry:
     """When burn runs in bottom-bar mode and the bar ASS exists, read its
-    PlayResY (which for a bar build equals frame_height + bar_px) and warn
-    when it differs from 1080 + args.bar_px. Overlay mode and missing-ASS
+    PlayResY and warn when it differs from the expectation derived from the
+    probed frame height. Geometry model (same as full_dub step 2d): the ASS
+    coordinate system is 1920 x (1080 + bar_play) and libass scales it
+    per-axis onto the padded frame, so a correct build has y-scale H/1080 —
+    a real pad of bar_px pixels equals round(bar_px * 1080 / H) in ASS units
+    and the expected PlayResY is 1080 + that. A probe failure falls back to
+    the 1080p assumption (the legacy behavior). Overlay mode and missing-ASS
     skip the check entirely."""
+
+    def _stub_probe(self, monkeypatch, frame_h):
+        """Pin the probed frame height so the geometry check sees the frame
+        we want without a real ffprobe run."""
+        monkeypatch.setattr(cook, "_probe_frame_height", lambda video: frame_h)
 
     def _run_burn(self, root: Path, mode: str = "bottom-bar", bar_px: int = 220,
                   detach: bool = False):
@@ -967,6 +977,83 @@ class TestBurnBarPxAssGeometry:
         assert "ASS not found" in stderr or "ASS" in stderr
         # geometry check did not run (no mismatch banner)
         assert "playresy" not in stderr.lower()
+
+    def test_2160p_scaled_ass_no_warning(self, tmp_path: Path, monkeypatch):
+        """4K frame (2160p) + ASS scaled to its geometry: burn pads 440 real
+        px, which is 220 in ASS units, so a correct ASS carries
+        PlayResY=1300 -> zero warnings. (Pre-fix this false-warned: the
+        hardcoded 1080 expectation demanded 1080+440=1520.)"""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 2160)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=440)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+        assert "1300" not in stderr  # no mismatch banner
+
+    def test_2160p_true_mismatch_still_warns(self, tmp_path: Path, monkeypatch):
+        """4K frame, burn pads 440 real px (= 220 ASS units -> expects
+        PlayResY 1300), but the ASS was built with an unscaled 440-unit bar
+        (PlayResY 1520) -> still a true geometry error, still warns."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1520)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 2160)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=440)
+        assert "geometry" in stderr.lower()
+        assert "1300" in stderr or "1520" in stderr  # names the values
+        # warning does not fail the burn
+        assert report is None or report.get("ok") is True or self.last_exit == 0
+
+    def test_1080p_probe_keeps_legacy_expectation(self, tmp_path: Path, monkeypatch):
+        """An explicit 1080p probe is scale factor 1: bar 220 real px expects
+        PlayResY 1080+220=1300 — the legacy behavior, now via the probe."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 1080)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+
+
+class TestGeometryProbeFrameHeight:
+    """The frame-height probe feeding the bar-px geometry check: parses
+    ffprobe's WxH answer (same call shape as full_dub's _probe_wh). Anything
+    but a clean answer — ffprobe missing, nonzero exit, unparseable stdout —
+    returns None so cmd_burn falls back to the 1080p assumption instead of
+    crashing or misdetecting."""
+
+    def _probe(self, monkeypatch, *, stdout="", returncode=0, ffprobe_on_path=True):
+        if ffprobe_on_path:
+            monkeypatch.setattr(cook.shutil, "which",
+                                lambda name: "/usr/bin/ffprobe")
+        else:
+            monkeypatch.setattr(cook.shutil, "which", lambda name: None)
+
+        class _R:
+            pass
+
+        r = _R()
+        r.returncode = returncode
+        r.stdout = stdout
+        monkeypatch.setattr(cook.subprocess, "run", lambda *a, **k: r)
+        return cook._probe_frame_height(Path("raw/video.raw.mp4"))
+
+    def test_parses_width_height_csv(self, monkeypatch):
+        assert self._probe(monkeypatch, stdout="3840x2160\n") == 2160
+        assert self._probe(monkeypatch, stdout="1920x1080\n") == 1080
+
+    def test_missing_ffprobe_returns_none(self, monkeypatch):
+        assert self._probe(monkeypatch, ffprobe_on_path=False) is None
+
+    def test_probe_failure_returns_none(self, monkeypatch):
+        # ffprobe ran but errored (e.g. the file is not a video) -> None
+        assert self._probe(monkeypatch, stdout="", returncode=1) is None
+        # exited 0 but the stdout is not a clean WxH -> None
+        assert self._probe(monkeypatch, stdout="n/a") is None
+        assert self._probe(monkeypatch, stdout="2160") is None
 
 
 class TestLengthIssuesWidthGate:
