@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 罐头段列表注入替身：未被 cue 覆盖的语音段报为缺口，已覆盖的不报
-- [ ] 缺口报告含起止时间、文本、覆盖判定
-- [ ] CLI parser 接线测试
-- [ ] vocals 轨缺失时降级 raw-only 并在报告标注
+- [x] 罐头段列表注入替身：未被 cue 覆盖的语音段报为缺口，已覆盖的不报
+- [x] 缺口报告含起止时间、文本、覆盖判定
+- [x] CLI parser 接线测试
+- [x] vocals 轨缺失时降级 raw-only 并在报告标注

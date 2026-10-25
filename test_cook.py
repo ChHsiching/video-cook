@@ -1217,6 +1217,7 @@ class TestQualityGuardR2:
 _DUB_STAGE_SCRIPTS = [
     "full_dub.py",
     "retime.py",
+    "audit_coverage.py",
     "loudness_match.py",
     "scan_reference.py",
     "extract_reference.py",
@@ -1239,7 +1240,7 @@ class TestDubScriptsInPackage:
     needs to be installed for the pipeline to run. (measure_rate.py and
     length_gate.py are functions-only and run in-process under cook.)"""
 
-    def test_all_seven_scripts_present(self):
+    def test_all_stage_scripts_present(self):
         d = _stages_dub_dir()
         for name in _DUB_STAGE_SCRIPTS:
             assert (d / name).is_file(), f"stages/dub/{name} missing"
@@ -4642,3 +4643,279 @@ class TestCliParityLoudnessMatch:
         assert code == 1
         assert report["ok"] is False
         assert "ebur128" in report["error"]
+
+
+# ============================================================================
+# dub audit-coverage (ticket 02): ASR speech segments vs transcript cue
+# windows — the gate for the whisperX-dropped-19s-under-music incident.
+# The model never loads: stage tests inject a canned-segment transcriber
+# (the retime fw_transcriber seam precedent), CLI tests stub the module.
+# ============================================================================
+
+def _load_audit_coverage():
+    """Load stages/dub/audit_coverage.py fresh. Module level is stdlib-only;
+    the faster-whisper import happens lazily inside the segmenter factory."""
+    spec = importlib.util.spec_from_file_location(
+        f"audit_coverage_test_{id(_stages_dub_dir()):x}",
+        _stages_dub_dir() / "audit_coverage.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestAuditCoverageStage:
+    """stage_audit_coverage: orchestration with an injected fake
+    transcriber returning canned speech segments per audio track."""
+
+    CUES = [
+        (1, "00:00:10,000 --> 00:00:14,000", "First spoken sentence here."),
+        (2, "00:00:20,000 --> 00:00:24,000", "Second spoken sentence here."),
+    ]
+
+    def _fixture(self, tmp_path: Path, with_vocals: bool = True) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "vid.en.full.srt", self.CUES)
+        raw = root / "raw" / "vid.raw.mp4"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"x" * 64)  # content never read: the fake ignores it
+        if with_vocals:
+            voc = root / "dubbed" / "vocals.wav"
+            voc.parent.mkdir(parents=True, exist_ok=True)
+            voc.write_bytes(b"x" * 64)
+        return root
+
+    def _transcriber(self, by_source: dict, calls: list | None = None):
+        """Canned segments per track, keyed 'vocals'/'raw' on the path name;
+        segments = [(start, end, text), ...]. Records the paths it saw."""
+        def transcribe(path):
+            if calls is not None:
+                calls.append(Path(path))
+            key = "vocals" if "vocals" in Path(path).name else "raw"
+            return list(by_source[key])
+        return transcribe
+
+    def test_uncovered_segment_reported_as_gap(self, tmp_path):
+        """A speech segment no cue window covers (the incident shape: the
+        19s montage voiceover whisperX never transcribed) is reported with
+        its start/end/text and covered=false; the report is not ok."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "montage highlight voiceover")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["ok"] is False
+        assert rep["gap_count"] == 1
+        gap = rep["gaps"][0]
+        assert gap["start"] == 5.0
+        assert gap["end"] == 8.5
+        assert gap["text"] == "montage highlight voiceover"
+        assert gap["covered"] is False
+        # both tracks heard it -> source annotated on the gap
+        assert sorted(gap["sources"]) == ["raw", "vocals"]
+
+    def test_covered_segment_not_reported(self, tmp_path):
+        """Segments sitting inside cue windows produce no gaps, are counted
+        as covered, and the report is ok."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(10.2, 13.8, "First spoken sentence here."),
+                (20.5, 23.0, "Second spoken sentence here.")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["ok"] is True
+        assert rep["gaps"] == []
+        assert rep["gap_count"] == 0
+        assert rep["covered_count"] == 4  # 2 per track, both scanned
+        assert rep["segments_scanned"] == 4
+
+    def test_under_half_overlap_and_midpoint_outside_is_gap(self, tmp_path):
+        """Coverage needs more than half the segment overlapped (or the
+        midpoint inside a cue): a segment straddling a cue's start with
+        only a third of itself inside stays a gap."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(6.0, 12.0, "long run-in before the cue window opens")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["gap_count"] == 1
+
+    def test_midpoint_inside_cue_tolerance_band_covers(self, tmp_path):
+        """Midpoint rule with the 0.3s boundary tolerance: a segment whose
+        midpoint lands 0.2s before a cue start is covered even though its
+        overlap is well under half its duration."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        # midpoint 9.8 vs cue start 10.0 (tolerance 0.3); overlap 2.0 of 4.4
+        segs = [(7.6, 12.0, "speech that straddles the cue boundary")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["gap_count"] == 0
+        assert rep["ok"] is True
+
+    def test_vocals_missing_degrades_raw_only_and_marks_report(self, tmp_path):
+        """No dubbed/vocals.wav: only the raw track is scanned and the
+        report says so (vocals_missing, per-track list without vocals)."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path, with_vocals=False)
+        calls: list = []
+        segs = [(5.0, 8.5, "gap heard on the raw track only")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": [], "raw": segs}, calls=calls))
+        assert len(calls) == 1                      # raw scanned once
+        assert calls[0].name == "vid.raw.mp4"
+        assert rep["vocals_missing"] is True
+        assert [t["source"] for t in rep["tracks"]] == ["raw"]
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["sources"] == ["raw"]
+
+    def test_gap_heard_on_both_tracks_reported_once_with_vocals_text(self, tmp_path):
+        """The same hole heard on both tracks is ONE gap (deduped), keeping
+        the vocals track's text (the cleaner ASR input, scanned first)."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber({
+                "vocals": [(5.0, 8.5, "clean vocals transcription")],
+                "raw": [(5.1, 8.4, "noisier raw transcription")],
+            }))
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["text"] == "clean vocals transcription"
+        assert sorted(rep["gaps"][0]["sources"]) == ["raw", "vocals"]
+        # per-track counts still see one uncovered each
+        by_src = {t["source"]: t for t in rep["tracks"]}
+        assert by_src["vocals"]["uncovered"] == 1
+        assert by_src["raw"]["uncovered"] == 1
+
+    def test_transcript_falls_back_to_en_srt(self, tmp_path):
+        """en.full.srt absent: the plain <name>.en.srt carries the cue
+        windows and the report marks the fallback."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "transcript" / "vid.en.full.srt").unlink()
+        _make_srt(root / "transcript" / "vid.en.srt", self.CUES)
+        segs = [(10.2, 13.8, "First spoken sentence here.")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["transcript"] == "transcript/vid.en.srt"
+        assert rep["transcript_fallback"] is True
+        assert rep["cues"] == 2
+        assert rep["ok"] is True
+
+    def test_report_json_written_under_dubbed(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "the hole")]
+        mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        out = root / "dubbed" / "_audit_coverage.json"
+        assert out.is_file()
+        on_disk = json.loads(out.read_text(encoding="utf-8"))
+        assert on_disk["gap_count"] == 1
+
+    def test_stage_logs_to_stderr_stdout_stays_clean(self, tmp_path, capsys):
+        """Progress logs go to stderr so both the standalone CLI and cook's
+        in-process forward keep stdout a single JSON document."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "the hole")]
+        mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "audit-coverage" in captured.err
+
+    def test_missing_transcript_is_error(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "transcript" / "vid.en.full.srt").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_audit_coverage(root, "vid", transcriber=lambda p: [])
+        assert e.value.code not in (0, None)
+
+    def test_no_audio_tracks_is_error(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path, with_vocals=False)
+        (root / "raw" / "vid.raw.mp4").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_audit_coverage(root, "vid", transcriber=lambda p: [])
+        assert e.value.code not in (0, None)
+
+
+class TestDubAuditCoverageCommand:
+    """cook dub audit-coverage: in-process forward to the packaged stage
+    function; JSON on stdout; exit 1 when gaps were found (the gate)."""
+
+    def test_parser_wires_audit_coverage(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "audit-coverage", "some/root", "name"])
+        assert args.func is cook.cmd_dub_audit_coverage
+        assert args.output_root == "some/root"
+        assert args.name == "name"
+
+    def test_cmd_forwards_to_stage_function_and_emits_report(
+            self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        root.mkdir()
+        calls = {}
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                calls["args"] = (output_root, name)
+                return {"ok": True, "gap_count": 0, "gaps": [],
+                        "covered_count": 12, "segments_scanned": 12}
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 0
+        assert calls["args"] == (root.resolve(), "video")
+        assert report["ok"] is True
+        assert report["stage"] == "audit-coverage"
+        assert report["gap_count"] == 0
+
+    def test_cmd_exits_fail_when_gaps_found(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        root.mkdir()
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                return {"ok": False, "gap_count": 2,
+                        "gaps": [{"start": 5.0, "end": 8.5,
+                                  "text": "x", "covered": False,
+                                  "sources": ["raw"]}]}
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert report["gap_count"] == 2
+
+    def test_stage_refusal_becomes_cook_json_error(self, tmp_path, monkeypatch):
+        """The stage's SystemExit (missing transcript / missing
+        faster-whisper) surfaces as cook's JSON error, not a bare exit."""
+        root = tmp_path / "vid"
+        root.mkdir()
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                raise SystemExit("faster-whisper is not installed in this "
+                                 "interpreter: pip install faster-whisper")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "faster-whisper" in report["error"]
