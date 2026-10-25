@@ -6,7 +6,7 @@
 
 **Status:** ready-for-agent
 
-- [ ] 超窗 take 装配后：摆位时长正确、`_segments/` 原文件字节不变、旁位目录有产物
-- [ ] 再次装配从原始缓存重建旁位（陈旧 fitted 不泄漏）
-- [ ] 字幕窗计算跟随实际摆位音频（fitted 优先）
-- [ ] 既有 assemble 测试全绿
+- [x] 超窗 take 装配后：摆位时长正确、`_segments/` 原文件字节不变、旁位目录有产物
+- [x] 再次装配从原始缓存重建旁位（陈旧 fitted 不泄漏）
+- [x] 字幕窗计算跟随实际摆位音频（fitted 优先）
+- [x] 既有 assemble 测试全绿

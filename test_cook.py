@@ -3642,6 +3642,171 @@ class TestAssembleAutoRetime:
         assert "Stage 2 DONE" in buf.getvalue()
 
 
+# ----------------------------------------------------------------------------
+# assemble fit sidecar (nate-herk reflux ticket 01): assembly NEVER writes the
+# synth cache. The fit pass's atempo products land in _full/_segments_fitted/,
+# a sidecar wiped and rebuilt at the start of every assemble; placement (2b)
+# and the subtitle window (2c) resolve takes fitted-first. The incident this
+# pins: an experimental 463-cue assemble crushed 144 takes against misaligned
+# windows and replaced them in the cache before erroring out; the next
+# assemble silently shipped the corruption. Same doubles as
+# TestAssembleAutoRetime — fake subprocess.run (real stdlib-wave wavs), no
+# ffmpeg, no retime (no_retime=True keeps the assertion surface on the fit).
+# ----------------------------------------------------------------------------
+
+class TestAssembleFitSidecar:
+    """An over-window take (12.0s in a 10.0s window, factor 1.2) must leave
+    _segments/sent_0001.wav byte- AND mtime-identical, put the atempo product
+    in _segments_fitted/, and place + window subtitles on the FITTED audio;
+    a second assemble rebuilds the sidecar from the untouched cache."""
+
+    RAW_DUR = 22.2
+
+    @staticmethod
+    def _write_silence(path: Path, dur: float) -> None:
+        import contextlib
+        import wave
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(wave.open(str(path), "wb")) as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(b"\x00" * (int(dur * 22050) * 2))
+
+    def _dur(self, path: Path) -> float:
+        import contextlib
+        import wave
+        with contextlib.closing(wave.open(str(path), "rb")) as w:
+            return w.getnframes() / float(w.getframerate())
+
+    def _video(self, tmp_path: Path) -> Path:
+        """2 cues: take 1 is 12.0s inside its 10.0s window (10s -> next cue
+        start 20s; factor 1.2 -> atempo'd); take 2 is 0.2s in a 2.2s window
+        (natural pace, no fit)."""
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "English cue one"),
+            (2, "00:00:20,000 --> 00:00:22,000", "English cue two"),
+        ])
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["这是第一句配音", "这是第二句配音"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        segs.mkdir(parents=True, exist_ok=True)
+        self._write_silence(segs / "sent_0001.wav", 12.0)
+        self._write_silence(segs / "sent_0002.wav", 0.2)
+        return root
+
+    def _fake_subprocess(self):
+        """atempo writes REAL stdlib-wave silence of in_dur/k (compressed);
+        apad writes in_dur+pad; ffprobe answers canned stdout; the final
+        encode just touches its output."""
+        import contextlib
+        import types
+        import wave
+        RAW = self.RAW_DUR
+
+        def run(cmd, capture_output=True, text=True, **kw):
+            if cmd[0] == "ffprobe":
+                out = "1920x1080\n" if "stream=width,height" in cmd else f"{RAW}\n"
+                return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+            if any(str(a).startswith("atempo=") for a in cmd):
+                af = next(str(a) for a in cmd if str(a).startswith("atempo="))
+                k = float(af.split("=", 1)[1])
+                src = cmd[cmd.index("-i") + 1]
+                with contextlib.closing(wave.open(str(src), "rb")) as w:
+                    d = w.getnframes() / float(w.getframerate())
+                self._write_silence(Path(cmd[-1]), d / k)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if any(str(a).startswith("apad=pad_dur=") for a in cmd):
+                af = next(str(a) for a in cmd if str(a).startswith("apad="))
+                pad = float(af.rsplit("=", 1)[1])
+                src = cmd[cmd.index("-i") + 1]
+                with contextlib.closing(wave.open(str(src), "rb")) as w:
+                    d = w.getnframes() / float(w.getframerate())
+                self._write_silence(Path(cmd[-1]), d + pad)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[-1]).write_bytes(b"fake mp4")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return run
+
+    def _assemble(self, mod, root: Path) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_assemble(str(root), "video", no_retime=True)
+        return buf.getvalue()
+
+    def test_over_window_take_cache_untouched_sidecar_written(self,
+                                                              tmp_path,
+                                                              monkeypatch):
+        """After assembling an over-window take: the cache file's bytes and
+        mtime are identical, the atempo product exists in _segments_fitted/
+        at window size, and placement consumed the FITTED take (padded cue
+        is 10.0s of audio, not the cache's 12.0s)."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        before_bytes = cache.read_bytes()
+        before_mtime = cache.stat().st_mtime_ns
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        out = self._assemble(mod, root)
+        # cache is physically un-writable by assembly: bytes AND mtime
+        assert cache.read_bytes() == before_bytes
+        assert cache.stat().st_mtime_ns == before_mtime
+        # the atempo product lives in the sidecar, window-sized (12.0/1.2)
+        fitted = root / "dubbed" / "_full" / "_segments_fitted" / "sent_0001.wav"
+        assert fitted.exists() and fitted.stat().st_size > 1000
+        assert abs(self._dur(fitted) - 10.0) < 0.01
+        # placement used the fitted take: cue 1 contributes 10.0s of audio
+        pad0 = root / "dubbed" / "_full" / "_audio_pad" / "cue_0000.wav"
+        assert abs(self._dur(pad0) - 10.0) < 0.01
+        assert "Stage 2 DONE" in out
+
+    def test_subtitle_window_follows_fitted_take(self, tmp_path, monkeypatch):
+        """2c's ZH window spans the PLACED audio via the fitted-first
+        resolver: the cache take is still 12.0s (untouched), yet cue 1's
+        end is start + fitted 10.0s = 20.0s — reading the cache instead of
+        the sidecar would give 22.0s."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        self._assemble(mod, root)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        assert abs(self._dur(cache) - 12.0) < 0.01
+        dubbing = (root / "dubbed" / "_full" / "dubbing.srt"
+                   ).read_text(encoding="utf-8")
+        assert "00:00:10,000 --> 00:00:20,000" in dubbing
+        assert "00:00:10,000 --> 00:00:22,000" not in dubbing
+
+    def test_second_assemble_rebuilds_sidecar_from_original_cache(self,
+                                                                  tmp_path,
+                                                                  monkeypatch):
+        """Every assemble starts by wiping _segments_fitted/: a corrupted
+        fitted product is rebuilt byte-identically from the untouched cache,
+        and a stale leftover for a cue this run never fits is gone."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        cache_before = cache.read_bytes()
+        fitted_dir = root / "dubbed" / "_full" / "_segments_fitted"
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        self._assemble(mod, root)
+        first = (fitted_dir / "sent_0001.wav").read_bytes()
+        # stale sidecar state: a corrupted product + a cue-2 leftover this
+        # run would never produce (cue 2 fits naturally)
+        self._write_silence(fitted_dir / "sent_0001.wav", 7.7)
+        self._write_silence(fitted_dir / "sent_0002.wav", 9.9)
+        out = self._assemble(mod, root)
+        # wiped and rebuilt from the ORIGINAL cache: byte-identical product,
+        # stale leftover gone, cache still untouched
+        assert (fitted_dir / "sent_0001.wav").read_bytes() == first
+        assert not (fitted_dir / "sent_0002.wav").exists()
+        assert cache.read_bytes() == cache_before
+        assert "Stage 2 DONE" in out
+
+
 class TestAssembleRetimeCLI:
     """full_dub.py's own CLI: the `--no-retime` argv cook passes through must
     reach stage_assemble (default off = retime on), and the flag is legal on
