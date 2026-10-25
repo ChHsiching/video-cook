@@ -21,7 +21,9 @@ clean stem, and vice versa):
                       (scanned first - it is the cleaner ASR input)
   raw/<name>.raw.mp4  the raw video's own audio track (faster-whisper
                       decodes it via PyAV - no pre-extract needed)
-  A missing vocals.wav degrades to raw-only and the report says so.
+  A missing vocals.wav degrades to raw-only, a missing raw track to
+  vocals-only; the report's tracks_mode/tracks_scanned name what actually
+  ran (a degrade never hides behind a "vocals+raw" label).
 
 Transcript: transcript/<name>.en.full.srt, falling back to
 transcript/<name>.en.srt when the full-sentence SRT has not been built.
@@ -30,8 +32,10 @@ Coverage semantics (per speech segment [s, e], against any cue window
 [cs, ce]): COVERED when the overlap exceeds half the segment's duration,
 OR the segment's midpoint falls inside the window - both with a 0.3s
 boundary tolerance (ASR segment edges and SRT cue edges are both
-approximate). Gaps heard on both tracks are deduped into one entry
-annotated with the tracks that heard them.
+approximate), capped at half the segment's own duration so the slack can
+never cover a sub-0.6s zero-overlap segment on its own. Gaps heard on
+both tracks are deduped into one entry annotated with the tracks that
+heard them.
 
 The faster-whisper dependency loads lazily behind the fw_segmenter seam
 (the retime.py fw_transcriber precedent): the module top level is
@@ -102,14 +106,22 @@ def segment_covered(seg_start: float, seg_end: float,
                     cue_windows: list[tuple[float, float]]) -> bool:
     """True when any cue window covers the speech segment: overlap beyond
     half the segment's duration, or containment of the segment's midpoint,
-    each with BOUNDARY_TOL_S of slack on the window edges."""
+    each with BOUNDARY_TOL_S of slack on the window edges. The slack is
+    capped at half the segment's OWN duration — it exists to absorb edge
+    error on the timestamps (touching a cue edge still counts), never to
+    substitute for overlap evidence: a sub-0.6s segment sitting clear of
+    every cue stays a gap (the old `overlap + BOUNDARY_TOL_S > dur / 2`
+    form let the blanket 0.3s cover any segment shorter than 0.6s
+    regardless of the cues)."""
     dur = seg_end - seg_start
     mid = 0.5 * (seg_start + seg_end)
+    mid_tol = min(BOUNDARY_TOL_S, 0.5 * dur)
+    overlap_needed = max(0.5 * dur - BOUNDARY_TOL_S, 0.0)
     for cs, ce in cue_windows:
-        if cs - BOUNDARY_TOL_S <= mid <= ce + BOUNDARY_TOL_S:
+        if cs - mid_tol <= mid <= ce + mid_tol:
             return True
         overlap = min(seg_end, ce) - max(seg_start, cs)
-        if overlap + BOUNDARY_TOL_S > dur / 2.0:
+        if overlap > overlap_needed:
             return True
     return False
 
@@ -218,11 +230,21 @@ def stage_audit_coverage(output_root, name: str, transcriber=None) -> dict:
                f"(run 'cook download' + 'cook dub separate' first)")
         _log(f"ERROR: {msg}")
         raise SystemExit(msg)
-    mode = "vocals+raw" if not vocals_missing else "raw-only"
+    # label by what ACTUALLY scanned: vocals+raw / vocals-only / raw-only
+    # (a vocals-present-raw-missing run used to be mislabeled "vocals+raw")
+    tracks_scanned = [src for src, _p in tracks]
+    mode = {("vocals", "raw"): "vocals+raw",
+            ("vocals",): "vocals-only",
+            ("raw",): "raw-only"}[tuple(tracks_scanned)]
+    if "vocals" not in tracks_scanned:
+        degrade = " - vocals.wav missing, raw-only degrade"
+    elif "raw" not in tracks_scanned:
+        degrade = " - raw track missing, vocals-only degrade"
+    else:
+        degrade = ""
     _log(f"audit-coverage: {len(cues)} cues from {srt.name}"
          f"{' (en.srt fallback)' if fallback else ''}; "
-         f"scanning {mode}"
-         f"{' - vocals.wav missing, raw-only degrade' if vocals_missing else ''}")
+         f"scanning {mode}{degrade}")
 
     transcribe = transcriber if transcriber is not None else fw_segmenter()
 
@@ -258,6 +280,7 @@ def stage_audit_coverage(output_root, name: str, transcriber=None) -> dict:
         "transcript_fallback": fallback,
         "cues": len(cues),
         "tracks_mode": mode,
+        "tracks_scanned": tracks_scanned,
         "vocals_missing": vocals_missing,
         "tracks": track_stats,
         "segments_scanned": segments_scanned,

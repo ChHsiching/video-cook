@@ -2767,8 +2767,10 @@ def cmd_dub_loudness_match(args: argparse.Namespace) -> None:
     """Per-cue loudness matching over dubbed/_full/_segments/sent_NNNN.wav
     (ffmpeg ebur128 per cue, pulled to the anchor with peak protection).
     Run once AFTER synth and BEFORE assemble — the assembler's global
-    loudnorm lands the track, not the individual voices, and assemble's fit
-    pass overwrites the segments in place.
+    loudnorm lands the track, not the individual voices. Assembly never
+    writes the synth cache (the fit sidecar architecture: atempo products
+    land in _segments_fitted/), so the matched segments in _segments/
+    survive any later re-assembly.
 
     Thin shell over stages/dub/loudness_match.py (ffmpeg via subprocess,
     otherwise stdlib — in-process). Cues already within tolerance are

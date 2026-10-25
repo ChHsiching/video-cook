@@ -4787,6 +4787,76 @@ class TestCliParityLoudnessMatch:
         assert report["ok"] is False
         assert "ebur128" in report["error"]
 
+    def test_cli_parity_loudness_output_equals_direct_stage_run(
+            self, tmp_path, monkeypatch):
+        """Ticket 03 acceptance 3/3: the cue wavs `cook dub
+        loudness-match` leaves behind are byte-identical to a direct
+        stages/dub/loudness_match.py run over the same seeds (the
+        make-srt/merge-short parity form). ffmpeg is stubbed at the
+        subprocess seam the stage shells through: measure calls return
+        canned ebur128 Summary blocks keyed on the cue index; gain calls
+        rewrite the file through the stage's tmp target, appending the
+        volume filter actually applied, so the products carry real
+        per-branch evidence."""
+        levels = {  # cue index -> (integrated LUFS, true peak dBTP)
+            1: (-20.0, -6.0),  # +1.30 dB to reach the anchor
+            2: (-18.8, -5.0),  # 0.1 dB off -> within TOL, untouched
+            3: (-19.5, 0.0),   # +0.8 dB wanted, peak-clamped to -1.50
+        }                      # (the <1KB sent_0004 must never be measured)
+
+        def fake_run(cmd, **kw):
+            if any("ebur128" in a for a in cmd):   # measure call
+                idx = int(re.search(r"sent_(\d{4})\.wav",
+                                    " ".join(cmd)).group(1))
+                lufs, peak = levels[idx]  # KeyError => broken file measured
+                return subprocess.CompletedProcess(
+                    cmd, 0, "",
+                    "  Pseudo loudness run\nSummary:\n"
+                    f"  I:   {lufs} LUFS\n"
+                    f"  Peak:      {peak} dBTP\n")
+            src, dst = cmd[cmd.index("-i") + 1], cmd[-1]
+            vol = cmd[cmd.index("-af") + 1]
+            Path(dst).write_bytes(
+                Path(src).read_bytes() + f"|{vol}".encode())
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        def seed(root: Path) -> Path:
+            segs = root / "dubbed" / "_full" / "_segments"
+            segs.mkdir(parents=True)
+            for i in range(1, 5):
+                body = f"cue-{i}-synth-audio-bytes".encode()
+                (segs / f"sent_{i:04d}.wav").write_bytes(
+                    body * (60 if i != 4 else 10))  # 0004 stays <1KB
+            return segs
+
+        via_cook = seed(tmp_path / "via_cook")
+        direct = seed(tmp_path / "direct")
+        originals = {p.name: p.read_bytes()
+                     for p in sorted(via_cook.iterdir())}
+
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(tmp_path / "via_cook"), "video"])
+        assert code == 0 and report["ok"] is True
+        assert report["cue_wavs"] == 4
+        _run_stage_direct("dub", "loudness_match.py", "t_loudness_direct", [
+            str(tmp_path / "direct"), "video",
+            "--anchor", "-18.7", "--peak", "-1.5"])
+
+        # parity: byte-identical cue wavs through both entry points
+        for f in sorted(via_cook.iterdir()):
+            assert f.read_bytes() == (direct / f.name).read_bytes(), f.name
+        # the shared product exercises the stage's per-cue branches
+        assert (via_cook / "sent_0001.wav").read_bytes().endswith(
+            b"|volume=1.30dB")                      # pulled to the anchor
+        assert (via_cook / "sent_0002.wav").read_bytes() == \
+            originals["sent_0002.wav"]              # within TOL, skipped
+        assert (via_cook / "sent_0003.wav").read_bytes().endswith(
+            b"|volume=-1.50dB")                     # peak-clamped
+        assert (via_cook / "sent_0004.wav").read_bytes() == \
+            originals["sent_0004.wav"]              # <1KB, SKIP broken
+
 
 # ============================================================================
 # dub audit-coverage (ticket 02): ASR speech segments vs transcript cue
@@ -4804,6 +4874,61 @@ def _load_audit_coverage():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class TestSegmentCoveredShortSegments:
+    """segment_covered pure-function edge: the 0.3s boundary tolerance
+    must not swallow the "the segment itself is tiny" judgement. The old
+    overlap + 0.3 > dur/2 form called EVERY sub-0.6s segment covered —
+    even one sitting clear of every cue — because the flat tolerance
+    alone exceeded dur/2. The slack now caps at half the segment's own
+    duration: timestamps still get their ±0.3s (shrunk to dur/2 for tiny
+    segments, so touching still counts), but no amount of slack
+    substitutes for overlap evidence."""
+
+    def test_short_zero_overlap_segment_clear_after_cue_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment 0.1s clear of the cue's end: zero overlap, midpoint
+        # beyond the dur/2-capped slack -> gap (old: covered by the flat
+        # 0.3s midpoint band alone)
+        assert mod.segment_covered(14.6, 15.0,
+                                   [(10.0, 14.5), (20.0, 24.0)]) is False
+
+    def test_short_zero_overlap_segment_clear_before_cue_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment 0.1s clear of the cue's start: same blind spot
+        assert mod.segment_covered(9.5, 9.9, [(10.0, 14.0)]) is False
+
+    def test_short_segment_midpoint_in_flat_band_only_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.2s segment whose midpoint sits 0.25s past the cue end: inside
+        # the old flat ±0.3s midpoint band, outside the dur/2 cap, zero
+        # overlap -> gap
+        assert mod.segment_covered(14.15, 14.35, [(10.0, 14.0)]) is False
+
+    def test_short_segment_touching_cue_edge_stays_covered(self):
+        mod = _load_audit_coverage()
+        # the capped slack still honors touching edges (ASR/SRT edge
+        # error is what the tolerance exists for): a 0.4s segment
+        # starting exactly at the cue's end, or ending exactly at its
+        # start, keeps exactly dur/2 of slack -> covered
+        assert mod.segment_covered(14.5, 14.9, [(10.0, 14.5)]) is True
+        assert mod.segment_covered(9.6, 10.0, [(10.0, 14.0)]) is True
+
+    def test_short_segment_with_real_overlap_still_covered(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment, 0.3s of it inside the cue: real evidence, covered
+        assert mod.segment_covered(13.7, 14.1, [(10.0, 14.0)]) is True
+        # short segment fully inside the cue
+        assert mod.segment_covered(11.0, 11.3, [(10.0, 14.0)]) is True
+
+    def test_long_segment_slack_unchanged(self):
+        mod = _load_audit_coverage()
+        # dur 4.4, overlap 2.0 > 4.4/2 - 0.3: covered exactly as before
+        assert mod.segment_covered(12.0, 16.4, [(10.0, 14.0)]) is True
+        # dur 6.0, overlap 2.0 < 6.0/2 - 0.3 = 2.7 and midpoint outside:
+        # still a gap (the pre-existing half-coverage bar)
+        assert mod.segment_covered(6.0, 12.0, [(10.0, 14.0)]) is False
 
 
 class TestAuditCoverageStage:
@@ -4872,6 +4997,8 @@ class TestAuditCoverageStage:
         assert rep["gap_count"] == 0
         assert rep["covered_count"] == 4  # 2 per track, both scanned
         assert rep["segments_scanned"] == 4
+        assert rep["tracks_mode"] == "vocals+raw"
+        assert rep["tracks_scanned"] == ["vocals", "raw"]
 
     def test_under_half_overlap_and_midpoint_outside_is_gap(self, tmp_path):
         """Coverage needs more than half the segment overlapped (or the
@@ -4912,9 +5039,33 @@ class TestAuditCoverageStage:
         assert len(calls) == 1                      # raw scanned once
         assert calls[0].name == "vid.raw.mp4"
         assert rep["vocals_missing"] is True
+        assert rep["tracks_mode"] == "raw-only"
+        assert rep["tracks_scanned"] == ["raw"]
         assert [t["source"] for t in rep["tracks"]] == ["raw"]
         assert rep["gap_count"] == 1
         assert rep["gaps"][0]["sources"] == ["raw"]
+
+    def test_raw_missing_scans_vocals_only_and_labels_mode(self, tmp_path):
+        """vocals.wav present but the raw track missing: only the vocals
+        stem is scanned and the report must say vocals-only — the mode
+        label previously claimed 'vocals+raw' even though raw never ran;
+        tracks_scanned names what actually scanned."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "raw" / "vid.raw.mp4").unlink()
+        calls: list = []
+        segs = [(5.0, 8.5, "gap heard on the vocals stem only")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": []}, calls=calls))
+        assert len(calls) == 1                      # vocals scanned once
+        assert calls[0].name == "vocals.wav"
+        assert rep["tracks_mode"] == "vocals-only"
+        assert rep["tracks_scanned"] == ["vocals"]
+        assert rep["vocals_missing"] is False
+        assert [t["source"] for t in rep["tracks"]] == ["vocals"]
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["sources"] == ["vocals"]
 
     def test_gap_heard_on_both_tracks_reported_once_with_vocals_text(self, tmp_path):
         """The same hole heard on both tracks is ONE gap (deduped), keeping
