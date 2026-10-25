@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 无句读超长 cue 在逗号处切分；无逗号时行为不变
-- [ ] 纯函数单测（tests/test_validation.py 先例）
+- [x] 无句读超长 cue 在逗号处切分；无逗号时行为不变
+- [x] 纯函数单测（tests/test_validation.py 先例）

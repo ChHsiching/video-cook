@@ -1799,6 +1799,149 @@ class TestShortenExemptionUnchanged:
 
 
 # ----------------------------------------------------------------------------
+# cook subtitles shorten: comma-first hard cuts (ticket 04, nate-herk reflux).
+# When a cue exceeds the limit and the sentence-punctuation ladder yields no
+# usable block (or a block still over the limit), the hard cut must prefer the
+# last clause comma (，,；;) inside the limit over a word boundary, falling to
+# the word-level cut only when no such comma exists. Judgment case (both the
+# bilingual and the dubbing pipeline hit it): the no-sentence-punctuation
+# question "Where does that break ... right scoped API keys or whatever ..."
+# was word-cut between "API" and "keys", splitting the multi-word term across
+# two cues. These are pure-function tests on the same splitter->packer
+# composition cmd_shorten uses — no SRT I/O.
+# ----------------------------------------------------------------------------
+
+# ZH, ASCII commas: split_zh's clause ladder (，、：) never sees ASCII commas,
+# so the over-width block reaches pack_zh's hard cut — exactly the path the
+# comma-first rule guards. "API key" rides inside as the multi-word term.
+_COMMA_ZH = ("一个不懂技术的人可能不知道怎么搭建合适的代码库,"
+             "也可能不知道怎么开出权限范围合适的API key,"
+             "各种坑都可能出现")
+
+# EN, full-width comma: split_en's comma split only matches "," + whitespace,
+# so a translated full-width ，survives into the hard cut.
+_COMMA_EN = ("Imagine a non-technical person trying to set up the right code "
+             "base without any prior knowledge，they also have to create "
+             "properly scoped API keys or whatever the tooling demands and "
+             "keep everything from falling through the cracks")
+
+# The acceptance cue from the incident (en.srt 146 of the nate-herk run):
+# 287 chars, one comma at index 191 — past the 160 limit, so the comma-first
+# rule cannot fire and the behavior is pinned as the documented boundary.
+_COMMA_JUDGMENT = (
+    "Where does that break where a non-technical person that might not have "
+    "knowledge of how to set up the right code base or how to create the right "
+    "scoped API keys or whatever the issue might be, how does that person "
+    "drive with intent while still making sure that things don't fall through?"
+)
+
+_SOFT_BREAK = "，,；;"
+
+
+def _shorten_zh_pure(subs, text: str, limit: int = 56) -> list[str]:
+    """cmd_shorten's zh composition (split_zh -> pack_zh) as a pure call."""
+    return subs.pack_zh(subs.split_zh(text, limit), limit)
+
+
+def _shorten_en_pure(subs, text: str, limit: int = 160) -> list[str]:
+    """cmd_shorten's en composition (split_en -> pack) as a pure call."""
+    return subs.pack(subs.split_en(text, limit), limit)
+
+
+class TestShortenCommaFirst:
+    def test_zh_no_sentence_punct_cuts_at_comma(self):
+        """Over-width zh text with no sentence punctuation must cut right
+        after a clause comma, never inside a word run — the ASCII-comma
+        block that the punctuation ladder misses is the recurring case."""
+        subs = cook._import_subtitles_module()
+        pieces = _shorten_zh_pure(subs, _COMMA_ZH)
+        assert "".join(pieces) == _COMMA_ZH        # nothing lost or reordered
+        assert all(subs.wlen(p) <= 56 for p in pieces)
+        # every cut lands right after a comma; the last piece carries the tail
+        for p in pieces[:-1]:
+            assert p[-1] in _SOFT_BREAK, f"cut not at a comma: {p!r}"
+        # the multi-word term stays whole inside one cue
+        assert any("API key" in p for p in pieces)
+
+    def test_en_no_sentence_punct_cuts_at_comma(self):
+        """Over-length en text with no sentence punctuation cuts at the
+        full-width comma a translation can inject; the word-level cut would
+        have landed mid-clause and been free to split terms like API keys."""
+        subs = cook._import_subtitles_module()
+        pieces = _shorten_en_pure(subs, _COMMA_EN)
+        assert " ".join(pieces).replace(" ", "") == _COMMA_EN.replace(" ", "")
+        assert all(len(p) <= 160 for p in pieces)
+        for p in pieces[:-1]:
+            assert p[-1] in _SOFT_BREAK, f"cut not at a comma: {p!r}"
+        assert any("API keys" in p for p in pieces)
+
+    def test_en_no_comma_keeps_word_level_cut(self):
+        """No comma anywhere -> the word-level hard cut is the only option
+        and its exact legacy output is pinned so the rule provably adds a
+        preference instead of changing the fallback."""
+        subs = cook._import_subtitles_module()
+        text = ("A really long run of spoken text without any punctuation at "
+                "all just words flowing one after another until the line "
+                "exceeds the limit and gets cut at a word boundary near the "
+                "end of the first chunk")
+        assert _shorten_en_pure(subs, text) == [
+            "A really long run of spoken text without any punctuation at all "
+            "just words flowing one after another until the line exceeds the "
+            "limit and gets cut at a word",
+            "boundary near the end of the first chunk",
+        ]
+
+    def test_zh_no_comma_degraded_cut_unchanged(self, monkeypatch):
+        """Same pin on the zh side, with jieba forced absent so the width-only
+        legacy cut is deterministic. A fresh module instance is imported after
+        the monkeypatch so the cached jieba state cannot leak in."""
+        monkeypatch.setitem(sys.modules, "jieba", None)
+        subs = cook._import_subtitles_module()
+        text = ("这是一段完全没有逗号也没有任何句末标点的超长中文文本用来"
+                "确认无逗号时硬切行为保持不变且切分位置与旧实现完全一致")
+        assert _shorten_zh_pure(subs, text) == [
+            "这是一段完全没有逗号也没有任何句末标点的超长中文文本用来",
+            "确认无逗号时硬切行为保持不变且切分位置与旧实现完全一致",
+        ]
+
+    def test_judgment_cue_comma_beyond_limit_is_unchanged(self):
+        """The incident cue itself: its only comma sits at index 191, past
+        the 160 limit — cutting there would trade a length violation for
+        term integrity, which the rule forbids. The word-level split of
+        "API"/"keys" therefore remains, pinned here as the rule's explicit
+        boundary (the shipped video fixed this one cue at the product
+        layer; see nate-herk STATE.md Gate C round 1)."""
+        subs = cook._import_subtitles_module()
+        assert _shorten_en_pure(subs, _COMMA_JUDGMENT) == [
+            "Where does that break where a non-technical person that might "
+            "not have knowledge of how to set up the right code base or how "
+            "to create the right scoped API",
+            "keys or whatever the issue might be, how does that person drive "
+            "with intent while still making sure that things don't fall "
+            "through?",
+        ]
+
+    def test_sentence_punctuation_still_wins_zh(self):
+        """Sentence punctuation keeps priority: an over-width cue made of two
+        sentences splits on the sentence boundary; commas inside a sentence
+        never preempt it (regression guard for the ladder's order)."""
+        subs = cook._import_subtitles_module()
+        text = ("这第一句话足够长而且带一个完整的意思。"
+                "这第二句里面有逗号，逗号必须让位于句子边界，不能抢先！")
+        pieces = _shorten_zh_pure(subs, text)
+        assert [p[-1] for p in pieces] == ["。", "！"]
+
+    def test_sentence_punctuation_still_wins_en(self):
+        subs = cook._import_subtitles_module()
+        text = ("The first sentence is long enough to matter here and it "
+                "carries its own full stop. The second sentence is also "
+                "long, with commas inside, but the sentence boundary must "
+                "win over any comma!")
+        pieces = _shorten_en_pure(subs, text)
+        assert [p[-1] for p in pieces] == [".", "!"]
+
+
+# ----------------------------------------------------------------------------
 # synth multi-worker (ticket 10 / issue #21): band split + stagger + exit-code
 # aggregation. All tests are pure or monkeypatched — fake IndexTTS2/torch via a
 # temp INDEXTTS_DIR package, fake Popen for cook's orchestration. No network,
