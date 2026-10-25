@@ -2207,6 +2207,51 @@ def cmd_dub_retime(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------------------
+# dub subcommand: audit-coverage — ASR speech segments vs transcript cues.
+# The gate for the nate-herk incident: whisperX dropped 19s of speech under
+# the intro music, the transcript never had it, and both releases shipped
+# with the hole. This scans the SOURCE audio (dubbed/vocals.wav when Demucs
+# has run + the raw video's own track; either track hearing speech counts)
+# with faster-whisper and reports every uncovered speech segment as a gap
+# (start/end/text) — before translation. Runs in-process: the stage module
+# is stdlib at import time and loads faster-whisper lazily behind its
+# fw_segmenter seam (the retime fw_transcriber precedent); a missing
+# faster-whisper surfaces as cook's JSON error with the pip-install remedy.
+# ----------------------------------------------------------------------------
+
+def cmd_dub_audit_coverage(args: argparse.Namespace) -> None:
+    """Diff the source audio's speech segments against
+    transcript/<name>.en.full.srt (falling back to <name>.en.srt): every
+    speech segment not covered by a cue window is reported as a gap
+    (start/end/text, plus which track heard it). Tracks: dubbed/vocals.wav
+    (if separation has run) + raw/<name>.raw.mp4, each scanned once;
+    missing vocals degrades to raw-only and is marked in the report.
+    Coverage = cue overlap beyond half the segment, or the segment's
+    midpoint inside the cue, with 0.3s boundary tolerance. Exits 1 when
+    gaps were found (gate contract)."""
+    root = _video_dir(args.output_root)
+    mod = _import_stage_module("dub", "audit_coverage.py",
+                               "cook_stages_dub_audit")
+    try:
+        # the stage logs progress to stderr; stdout stays cook's JSON
+        rep = mod.stage_audit_coverage(root, args.name)
+    except SystemExit as e:
+        if e.code in (0, None):
+            raise
+        _die(str(e.code), obj={"stage": "audit-coverage"})
+    rep["stage"] = "audit-coverage"
+    _emit_json(rep)
+    if rep.get("ok"):
+        print("COOK-RESULT: OK", file=sys.stderr, flush=True)
+        sys.exit(0)
+    print(f"COOK-RESULT: FAIL — coverage audit: {rep.get('gap_count')} "
+          "uncovered speech segment(s); fix the transcript before "
+          "translating (details in the gaps list / "
+          "dubbed/_audit_coverage.json)", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+# ----------------------------------------------------------------------------
 # dub merge — the ONLY legal cue-merge entry: both sides in lockstep.
 # ----------------------------------------------------------------------------
 
@@ -2942,6 +2987,20 @@ def build_parser() -> argparse.ArgumentParser:
              "backs up the original as .pre_retime")
     _add_dub_common(prt)
     prt.set_defaults(func=cmd_dub_retime)
+
+    # audit-coverage: in-process forward to the packaged stage (the stage
+    # module is stdlib at import; faster-whisper loads lazily in the stage).
+    pac = dub_sub.add_parser(
+        "audit-coverage",
+        help="ASR-scan the source audio (dubbed/vocals.wav + the raw video "
+             "track) and diff speech segments against the transcript cues; "
+             "reports every uncovered segment as a gap (start/end/text) — "
+             "the gate that catches speech the transcriber dropped under "
+             "music, BEFORE translation")
+    pac.add_argument("output_root")
+    pac.add_argument("name")
+    pac.set_defaults(func=cmd_dub_audit_coverage)
+
     pdmg = dub_sub.add_parser(
         "merge",
         help="merge cue groups in en.full.srt + translations_dub.txt in "
