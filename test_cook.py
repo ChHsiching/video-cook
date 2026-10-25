@@ -4287,3 +4287,271 @@ class TestPublishTmpSuffix:
         assert seen["name"].endswith(".wav")
         assert not seen["name"].startswith("c0009_")
         assert dst.read_bytes() == b"x" * 2048
+
+
+# ============================================================================
+# CLI parity (ticket 03): `cook dub make-srt / merge-short / loudness-match`
+# — the three subcommands the video-dubbing SKILL.md already documents.
+# Thin shells over the packaged stages; behavior must equal running the
+# stage script directly (byte-equal products on a small sample).
+# ============================================================================
+
+def _run_cook_cmd(argv: list[str]) -> tuple[dict, int]:
+    """Parse argv through cook's real parser, run the wired cmd, and return
+    (stdout JSON, exit code). SystemExit codes become ints; a non-int code
+    (argparse error string) counts as failure."""
+    import io
+    import contextlib
+    args = cook.build_parser().parse_args(argv)
+    buf = io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(buf):
+        try:
+            args.func(args)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+    text = buf.getvalue().strip()
+    return (json.loads(text) if text else {}), code
+
+
+def _run_stage_direct(stage: str, script: str, modname: str, argv: list[str]):
+    """Run a packaged stage module's main() directly (the 'stages 直跑' side
+    of the parity check) with a synthetic argv, stdout swallowed."""
+    import io
+    import contextlib
+    mod = cook._import_stage_module(stage, script, modname)
+    old = sys.argv
+    sys.argv = [script] + argv
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main()
+    finally:
+        sys.argv = old
+
+
+class TestCliParityMakeSrt:
+    """make-srt: <output_root> <name> -> transcript/<name>.zh.dub.srt,
+    forwarding derived paths to stages/dub/make_zh_dub_srt.py."""
+
+    def _inputs(self, tmp_path: Path, n_zh: int = 3) -> Path:
+        root = tmp_path / "vid"
+        tdir = root / "transcript"
+        tdir.mkdir(parents=True)
+        _make_srt(tdir / "video.en.full.srt", [
+            (1, "00:00:00,000 --> 00:00:03,200", "First full sentence here."),
+            (2, "00:00:03,500 --> 00:00:07,100", "Second sentence, also full."),
+            (3, "00:00:07,400 --> 00:00:11,000", "Third and final sentence."),
+        ])
+        _make_translations(tdir / "translations_dub.txt",
+                           [f"第{i}句完整的话。" for i in range(1, n_zh + 1)])
+        return root
+
+    def test_cli_parity_make_srt_parser_wiring(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "make-srt", "some/root", "name"])
+        assert args.func is cook.cmd_dub_make_srt
+        assert args.output_root == "some/root"
+        assert args.name == "name"
+
+    def test_cli_parity_make_srt_output_equals_direct_stage_run(self, tmp_path):
+        root = self._inputs(tmp_path)
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 0
+        assert report["ok"] is True
+        assert report["cues"] == 3
+        assert report["output"] == "transcript/video.zh.dub.srt"
+        via_cook = (root / "transcript" / "video.zh.dub.srt").read_text(
+            encoding="utf-8")
+        assert "00:00:03,500 --> 00:00:07,100" in via_cook
+
+        # parity: the same stage run directly must produce identical bytes
+        direct_out = root / "transcript" / "direct.zh.dub.srt"
+        _run_stage_direct("dub", "make_zh_dub_srt.py", "t_make_srt_direct", [
+            str(root / "transcript" / "video.en.full.srt"),
+            str(root / "transcript" / "translations_dub.txt"),
+            str(direct_out)])
+        assert via_cook == direct_out.read_text(encoding="utf-8")
+
+    def test_cli_parity_make_srt_missing_inputs_die(self, tmp_path):
+        root = tmp_path / "empty"
+        root.mkdir()
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "en.full.srt" in report["error"]
+
+    def test_cli_parity_make_srt_count_mismatch_refused(self, tmp_path):
+        root = self._inputs(tmp_path, n_zh=2)  # 3 cues vs 2 lines
+        out = root / "transcript" / "video.zh.dub.srt"
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "3" in report["error"] and "2" in report["error"]
+        assert not out.exists()  # refused before writing
+
+    def test_cli_parity_make_srt_forwards_derived_paths(self, tmp_path, monkeypatch):
+        root = self._inputs(tmp_path)
+        calls = {}
+
+        class _Stub:
+            def main(self):
+                calls["argv"] = list(sys.argv)
+                out = Path(sys.argv[3])
+                out.write_text("1\n00:00:01,000 --> 00:00:02,000\n甲\n",
+                               encoding="utf-8")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 0 and report["ok"] is True
+        tdir = (root / "transcript").resolve()
+        assert calls["argv"][1:] == [
+            str(tdir / "video.en.full.srt"),
+            str(tdir / "translations_dub.txt"),
+            str(tdir / "video.zh.dub.srt"),
+        ]
+
+
+class TestCliParityMergeShort:
+    """merge-short: input/output/--min-dur/--max-len/--lang forwarded to
+    stages/subtitle/subtitles.py's cmd — identical defaults, byte-equal
+    output vs running the stage script directly."""
+
+    INPUT_CUES = [
+        (1, "00:00:00,000 --> 00:00:02,500", "这是一句足够长的话"),
+        (2, "00:00:02,500 --> 00:00:02,900", "嗯"),          # 0.4s -> absorbed
+        (3, "00:00:03,000 --> 00:00:05,500", "第二句正常长度的话"),
+        (4, "00:00:05,500 --> 00:00:05,800", "。"),          # punct-only
+        (5, "00:00:06,000 --> 00:00:09,000", "第三句也正常"),
+    ]
+
+    def _input(self, tmp_path: Path) -> Path:
+        inp = tmp_path / "dubbing.short.srt"
+        _make_srt(inp, self.INPUT_CUES)
+        return inp
+
+    def test_cli_parity_merge_short_cli_parser_wiring(self):
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "merge-short", "in.srt", "out.srt"])
+        assert args.func is cook.cmd_dub_merge_short
+        assert args.min_dur == 1.2 and isinstance(args.min_dur, float)
+        assert args.max_len == 0 and isinstance(args.max_len, int)
+        assert args.lang == "zh"
+        args = p.parse_args(["dub", "merge-short", "in.srt", "out.srt",
+                             "--min-dur", "0.8", "--max-len", "56",
+                             "--lang", "en"])
+        assert (args.min_dur, args.max_len, args.lang) == (0.8, 56, "en")
+
+    def test_cli_parity_merge_short_output_equals_direct_stage_run(self, tmp_path):
+        inp = self._input(tmp_path)
+        via_cook_out = tmp_path / "via_cook.merged.srt"
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(inp), str(via_cook_out),
+             "--min-dur", "1.2", "--max-len", "42", "--lang", "zh"])
+        assert code == 0 and report["ok"] is True
+        assert report["cues_before"] == 5
+        assert report["cues_after"] < 5  # short + punct-only cues merged away
+        direct_out = tmp_path / "direct.merged.srt"
+        _run_stage_direct("subtitle", "subtitles.py", "t_merge_short_direct", [
+            "merge-short", str(inp), str(direct_out),
+            "--min-dur", "1.2", "--max-len", "42", "--lang", "zh"])
+        assert via_cook_out.read_text(encoding="utf-8") == \
+            direct_out.read_text(encoding="utf-8")
+
+    def test_cli_parity_merge_short_forwards_to_subtitles_cmd(self, tmp_path, monkeypatch):
+        inp = self._input(tmp_path)
+        out = tmp_path / "merged.srt"
+        calls = {}
+
+        class _Stub:
+            def cmd_merge_short(self, ns):
+                calls["ns"] = ns
+                out.write_text("1\n00:00:00,000 --> 00:00:03,000\n合并后的句子\n",
+                               encoding="utf-8")
+
+        monkeypatch.setattr(cook, "_import_subtitles_module", lambda: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(inp), str(out),
+             "--min-dur", "0.8", "--max-len", "56", "--lang", "en"])
+        assert code == 0 and report["ok"] is True
+        ns = calls["ns"]
+        assert ns.input == str(inp)
+        assert ns.output == str(out)
+        assert ns.min_dur == 0.8 and ns.max_len == 56 and ns.lang == "en"
+
+    def test_cli_parity_merge_short_missing_input_dies(self, tmp_path):
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(tmp_path / "nope.srt"),
+             str(tmp_path / "out.srt")])
+        assert code == 1
+        assert report["ok"] is False
+        assert "nope.srt" in report["error"]
+
+
+class TestCliParityLoudnessMatch:
+    """loudness-match: <output_root> <name> [--anchor] [--peak] forwarded to
+    stages/dub/loudness_match.py over dubbed/_full/_segments."""
+
+    def _segments(self, root: Path, n: int = 2) -> Path:
+        segs = root / "dubbed" / "_full" / "_segments"
+        segs.mkdir(parents=True)
+        for i in range(1, n + 1):
+            (segs / f"sent_{i:04d}.wav").write_bytes(b"x" * 2048)
+        return segs
+
+    def test_cli_parity_loudness_cli_parser_wiring(self):
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "loudness-match", "some/root", "name"])
+        assert args.func is cook.cmd_dub_loudness_match
+        assert args.anchor == -18.7 and isinstance(args.anchor, float)
+        assert args.peak == -1.5 and isinstance(args.peak, float)
+        args = p.parse_args(["dub", "loudness-match", "r", "n",
+                             "--anchor", "-17.0", "--peak", "-2.5"])
+        assert (args.anchor, args.peak) == (-17.0, -2.5)
+
+    def test_cli_parity_loudness_forwards_root_and_flags(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        self._segments(root, n=2)
+        calls = {}
+
+        class _Stub:
+            def main(self):
+                calls["argv"] = list(sys.argv)
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video",
+             "--anchor", "-17.0", "--peak", "-1.0"])
+        assert code == 0 and report["ok"] is True
+        assert calls["argv"][1:] == [str(root.resolve()), "video",
+                                     "--anchor", "-17.0", "--peak", "-1.0"]
+        assert report["cue_wavs"] == 2
+        assert report["segments_dir"] == "dubbed/_full/_segments"
+        assert report["anchor_lufs"] == -17.0
+        assert report["peak_dbfs"] == -1.0
+
+    def test_cli_parity_loudness_missing_segments_dies(self, tmp_path):
+        root = tmp_path / "vid"
+        root.mkdir()
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "synth" in report["error"]  # points at the producing command
+
+    def test_cli_parity_loudness_stage_error_dies_with_json(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        self._segments(root, n=1)
+
+        class _Stub:
+            def main(self):
+                raise RuntimeError("ebur128 parse fail: sent_0001.wav")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "ebur128" in report["error"]

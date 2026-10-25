@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 三子命令与 stages 直跑产物等价（对小样本对拍）
-- [ ] parser 接线测试
+- [x] 三子命令与 stages 直跑产物等价（对小样本对拍）
+- [x] parser 接线测试
