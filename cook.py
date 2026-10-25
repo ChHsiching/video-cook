@@ -1149,6 +1149,19 @@ def _run_subs(mod, argv: list[str]) -> None:
         sys.argv = old
 
 
+def _run_stage_argv(mod, argv: list[str], stage: str) -> None:
+    """Invoke a packaged stage module's main() with a synthetic argv (the
+    _run_subs mechanism, generalized beyond subtitles), keeping cook's
+    stdout pure-JSON: the stage's human-readable prints go to stderr, and a
+    stage-level refusal (sys.exit "message", e.g. make_zh_dub_srt's line
+    count mismatch) becomes cook's _die JSON error instead of a bare exit."""
+    try:
+        _run_subs(mod, argv)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _die(str(e.code), obj={"stage": stage})
+
+
 def _import_full_dub_module():
     """Import the packaged dub stage module (stages/dub/full_dub.py) for its
     pure helpers (synth_bands — the multi-worker band split). The module
@@ -2594,6 +2607,124 @@ def cmd_dub_gate(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+# ----------------------------------------------------------------------------
+# dub subcommands: make-srt / merge-short / loudness-match — the three
+# thin shells the video-dubbing SKILL.md already documents but the CLI
+# lacked (ticket 03: contract drift; agents had to run the stage scripts
+# by hand). Each forwards to the packaged stages/ implementation, so the
+# product is byte-identical to running the stage directly.
+# ----------------------------------------------------------------------------
+
+def cmd_dub_make_srt(args: argparse.Namespace) -> None:
+    """Write transcript/<name>.zh.dub.srt — one zh cue per non-empty line
+    of translations_dub.txt, timestamps inherited from
+    transcript/<name>.en.full.srt (the skill's pre-assembly SRT; full_dub's
+    timeline work recomputes the real TTS timing later).
+
+    Thin shell over stages/dub/make_zh_dub_srt.py (stdlib-only,
+    in-process): cook derives the transcript/ paths from
+    <output_root>/<name> and forwards; the stage's own pairing check
+    (cue count == translation line count) still fires."""
+    root = _video_dir(args.output_root)
+    en_full = root / "transcript" / f"{args.name}.en.full.srt"
+    trans = root / "transcript" / "translations_dub.txt"
+    output = root / "transcript" / f"{args.name}.zh.dub.srt"
+    for f in (en_full, trans):
+        if not f.exists():
+            _die(f"{f.name} not found: {f} — make-srt pairs "
+                 f"{en_full.name} with translations_dub.txt (write the dub "
+                 f"translation first)",
+                 obj={"stage": "make-srt", "missing": str(f)})
+
+    mod = _import_stage_module("dub", "make_zh_dub_srt.py",
+                               "cook_stages_dub_make_srt")
+    _run_stage_argv(mod, [str(en_full), str(trans), str(output)],
+                    stage="make-srt")
+    _emit_json({
+        "ok": True,
+        "output": output.relative_to(root).as_posix(),
+        "cues": len(_read_srt_cues(output)),
+        "inputs": {
+            "en_full_srt": en_full.relative_to(root).as_posix(),
+            "translations": trans.relative_to(root).as_posix(),
+        },
+    })
+
+
+def cmd_dub_merge_short(args: argparse.Namespace) -> None:
+    """Absorb sub-min-duration and punctuation-only cues into their
+    neighbours — exposed on `cook dub` for the dubbing pipeline's working
+    SRTs (e.g. dubbed/_full/dubbing.short.srt -> dubbing.merged.srt).
+
+    Thin forward to stages/subtitle/subtitles.py's cmd_merge_short with the
+    stage's own defaults (min-dur 1.2s, max-len 0, lang zh): the output is
+    byte-identical to running `python subtitles.py merge-short` directly."""
+    inp = Path(args.input)
+    if not inp.is_file():
+        _die(f"input SRT not found: {inp}", obj={"stage": "merge-short",
+                                                 "missing": str(inp)})
+
+    subs = _import_subtitles_module()
+    import contextlib
+    ns = argparse.Namespace(input=args.input, output=args.output,
+                            min_dur=args.min_dur, max_len=args.max_len,
+                            lang=args.lang)
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            subs.cmd_merge_short(ns)
+    except (OSError, ValueError, RuntimeError) as e:
+        _die(f"merge-short failed: {e}", obj={"stage": "merge-short"})
+
+    out = Path(args.output)
+    _emit_json({
+        "ok": True,
+        "input": str(inp),
+        "output": str(out),
+        "cues_before": len(_read_srt_cues(inp)),
+        "cues_after": len(_read_srt_cues(out)) if out.is_file() else 0,
+        "min_dur": args.min_dur,
+        "max_len": args.max_len,
+        "lang": args.lang,
+    })
+
+
+def cmd_dub_loudness_match(args: argparse.Namespace) -> None:
+    """Per-cue loudness matching over dubbed/_full/_segments/sent_NNNN.wav
+    (ffmpeg ebur128 per cue, pulled to the anchor with peak protection).
+    Run once AFTER synth and BEFORE assemble — the assembler's global
+    loudnorm lands the track, not the individual voices, and assemble's fit
+    pass overwrites the segments in place.
+
+    Thin shell over stages/dub/loudness_match.py (ffmpeg via subprocess,
+    otherwise stdlib — in-process). Cues already within tolerance are
+    skipped, so re-running is cheap."""
+    root = _video_dir(args.output_root)
+    segs = root / "dubbed" / "_full" / "_segments"
+    n_cues = sum(1 for p in segs.iterdir()
+                 if re.fullmatch(r"sent_\d{4}\.wav", p.name)) \
+        if segs.is_dir() else 0
+    if n_cues == 0:
+        _die("missing dubbed/_full/_segments cue wavs — run cook dub synth",
+             obj={"stage": "loudness-match", "missing": str(segs)})
+
+    mod = _import_stage_module("dub", "loudness_match.py",
+                               "cook_stages_dub_loudness")
+    try:
+        _run_stage_argv(mod, [str(root), args.name,
+                              "--anchor", str(args.anchor),
+                              "--peak", str(args.peak)],
+                        stage="loudness-match")
+    except RuntimeError as e:  # ebur128 parse fail / ffmpeg gain failure
+        _die(str(e), obj={"stage": "loudness-match"})
+    _emit_json({
+        "ok": True,
+        "segments_dir": segs.relative_to(root).as_posix(),
+        "cue_wavs": n_cues,
+        "anchor_lufs": args.anchor,
+        "peak_dbfs": args.peak,
+    })
+
+
 # ============================================================================
 # CLI entry point
 # ============================================================================
@@ -2835,6 +2966,51 @@ def build_parser() -> argparse.ArgumentParser:
                           "(findings, coverage, verdict). Without it only a "
                           "human summary goes to stderr.")
     pgr.set_defaults(func=cmd_dub_gate)
+
+    # make-srt: thin shell over the packaged stages/dub/make_zh_dub_srt.py
+    # (stdlib-only, in-process). SKILL.md Step 3's pre-assembly SRT.
+    pms = dub_sub.add_parser(
+        "make-srt",
+        help="write transcript/<name>.zh.dub.srt — zh cues on the "
+             "en.full.srt timestamps (from en.full.srt + translations_dub.txt)")
+    pms.add_argument("output_root")
+    pms.add_argument("name")
+    pms.set_defaults(func=cmd_dub_make_srt)
+
+    # merge-short: thin forward of the subtitles module's merge-short cmd
+    # (same defaults, byte-identical output to the stage run).
+    pmsh = dub_sub.add_parser(
+        "merge-short",
+        help="absorb sub-min-duration and punctuation-only cues into "
+             "neighbours (stages/subtitle/subtitles.py merge-short)")
+    pmsh.add_argument("input", help="input SRT (e.g. dubbed/_full/dubbing.short.srt)")
+    pmsh.add_argument("output", help="output SRT (e.g. dubbed/_full/dubbing.merged.srt)")
+    pmsh.add_argument("--min-dur", type=float, default=1.2, metavar="SECONDS",
+                      help="absorb cues shorter than this (and punctuation-only "
+                           "cues) into a neighbour. Default 1.2s.")
+    pmsh.add_argument("--max-len", type=int, default=0, metavar="CHARS",
+                      help="skip a merge that would push the target cue's text "
+                           "past this length (zh: width units, CJK=2 ASCII=1). "
+                           "Default 0 = no check.")
+    pmsh.add_argument("--lang", choices=["zh", "en"], default="zh",
+                      help="when zh, --max-len is display-width units "
+                           "(CJK=2, ASCII=1). Default zh.")
+    pmsh.set_defaults(func=cmd_dub_merge_short)
+
+    # loudness-match: thin shell over the packaged
+    # stages/dub/loudness_match.py (ffmpeg via subprocess, in-process).
+    plm = dub_sub.add_parser(
+        "loudness-match",
+        help="pull every dubbed/_full/_segments take to the -18.7 LUFS "
+             "anchor with -1.5 dBFS peak protection (after synth, before "
+             "assemble)")
+    plm.add_argument("output_root")
+    plm.add_argument("name")
+    plm.add_argument("--anchor", type=float, default=-18.7, metavar="LUFS",
+                     help="target integrated LUFS per cue (default -18.7)")
+    plm.add_argument("--peak", type=float, default=-1.5, metavar="DBFS",
+                     help="true-peak ceiling in dBFS (default -1.5)")
+    plm.set_defaults(func=cmd_dub_loudness_match)
 
     return p
 
