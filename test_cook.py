@@ -865,9 +865,19 @@ Dialogue: 0,0:00:00,0:00:02,Default,,0,0,0,,hello
 
 class TestBurnBarPxAssGeometry:
     """When burn runs in bottom-bar mode and the bar ASS exists, read its
-    PlayResY (which for a bar build equals frame_height + bar_px) and warn
-    when it differs from 1080 + args.bar_px. Overlay mode and missing-ASS
+    PlayResY and warn when it differs from the expectation derived from the
+    probed frame height. Geometry model (same as full_dub step 2d): the ASS
+    coordinate system is 1920 x (1080 + bar_play) and libass scales it
+    per-axis onto the padded frame, so a correct build has y-scale H/1080 —
+    a real pad of bar_px pixels equals round(bar_px * 1080 / H) in ASS units
+    and the expected PlayResY is 1080 + that. A probe failure falls back to
+    the 1080p assumption (the legacy behavior). Overlay mode and missing-ASS
     skip the check entirely."""
+
+    def _stub_probe(self, monkeypatch, frame_h):
+        """Pin the probed frame height so the geometry check sees the frame
+        we want without a real ffprobe run."""
+        monkeypatch.setattr(cook, "_probe_frame_height", lambda video: frame_h)
 
     def _run_burn(self, root: Path, mode: str = "bottom-bar", bar_px: int = 220,
                   detach: bool = False):
@@ -967,6 +977,83 @@ class TestBurnBarPxAssGeometry:
         assert "ASS not found" in stderr or "ASS" in stderr
         # geometry check did not run (no mismatch banner)
         assert "playresy" not in stderr.lower()
+
+    def test_2160p_scaled_ass_no_warning(self, tmp_path: Path, monkeypatch):
+        """4K frame (2160p) + ASS scaled to its geometry: burn pads 440 real
+        px, which is 220 in ASS units, so a correct ASS carries
+        PlayResY=1300 -> zero warnings. (Pre-fix this false-warned: the
+        hardcoded 1080 expectation demanded 1080+440=1520.)"""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 2160)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=440)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+        assert "1300" not in stderr  # no mismatch banner
+
+    def test_2160p_true_mismatch_still_warns(self, tmp_path: Path, monkeypatch):
+        """4K frame, burn pads 440 real px (= 220 ASS units -> expects
+        PlayResY 1300), but the ASS was built with an unscaled 440-unit bar
+        (PlayResY 1520) -> still a true geometry error, still warns."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1520)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 2160)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=440)
+        assert "geometry" in stderr.lower()
+        assert "1300" in stderr or "1520" in stderr  # names the values
+        # warning does not fail the burn
+        assert report is None or report.get("ok") is True or self.last_exit == 0
+
+    def test_1080p_probe_keeps_legacy_expectation(self, tmp_path: Path, monkeypatch):
+        """An explicit 1080p probe is scale factor 1: bar 220 real px expects
+        PlayResY 1080+220=1300 — the legacy behavior, now via the probe."""
+        root = tmp_path / "vid"
+        self._stage_burn_inputs(root, "bottom-bar", ass_play_res_y=1300)
+        self._stub_ffmpeg(monkeypatch)
+        self._stub_probe(monkeypatch, 1080)
+        report, stderr = self._run_burn(root, mode="bottom-bar", bar_px=220)
+        assert "geometry" not in stderr.lower()
+        assert "playresy" not in stderr.lower()
+
+
+class TestGeometryProbeFrameHeight:
+    """The frame-height probe feeding the bar-px geometry check: parses
+    ffprobe's WxH answer (same call shape as full_dub's _probe_wh). Anything
+    but a clean answer — ffprobe missing, nonzero exit, unparseable stdout —
+    returns None so cmd_burn falls back to the 1080p assumption instead of
+    crashing or misdetecting."""
+
+    def _probe(self, monkeypatch, *, stdout="", returncode=0, ffprobe_on_path=True):
+        if ffprobe_on_path:
+            monkeypatch.setattr(cook.shutil, "which",
+                                lambda name: "/usr/bin/ffprobe")
+        else:
+            monkeypatch.setattr(cook.shutil, "which", lambda name: None)
+
+        class _R:
+            pass
+
+        r = _R()
+        r.returncode = returncode
+        r.stdout = stdout
+        monkeypatch.setattr(cook.subprocess, "run", lambda *a, **k: r)
+        return cook._probe_frame_height(Path("raw/video.raw.mp4"))
+
+    def test_parses_width_height_csv(self, monkeypatch):
+        assert self._probe(monkeypatch, stdout="3840x2160\n") == 2160
+        assert self._probe(monkeypatch, stdout="1920x1080\n") == 1080
+
+    def test_missing_ffprobe_returns_none(self, monkeypatch):
+        assert self._probe(monkeypatch, ffprobe_on_path=False) is None
+
+    def test_probe_failure_returns_none(self, monkeypatch):
+        # ffprobe ran but errored (e.g. the file is not a video) -> None
+        assert self._probe(monkeypatch, stdout="", returncode=1) is None
+        # exited 0 but the stdout is not a clean WxH -> None
+        assert self._probe(monkeypatch, stdout="n/a") is None
+        assert self._probe(monkeypatch, stdout="2160") is None
 
 
 class TestLengthIssuesWidthGate:
@@ -1130,6 +1217,7 @@ class TestQualityGuardR2:
 _DUB_STAGE_SCRIPTS = [
     "full_dub.py",
     "retime.py",
+    "audit_coverage.py",
     "loudness_match.py",
     "scan_reference.py",
     "extract_reference.py",
@@ -1152,7 +1240,7 @@ class TestDubScriptsInPackage:
     needs to be installed for the pipeline to run. (measure_rate.py and
     length_gate.py are functions-only and run in-process under cook.)"""
 
-    def test_all_seven_scripts_present(self):
+    def test_all_stage_scripts_present(self):
         d = _stages_dub_dir()
         for name in _DUB_STAGE_SCRIPTS:
             assert (d / name).is_file(), f"stages/dub/{name} missing"
@@ -1709,6 +1797,149 @@ class TestShortenExemptionUnchanged:
         text = "这是一条宽度刚好超过豁免带上限一点点的中文字幕用来确认必须切分路径仍会触发"
         pieces = _shorten_cue_texts(tmp_path, text, max_zh=56)
         assert len(pieces) >= 2
+
+
+# ----------------------------------------------------------------------------
+# cook subtitles shorten: comma-first hard cuts (ticket 04, nate-herk reflux).
+# When a cue exceeds the limit and the sentence-punctuation ladder yields no
+# usable block (or a block still over the limit), the hard cut must prefer the
+# last clause comma (，,；;) inside the limit over a word boundary, falling to
+# the word-level cut only when no such comma exists. Judgment case (both the
+# bilingual and the dubbing pipeline hit it): the no-sentence-punctuation
+# question "Where does that break ... right scoped API keys or whatever ..."
+# was word-cut between "API" and "keys", splitting the multi-word term across
+# two cues. These are pure-function tests on the same splitter->packer
+# composition cmd_shorten uses — no SRT I/O.
+# ----------------------------------------------------------------------------
+
+# ZH, ASCII commas: split_zh's clause ladder (，、：) never sees ASCII commas,
+# so the over-width block reaches pack_zh's hard cut — exactly the path the
+# comma-first rule guards. "API key" rides inside as the multi-word term.
+_COMMA_ZH = ("一个不懂技术的人可能不知道怎么搭建合适的代码库,"
+             "也可能不知道怎么开出权限范围合适的API key,"
+             "各种坑都可能出现")
+
+# EN, full-width comma: split_en's comma split only matches "," + whitespace,
+# so a translated full-width ，survives into the hard cut.
+_COMMA_EN = ("Imagine a non-technical person trying to set up the right code "
+             "base without any prior knowledge，they also have to create "
+             "properly scoped API keys or whatever the tooling demands and "
+             "keep everything from falling through the cracks")
+
+# The acceptance cue from the incident (en.srt 146 of the nate-herk run):
+# 287 chars, one comma at index 191 — past the 160 limit, so the comma-first
+# rule cannot fire and the behavior is pinned as the documented boundary.
+_COMMA_JUDGMENT = (
+    "Where does that break where a non-technical person that might not have "
+    "knowledge of how to set up the right code base or how to create the right "
+    "scoped API keys or whatever the issue might be, how does that person "
+    "drive with intent while still making sure that things don't fall through?"
+)
+
+_SOFT_BREAK = "，,；;"
+
+
+def _shorten_zh_pure(subs, text: str, limit: int = 56) -> list[str]:
+    """cmd_shorten's zh composition (split_zh -> pack_zh) as a pure call."""
+    return subs.pack_zh(subs.split_zh(text, limit), limit)
+
+
+def _shorten_en_pure(subs, text: str, limit: int = 160) -> list[str]:
+    """cmd_shorten's en composition (split_en -> pack) as a pure call."""
+    return subs.pack(subs.split_en(text, limit), limit)
+
+
+class TestShortenCommaFirst:
+    def test_zh_no_sentence_punct_cuts_at_comma(self):
+        """Over-width zh text with no sentence punctuation must cut right
+        after a clause comma, never inside a word run — the ASCII-comma
+        block that the punctuation ladder misses is the recurring case."""
+        subs = cook._import_subtitles_module()
+        pieces = _shorten_zh_pure(subs, _COMMA_ZH)
+        assert "".join(pieces) == _COMMA_ZH        # nothing lost or reordered
+        assert all(subs.wlen(p) <= 56 for p in pieces)
+        # every cut lands right after a comma; the last piece carries the tail
+        for p in pieces[:-1]:
+            assert p[-1] in _SOFT_BREAK, f"cut not at a comma: {p!r}"
+        # the multi-word term stays whole inside one cue
+        assert any("API key" in p for p in pieces)
+
+    def test_en_no_sentence_punct_cuts_at_comma(self):
+        """Over-length en text with no sentence punctuation cuts at the
+        full-width comma a translation can inject; the word-level cut would
+        have landed mid-clause and been free to split terms like API keys."""
+        subs = cook._import_subtitles_module()
+        pieces = _shorten_en_pure(subs, _COMMA_EN)
+        assert " ".join(pieces).replace(" ", "") == _COMMA_EN.replace(" ", "")
+        assert all(len(p) <= 160 for p in pieces)
+        for p in pieces[:-1]:
+            assert p[-1] in _SOFT_BREAK, f"cut not at a comma: {p!r}"
+        assert any("API keys" in p for p in pieces)
+
+    def test_en_no_comma_keeps_word_level_cut(self):
+        """No comma anywhere -> the word-level hard cut is the only option
+        and its exact legacy output is pinned so the rule provably adds a
+        preference instead of changing the fallback."""
+        subs = cook._import_subtitles_module()
+        text = ("A really long run of spoken text without any punctuation at "
+                "all just words flowing one after another until the line "
+                "exceeds the limit and gets cut at a word boundary near the "
+                "end of the first chunk")
+        assert _shorten_en_pure(subs, text) == [
+            "A really long run of spoken text without any punctuation at all "
+            "just words flowing one after another until the line exceeds the "
+            "limit and gets cut at a word",
+            "boundary near the end of the first chunk",
+        ]
+
+    def test_zh_no_comma_degraded_cut_unchanged(self, monkeypatch):
+        """Same pin on the zh side, with jieba forced absent so the width-only
+        legacy cut is deterministic. A fresh module instance is imported after
+        the monkeypatch so the cached jieba state cannot leak in."""
+        monkeypatch.setitem(sys.modules, "jieba", None)
+        subs = cook._import_subtitles_module()
+        text = ("这是一段完全没有逗号也没有任何句末标点的超长中文文本用来"
+                "确认无逗号时硬切行为保持不变且切分位置与旧实现完全一致")
+        assert _shorten_zh_pure(subs, text) == [
+            "这是一段完全没有逗号也没有任何句末标点的超长中文文本用来",
+            "确认无逗号时硬切行为保持不变且切分位置与旧实现完全一致",
+        ]
+
+    def test_judgment_cue_comma_beyond_limit_is_unchanged(self):
+        """The incident cue itself: its only comma sits at index 191, past
+        the 160 limit — cutting there would trade a length violation for
+        term integrity, which the rule forbids. The word-level split of
+        "API"/"keys" therefore remains, pinned here as the rule's explicit
+        boundary (the shipped video fixed this one cue at the product
+        layer; see nate-herk STATE.md Gate C round 1)."""
+        subs = cook._import_subtitles_module()
+        assert _shorten_en_pure(subs, _COMMA_JUDGMENT) == [
+            "Where does that break where a non-technical person that might "
+            "not have knowledge of how to set up the right code base or how "
+            "to create the right scoped API",
+            "keys or whatever the issue might be, how does that person drive "
+            "with intent while still making sure that things don't fall "
+            "through?",
+        ]
+
+    def test_sentence_punctuation_still_wins_zh(self):
+        """Sentence punctuation keeps priority: an over-width cue made of two
+        sentences splits on the sentence boundary; commas inside a sentence
+        never preempt it (regression guard for the ladder's order)."""
+        subs = cook._import_subtitles_module()
+        text = ("这第一句话足够长而且带一个完整的意思。"
+                "这第二句里面有逗号，逗号必须让位于句子边界，不能抢先！")
+        pieces = _shorten_zh_pure(subs, text)
+        assert [p[-1] for p in pieces] == ["。", "！"]
+
+    def test_sentence_punctuation_still_wins_en(self):
+        subs = cook._import_subtitles_module()
+        text = ("The first sentence is long enough to matter here and it "
+                "carries its own full stop. The second sentence is also "
+                "long, with commas inside, but the sentence boundary must "
+                "win over any comma!")
+        pieces = _shorten_en_pure(subs, text)
+        assert [p[-1] for p in pieces] == [".", "!"]
 
 
 # ----------------------------------------------------------------------------
@@ -3642,6 +3873,171 @@ class TestAssembleAutoRetime:
         assert "Stage 2 DONE" in buf.getvalue()
 
 
+# ----------------------------------------------------------------------------
+# assemble fit sidecar (nate-herk reflux ticket 01): assembly NEVER writes the
+# synth cache. The fit pass's atempo products land in _full/_segments_fitted/,
+# a sidecar wiped and rebuilt at the start of every assemble; placement (2b)
+# and the subtitle window (2c) resolve takes fitted-first. The incident this
+# pins: an experimental 463-cue assemble crushed 144 takes against misaligned
+# windows and replaced them in the cache before erroring out; the next
+# assemble silently shipped the corruption. Same doubles as
+# TestAssembleAutoRetime — fake subprocess.run (real stdlib-wave wavs), no
+# ffmpeg, no retime (no_retime=True keeps the assertion surface on the fit).
+# ----------------------------------------------------------------------------
+
+class TestAssembleFitSidecar:
+    """An over-window take (12.0s in a 10.0s window, factor 1.2) must leave
+    _segments/sent_0001.wav byte- AND mtime-identical, put the atempo product
+    in _segments_fitted/, and place + window subtitles on the FITTED audio;
+    a second assemble rebuilds the sidecar from the untouched cache."""
+
+    RAW_DUR = 22.2
+
+    @staticmethod
+    def _write_silence(path: Path, dur: float) -> None:
+        import contextlib
+        import wave
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(wave.open(str(path), "wb")) as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(b"\x00" * (int(dur * 22050) * 2))
+
+    def _dur(self, path: Path) -> float:
+        import contextlib
+        import wave
+        with contextlib.closing(wave.open(str(path), "rb")) as w:
+            return w.getnframes() / float(w.getframerate())
+
+    def _video(self, tmp_path: Path) -> Path:
+        """2 cues: take 1 is 12.0s inside its 10.0s window (10s -> next cue
+        start 20s; factor 1.2 -> atempo'd); take 2 is 0.2s in a 2.2s window
+        (natural pace, no fit)."""
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "video.en.full.srt", [
+            (1, "00:00:10,000 --> 00:00:12,000", "English cue one"),
+            (2, "00:00:20,000 --> 00:00:22,000", "English cue two"),
+        ])
+        _make_translations(root / "transcript" / "translations_dub.txt",
+                           ["这是第一句配音", "这是第二句配音"])
+        segs = root / "dubbed" / "_full" / "_segments"
+        segs.mkdir(parents=True, exist_ok=True)
+        self._write_silence(segs / "sent_0001.wav", 12.0)
+        self._write_silence(segs / "sent_0002.wav", 0.2)
+        return root
+
+    def _fake_subprocess(self):
+        """atempo writes REAL stdlib-wave silence of in_dur/k (compressed);
+        apad writes in_dur+pad; ffprobe answers canned stdout; the final
+        encode just touches its output."""
+        import contextlib
+        import types
+        import wave
+        RAW = self.RAW_DUR
+
+        def run(cmd, capture_output=True, text=True, **kw):
+            if cmd[0] == "ffprobe":
+                out = "1920x1080\n" if "stream=width,height" in cmd else f"{RAW}\n"
+                return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+            if any(str(a).startswith("atempo=") for a in cmd):
+                af = next(str(a) for a in cmd if str(a).startswith("atempo="))
+                k = float(af.split("=", 1)[1])
+                src = cmd[cmd.index("-i") + 1]
+                with contextlib.closing(wave.open(str(src), "rb")) as w:
+                    d = w.getnframes() / float(w.getframerate())
+                self._write_silence(Path(cmd[-1]), d / k)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if any(str(a).startswith("apad=pad_dur=") for a in cmd):
+                af = next(str(a) for a in cmd if str(a).startswith("apad="))
+                pad = float(af.rsplit("=", 1)[1])
+                src = cmd[cmd.index("-i") + 1]
+                with contextlib.closing(wave.open(str(src), "rb")) as w:
+                    d = w.getnframes() / float(w.getframerate())
+                self._write_silence(Path(cmd[-1]), d + pad)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[-1]).write_bytes(b"fake mp4")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return run
+
+    def _assemble(self, mod, root: Path) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.stage_assemble(str(root), "video", no_retime=True)
+        return buf.getvalue()
+
+    def test_over_window_take_cache_untouched_sidecar_written(self,
+                                                              tmp_path,
+                                                              monkeypatch):
+        """After assembling an over-window take: the cache file's bytes and
+        mtime are identical, the atempo product exists in _segments_fitted/
+        at window size, and placement consumed the FITTED take (padded cue
+        is 10.0s of audio, not the cache's 12.0s)."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        before_bytes = cache.read_bytes()
+        before_mtime = cache.stat().st_mtime_ns
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        out = self._assemble(mod, root)
+        # cache is physically un-writable by assembly: bytes AND mtime
+        assert cache.read_bytes() == before_bytes
+        assert cache.stat().st_mtime_ns == before_mtime
+        # the atempo product lives in the sidecar, window-sized (12.0/1.2)
+        fitted = root / "dubbed" / "_full" / "_segments_fitted" / "sent_0001.wav"
+        assert fitted.exists() and fitted.stat().st_size > 1000
+        assert abs(self._dur(fitted) - 10.0) < 0.01
+        # placement used the fitted take: cue 1 contributes 10.0s of audio
+        pad0 = root / "dubbed" / "_full" / "_audio_pad" / "cue_0000.wav"
+        assert abs(self._dur(pad0) - 10.0) < 0.01
+        assert "Stage 2 DONE" in out
+
+    def test_subtitle_window_follows_fitted_take(self, tmp_path, monkeypatch):
+        """2c's ZH window spans the PLACED audio via the fitted-first
+        resolver: the cache take is still 12.0s (untouched), yet cue 1's
+        end is start + fitted 10.0s = 20.0s — reading the cache instead of
+        the sidecar would give 22.0s."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        self._assemble(mod, root)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        assert abs(self._dur(cache) - 12.0) < 0.01
+        dubbing = (root / "dubbed" / "_full" / "dubbing.srt"
+                   ).read_text(encoding="utf-8")
+        assert "00:00:10,000 --> 00:00:20,000" in dubbing
+        assert "00:00:10,000 --> 00:00:22,000" not in dubbing
+
+    def test_second_assemble_rebuilds_sidecar_from_original_cache(self,
+                                                                  tmp_path,
+                                                                  monkeypatch):
+        """Every assemble starts by wiping _segments_fitted/: a corrupted
+        fitted product is rebuilt byte-identically from the untouched cache,
+        and a stale leftover for a cue this run never fits is gone."""
+        mod, _pkg = _load_full_dub(tmp_path, monkeypatch)
+        root = self._video(tmp_path)
+        cache = root / "dubbed" / "_full" / "_segments" / "sent_0001.wav"
+        cache_before = cache.read_bytes()
+        fitted_dir = root / "dubbed" / "_full" / "_segments_fitted"
+        monkeypatch.setattr(subprocess, "run", self._fake_subprocess())
+        self._assemble(mod, root)
+        first = (fitted_dir / "sent_0001.wav").read_bytes()
+        # stale sidecar state: a corrupted product + a cue-2 leftover this
+        # run would never produce (cue 2 fits naturally)
+        self._write_silence(fitted_dir / "sent_0001.wav", 7.7)
+        self._write_silence(fitted_dir / "sent_0002.wav", 9.9)
+        out = self._assemble(mod, root)
+        # wiped and rebuilt from the ORIGINAL cache: byte-identical product,
+        # stale leftover gone, cache still untouched
+        assert (fitted_dir / "sent_0001.wav").read_bytes() == first
+        assert not (fitted_dir / "sent_0002.wav").exists()
+        assert cache.read_bytes() == cache_before
+        assert "Stage 2 DONE" in out
+
+
 class TestAssembleRetimeCLI:
     """full_dub.py's own CLI: the `--no-retime` argv cook passes through must
     reach stage_assemble (default off = retime on), and the flag is legal on
@@ -4122,3 +4518,698 @@ class TestPublishTmpSuffix:
         assert seen["name"].endswith(".wav")
         assert not seen["name"].startswith("c0009_")
         assert dst.read_bytes() == b"x" * 2048
+
+
+# ============================================================================
+# CLI parity (ticket 03): `cook dub make-srt / merge-short / loudness-match`
+# — the three subcommands the video-dubbing SKILL.md already documents.
+# Thin shells over the packaged stages; behavior must equal running the
+# stage script directly (byte-equal products on a small sample).
+# ============================================================================
+
+def _run_cook_cmd(argv: list[str]) -> tuple[dict, int]:
+    """Parse argv through cook's real parser, run the wired cmd, and return
+    (stdout JSON, exit code). SystemExit codes become ints; a non-int code
+    (argparse error string) counts as failure."""
+    import io
+    import contextlib
+    args = cook.build_parser().parse_args(argv)
+    buf = io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(buf):
+        try:
+            args.func(args)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+    text = buf.getvalue().strip()
+    return (json.loads(text) if text else {}), code
+
+
+def _run_stage_direct(stage: str, script: str, modname: str, argv: list[str]):
+    """Run a packaged stage module's main() directly (the 'stages 直跑' side
+    of the parity check) with a synthetic argv, stdout swallowed."""
+    import io
+    import contextlib
+    mod = cook._import_stage_module(stage, script, modname)
+    old = sys.argv
+    sys.argv = [script] + argv
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main()
+    finally:
+        sys.argv = old
+
+
+class TestCliParityMakeSrt:
+    """make-srt: <output_root> <name> -> transcript/<name>.zh.dub.srt,
+    forwarding derived paths to stages/dub/make_zh_dub_srt.py."""
+
+    def _inputs(self, tmp_path: Path, n_zh: int = 3) -> Path:
+        root = tmp_path / "vid"
+        tdir = root / "transcript"
+        tdir.mkdir(parents=True)
+        _make_srt(tdir / "video.en.full.srt", [
+            (1, "00:00:00,000 --> 00:00:03,200", "First full sentence here."),
+            (2, "00:00:03,500 --> 00:00:07,100", "Second sentence, also full."),
+            (3, "00:00:07,400 --> 00:00:11,000", "Third and final sentence."),
+        ])
+        _make_translations(tdir / "translations_dub.txt",
+                           [f"第{i}句完整的话。" for i in range(1, n_zh + 1)])
+        return root
+
+    def test_cli_parity_make_srt_parser_wiring(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "make-srt", "some/root", "name"])
+        assert args.func is cook.cmd_dub_make_srt
+        assert args.output_root == "some/root"
+        assert args.name == "name"
+
+    def test_cli_parity_make_srt_output_equals_direct_stage_run(self, tmp_path):
+        root = self._inputs(tmp_path)
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 0
+        assert report["ok"] is True
+        assert report["cues"] == 3
+        assert report["output"] == "transcript/video.zh.dub.srt"
+        via_cook = (root / "transcript" / "video.zh.dub.srt").read_text(
+            encoding="utf-8")
+        assert "00:00:03,500 --> 00:00:07,100" in via_cook
+
+        # parity: the same stage run directly must produce identical bytes
+        direct_out = root / "transcript" / "direct.zh.dub.srt"
+        _run_stage_direct("dub", "make_zh_dub_srt.py", "t_make_srt_direct", [
+            str(root / "transcript" / "video.en.full.srt"),
+            str(root / "transcript" / "translations_dub.txt"),
+            str(direct_out)])
+        assert via_cook == direct_out.read_text(encoding="utf-8")
+
+    def test_cli_parity_make_srt_missing_inputs_die(self, tmp_path):
+        root = tmp_path / "empty"
+        root.mkdir()
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "en.full.srt" in report["error"]
+
+    def test_cli_parity_make_srt_count_mismatch_refused(self, tmp_path):
+        root = self._inputs(tmp_path, n_zh=2)  # 3 cues vs 2 lines
+        out = root / "transcript" / "video.zh.dub.srt"
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "3" in report["error"] and "2" in report["error"]
+        assert not out.exists()  # refused before writing
+
+    def test_cli_parity_make_srt_forwards_derived_paths(self, tmp_path, monkeypatch):
+        root = self._inputs(tmp_path)
+        calls = {}
+
+        class _Stub:
+            def main(self):
+                calls["argv"] = list(sys.argv)
+                out = Path(sys.argv[3])
+                out.write_text("1\n00:00:01,000 --> 00:00:02,000\n甲\n",
+                               encoding="utf-8")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(["dub", "make-srt", str(root), "video"])
+        assert code == 0 and report["ok"] is True
+        tdir = (root / "transcript").resolve()
+        assert calls["argv"][1:] == [
+            str(tdir / "video.en.full.srt"),
+            str(tdir / "translations_dub.txt"),
+            str(tdir / "video.zh.dub.srt"),
+        ]
+
+
+class TestCliParityMergeShort:
+    """merge-short: input/output/--min-dur/--max-len/--lang forwarded to
+    stages/subtitle/subtitles.py's cmd — identical defaults, byte-equal
+    output vs running the stage script directly."""
+
+    INPUT_CUES = [
+        (1, "00:00:00,000 --> 00:00:02,500", "这是一句足够长的话"),
+        (2, "00:00:02,500 --> 00:00:02,900", "嗯"),          # 0.4s -> absorbed
+        (3, "00:00:03,000 --> 00:00:05,500", "第二句正常长度的话"),
+        (4, "00:00:05,500 --> 00:00:05,800", "。"),          # punct-only
+        (5, "00:00:06,000 --> 00:00:09,000", "第三句也正常"),
+    ]
+
+    def _input(self, tmp_path: Path) -> Path:
+        inp = tmp_path / "dubbing.short.srt"
+        _make_srt(inp, self.INPUT_CUES)
+        return inp
+
+    def test_cli_parity_merge_short_cli_parser_wiring(self):
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "merge-short", "in.srt", "out.srt"])
+        assert args.func is cook.cmd_dub_merge_short
+        assert args.min_dur == 1.2 and isinstance(args.min_dur, float)
+        assert args.max_len == 0 and isinstance(args.max_len, int)
+        assert args.lang == "zh"
+        args = p.parse_args(["dub", "merge-short", "in.srt", "out.srt",
+                             "--min-dur", "0.8", "--max-len", "56",
+                             "--lang", "en"])
+        assert (args.min_dur, args.max_len, args.lang) == (0.8, 56, "en")
+
+    def test_cli_parity_merge_short_output_equals_direct_stage_run(self, tmp_path):
+        inp = self._input(tmp_path)
+        via_cook_out = tmp_path / "via_cook.merged.srt"
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(inp), str(via_cook_out),
+             "--min-dur", "1.2", "--max-len", "42", "--lang", "zh"])
+        assert code == 0 and report["ok"] is True
+        assert report["cues_before"] == 5
+        assert report["cues_after"] < 5  # short + punct-only cues merged away
+        direct_out = tmp_path / "direct.merged.srt"
+        _run_stage_direct("subtitle", "subtitles.py", "t_merge_short_direct", [
+            "merge-short", str(inp), str(direct_out),
+            "--min-dur", "1.2", "--max-len", "42", "--lang", "zh"])
+        assert via_cook_out.read_text(encoding="utf-8") == \
+            direct_out.read_text(encoding="utf-8")
+
+    def test_cli_parity_merge_short_forwards_to_subtitles_cmd(self, tmp_path, monkeypatch):
+        inp = self._input(tmp_path)
+        out = tmp_path / "merged.srt"
+        calls = {}
+
+        class _Stub:
+            def cmd_merge_short(self, ns):
+                calls["ns"] = ns
+                out.write_text("1\n00:00:00,000 --> 00:00:03,000\n合并后的句子\n",
+                               encoding="utf-8")
+
+        monkeypatch.setattr(cook, "_import_subtitles_module", lambda: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(inp), str(out),
+             "--min-dur", "0.8", "--max-len", "56", "--lang", "en"])
+        assert code == 0 and report["ok"] is True
+        ns = calls["ns"]
+        assert ns.input == str(inp)
+        assert ns.output == str(out)
+        assert ns.min_dur == 0.8 and ns.max_len == 56 and ns.lang == "en"
+
+    def test_cli_parity_merge_short_missing_input_dies(self, tmp_path):
+        report, code = _run_cook_cmd(
+            ["dub", "merge-short", str(tmp_path / "nope.srt"),
+             str(tmp_path / "out.srt")])
+        assert code == 1
+        assert report["ok"] is False
+        assert "nope.srt" in report["error"]
+
+
+class TestCliParityLoudnessMatch:
+    """loudness-match: <output_root> <name> [--anchor] [--peak] forwarded to
+    stages/dub/loudness_match.py over dubbed/_full/_segments."""
+
+    def _segments(self, root: Path, n: int = 2) -> Path:
+        segs = root / "dubbed" / "_full" / "_segments"
+        segs.mkdir(parents=True)
+        for i in range(1, n + 1):
+            (segs / f"sent_{i:04d}.wav").write_bytes(b"x" * 2048)
+        return segs
+
+    def test_cli_parity_loudness_cli_parser_wiring(self):
+        p = cook.build_parser()
+        args = p.parse_args(["dub", "loudness-match", "some/root", "name"])
+        assert args.func is cook.cmd_dub_loudness_match
+        assert args.anchor == -18.7 and isinstance(args.anchor, float)
+        assert args.peak == -1.5 and isinstance(args.peak, float)
+        args = p.parse_args(["dub", "loudness-match", "r", "n",
+                             "--anchor", "-17.0", "--peak", "-2.5"])
+        assert (args.anchor, args.peak) == (-17.0, -2.5)
+
+    def test_cli_parity_loudness_forwards_root_and_flags(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        self._segments(root, n=2)
+        calls = {}
+
+        class _Stub:
+            def main(self):
+                calls["argv"] = list(sys.argv)
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video",
+             "--anchor", "-17.0", "--peak", "-1.0"])
+        assert code == 0 and report["ok"] is True
+        assert calls["argv"][1:] == [str(root.resolve()), "video",
+                                     "--anchor", "-17.0", "--peak", "-1.0"]
+        assert report["cue_wavs"] == 2
+        assert report["segments_dir"] == "dubbed/_full/_segments"
+        assert report["anchor_lufs"] == -17.0
+        assert report["peak_dbfs"] == -1.0
+
+    def test_cli_parity_loudness_missing_segments_dies(self, tmp_path):
+        root = tmp_path / "vid"
+        root.mkdir()
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "synth" in report["error"]  # points at the producing command
+
+    def test_cli_parity_loudness_stage_error_dies_with_json(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        self._segments(root, n=1)
+
+        class _Stub:
+            def main(self):
+                raise RuntimeError("ebur128 parse fail: sent_0001.wav")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "ebur128" in report["error"]
+
+    def test_cli_parity_loudness_output_equals_direct_stage_run(
+            self, tmp_path, monkeypatch):
+        """Ticket 03 acceptance 3/3: the cue wavs `cook dub
+        loudness-match` leaves behind are byte-identical to a direct
+        stages/dub/loudness_match.py run over the same seeds (the
+        make-srt/merge-short parity form). ffmpeg is stubbed at the
+        subprocess seam the stage shells through: measure calls return
+        canned ebur128 Summary blocks keyed on the cue index; gain calls
+        rewrite the file through the stage's tmp target, appending the
+        volume filter actually applied, so the products carry real
+        per-branch evidence."""
+        levels = {  # cue index -> (integrated LUFS, true peak dBTP)
+            1: (-20.0, -6.0),  # +1.30 dB to reach the anchor
+            2: (-18.8, -5.0),  # 0.1 dB off -> within TOL, untouched
+            3: (-19.5, 0.0),   # +0.8 dB wanted, peak-clamped to -1.50
+        }                      # (the <1KB sent_0004 must never be measured)
+
+        def fake_run(cmd, **kw):
+            if any("ebur128" in a for a in cmd):   # measure call
+                idx = int(re.search(r"sent_(\d{4})\.wav",
+                                    " ".join(cmd)).group(1))
+                lufs, peak = levels[idx]  # KeyError => broken file measured
+                return subprocess.CompletedProcess(
+                    cmd, 0, "",
+                    "  Pseudo loudness run\nSummary:\n"
+                    f"  I:   {lufs} LUFS\n"
+                    f"  Peak:      {peak} dBTP\n")
+            src, dst = cmd[cmd.index("-i") + 1], cmd[-1]
+            vol = cmd[cmd.index("-af") + 1]
+            Path(dst).write_bytes(
+                Path(src).read_bytes() + f"|{vol}".encode())
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        def seed(root: Path) -> Path:
+            segs = root / "dubbed" / "_full" / "_segments"
+            segs.mkdir(parents=True)
+            for i in range(1, 5):
+                body = f"cue-{i}-synth-audio-bytes".encode()
+                (segs / f"sent_{i:04d}.wav").write_bytes(
+                    body * (60 if i != 4 else 10))  # 0004 stays <1KB
+            return segs
+
+        via_cook = seed(tmp_path / "via_cook")
+        direct = seed(tmp_path / "direct")
+        originals = {p.name: p.read_bytes()
+                     for p in sorted(via_cook.iterdir())}
+
+        report, code = _run_cook_cmd(
+            ["dub", "loudness-match", str(tmp_path / "via_cook"), "video"])
+        assert code == 0 and report["ok"] is True
+        assert report["cue_wavs"] == 4
+        _run_stage_direct("dub", "loudness_match.py", "t_loudness_direct", [
+            str(tmp_path / "direct"), "video",
+            "--anchor", "-18.7", "--peak", "-1.5"])
+
+        # parity: byte-identical cue wavs through both entry points
+        for f in sorted(via_cook.iterdir()):
+            assert f.read_bytes() == (direct / f.name).read_bytes(), f.name
+        # the shared product exercises the stage's per-cue branches
+        assert (via_cook / "sent_0001.wav").read_bytes().endswith(
+            b"|volume=1.30dB")                      # pulled to the anchor
+        assert (via_cook / "sent_0002.wav").read_bytes() == \
+            originals["sent_0002.wav"]              # within TOL, skipped
+        assert (via_cook / "sent_0003.wav").read_bytes().endswith(
+            b"|volume=-1.50dB")                     # peak-clamped
+        assert (via_cook / "sent_0004.wav").read_bytes() == \
+            originals["sent_0004.wav"]              # <1KB, SKIP broken
+
+
+# ============================================================================
+# dub audit-coverage (ticket 02): ASR speech segments vs transcript cue
+# windows — the gate for the whisperX-dropped-19s-under-music incident.
+# The model never loads: stage tests inject a canned-segment transcriber
+# (the retime fw_transcriber seam precedent), CLI tests stub the module.
+# ============================================================================
+
+def _load_audit_coverage():
+    """Load stages/dub/audit_coverage.py fresh. Module level is stdlib-only;
+    the faster-whisper import happens lazily inside the segmenter factory."""
+    spec = importlib.util.spec_from_file_location(
+        f"audit_coverage_test_{id(_stages_dub_dir()):x}",
+        _stages_dub_dir() / "audit_coverage.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestSegmentCoveredShortSegments:
+    """segment_covered pure-function edge: the 0.3s boundary tolerance
+    must not swallow the "the segment itself is tiny" judgement. The old
+    overlap + 0.3 > dur/2 form called EVERY sub-0.6s segment covered —
+    even one sitting clear of every cue — because the flat tolerance
+    alone exceeded dur/2. The slack now caps at half the segment's own
+    duration: timestamps still get their ±0.3s (shrunk to dur/2 for tiny
+    segments, so touching still counts), but no amount of slack
+    substitutes for overlap evidence."""
+
+    def test_short_zero_overlap_segment_clear_after_cue_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment 0.1s clear of the cue's end: zero overlap, midpoint
+        # beyond the dur/2-capped slack -> gap (old: covered by the flat
+        # 0.3s midpoint band alone)
+        assert mod.segment_covered(14.6, 15.0,
+                                   [(10.0, 14.5), (20.0, 24.0)]) is False
+
+    def test_short_zero_overlap_segment_clear_before_cue_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment 0.1s clear of the cue's start: same blind spot
+        assert mod.segment_covered(9.5, 9.9, [(10.0, 14.0)]) is False
+
+    def test_short_segment_midpoint_in_flat_band_only_is_gap(self):
+        mod = _load_audit_coverage()
+        # 0.2s segment whose midpoint sits 0.25s past the cue end: inside
+        # the old flat ±0.3s midpoint band, outside the dur/2 cap, zero
+        # overlap -> gap
+        assert mod.segment_covered(14.15, 14.35, [(10.0, 14.0)]) is False
+
+    def test_short_segment_touching_cue_edge_stays_covered(self):
+        mod = _load_audit_coverage()
+        # the capped slack still honors touching edges (ASR/SRT edge
+        # error is what the tolerance exists for): a 0.4s segment
+        # starting exactly at the cue's end, or ending exactly at its
+        # start, keeps exactly dur/2 of slack -> covered
+        assert mod.segment_covered(14.5, 14.9, [(10.0, 14.5)]) is True
+        assert mod.segment_covered(9.6, 10.0, [(10.0, 14.0)]) is True
+
+    def test_short_segment_with_real_overlap_still_covered(self):
+        mod = _load_audit_coverage()
+        # 0.4s segment, 0.3s of it inside the cue: real evidence, covered
+        assert mod.segment_covered(13.7, 14.1, [(10.0, 14.0)]) is True
+        # short segment fully inside the cue
+        assert mod.segment_covered(11.0, 11.3, [(10.0, 14.0)]) is True
+
+    def test_long_segment_slack_unchanged(self):
+        mod = _load_audit_coverage()
+        # dur 4.4, overlap 2.0 > 4.4/2 - 0.3: covered exactly as before
+        assert mod.segment_covered(12.0, 16.4, [(10.0, 14.0)]) is True
+        # dur 6.0, overlap 2.0 < 6.0/2 - 0.3 = 2.7 and midpoint outside:
+        # still a gap (the pre-existing half-coverage bar)
+        assert mod.segment_covered(6.0, 12.0, [(10.0, 14.0)]) is False
+
+
+class TestAuditCoverageStage:
+    """stage_audit_coverage: orchestration with an injected fake
+    transcriber returning canned speech segments per audio track."""
+
+    CUES = [
+        (1, "00:00:10,000 --> 00:00:14,000", "First spoken sentence here."),
+        (2, "00:00:20,000 --> 00:00:24,000", "Second spoken sentence here."),
+    ]
+
+    def _fixture(self, tmp_path: Path, with_vocals: bool = True) -> Path:
+        root = tmp_path / "vid"
+        _make_srt(root / "transcript" / "vid.en.full.srt", self.CUES)
+        raw = root / "raw" / "vid.raw.mp4"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"x" * 64)  # content never read: the fake ignores it
+        if with_vocals:
+            voc = root / "dubbed" / "vocals.wav"
+            voc.parent.mkdir(parents=True, exist_ok=True)
+            voc.write_bytes(b"x" * 64)
+        return root
+
+    def _transcriber(self, by_source: dict, calls: list | None = None):
+        """Canned segments per track, keyed 'vocals'/'raw' on the path name;
+        segments = [(start, end, text), ...]. Records the paths it saw."""
+        def transcribe(path):
+            if calls is not None:
+                calls.append(Path(path))
+            key = "vocals" if "vocals" in Path(path).name else "raw"
+            return list(by_source[key])
+        return transcribe
+
+    def test_uncovered_segment_reported_as_gap(self, tmp_path):
+        """A speech segment no cue window covers (the incident shape: the
+        19s montage voiceover whisperX never transcribed) is reported with
+        its start/end/text and covered=false; the report is not ok."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "montage highlight voiceover")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["ok"] is False
+        assert rep["gap_count"] == 1
+        gap = rep["gaps"][0]
+        assert gap["start"] == 5.0
+        assert gap["end"] == 8.5
+        assert gap["text"] == "montage highlight voiceover"
+        assert gap["covered"] is False
+        # both tracks heard it -> source annotated on the gap
+        assert sorted(gap["sources"]) == ["raw", "vocals"]
+
+    def test_covered_segment_not_reported(self, tmp_path):
+        """Segments sitting inside cue windows produce no gaps, are counted
+        as covered, and the report is ok."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(10.2, 13.8, "First spoken sentence here."),
+                (20.5, 23.0, "Second spoken sentence here.")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["ok"] is True
+        assert rep["gaps"] == []
+        assert rep["gap_count"] == 0
+        assert rep["covered_count"] == 4  # 2 per track, both scanned
+        assert rep["segments_scanned"] == 4
+        assert rep["tracks_mode"] == "vocals+raw"
+        assert rep["tracks_scanned"] == ["vocals", "raw"]
+
+    def test_under_half_overlap_and_midpoint_outside_is_gap(self, tmp_path):
+        """Coverage needs more than half the segment overlapped (or the
+        midpoint inside a cue): a segment straddling a cue's start with
+        only a third of itself inside stays a gap."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(6.0, 12.0, "long run-in before the cue window opens")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["gap_count"] == 1
+
+    def test_midpoint_inside_cue_tolerance_band_covers(self, tmp_path):
+        """Midpoint rule with the 0.3s boundary tolerance: a segment whose
+        midpoint lands 0.2s before a cue start is covered even though its
+        overlap is well under half its duration."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        # midpoint 9.8 vs cue start 10.0 (tolerance 0.3); overlap 2.0 of 4.4
+        segs = [(7.6, 12.0, "speech that straddles the cue boundary")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["gap_count"] == 0
+        assert rep["ok"] is True
+
+    def test_vocals_missing_degrades_raw_only_and_marks_report(self, tmp_path):
+        """No dubbed/vocals.wav: only the raw track is scanned and the
+        report says so (vocals_missing, per-track list without vocals)."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path, with_vocals=False)
+        calls: list = []
+        segs = [(5.0, 8.5, "gap heard on the raw track only")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": [], "raw": segs}, calls=calls))
+        assert len(calls) == 1                      # raw scanned once
+        assert calls[0].name == "vid.raw.mp4"
+        assert rep["vocals_missing"] is True
+        assert rep["tracks_mode"] == "raw-only"
+        assert rep["tracks_scanned"] == ["raw"]
+        assert [t["source"] for t in rep["tracks"]] == ["raw"]
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["sources"] == ["raw"]
+
+    def test_raw_missing_scans_vocals_only_and_labels_mode(self, tmp_path):
+        """vocals.wav present but the raw track missing: only the vocals
+        stem is scanned and the report must say vocals-only — the mode
+        label previously claimed 'vocals+raw' even though raw never ran;
+        tracks_scanned names what actually scanned."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "raw" / "vid.raw.mp4").unlink()
+        calls: list = []
+        segs = [(5.0, 8.5, "gap heard on the vocals stem only")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": []}, calls=calls))
+        assert len(calls) == 1                      # vocals scanned once
+        assert calls[0].name == "vocals.wav"
+        assert rep["tracks_mode"] == "vocals-only"
+        assert rep["tracks_scanned"] == ["vocals"]
+        assert rep["vocals_missing"] is False
+        assert [t["source"] for t in rep["tracks"]] == ["vocals"]
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["sources"] == ["vocals"]
+
+    def test_gap_heard_on_both_tracks_reported_once_with_vocals_text(self, tmp_path):
+        """The same hole heard on both tracks is ONE gap (deduped), keeping
+        the vocals track's text (the cleaner ASR input, scanned first)."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber({
+                "vocals": [(5.0, 8.5, "clean vocals transcription")],
+                "raw": [(5.1, 8.4, "noisier raw transcription")],
+            }))
+        assert rep["gap_count"] == 1
+        assert rep["gaps"][0]["text"] == "clean vocals transcription"
+        assert sorted(rep["gaps"][0]["sources"]) == ["raw", "vocals"]
+        # per-track counts still see one uncovered each
+        by_src = {t["source"]: t for t in rep["tracks"]}
+        assert by_src["vocals"]["uncovered"] == 1
+        assert by_src["raw"]["uncovered"] == 1
+
+    def test_transcript_falls_back_to_en_srt(self, tmp_path):
+        """en.full.srt absent: the plain <name>.en.srt carries the cue
+        windows and the report marks the fallback."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "transcript" / "vid.en.full.srt").unlink()
+        _make_srt(root / "transcript" / "vid.en.srt", self.CUES)
+        segs = [(10.2, 13.8, "First spoken sentence here.")]
+        rep = mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        assert rep["transcript"] == "transcript/vid.en.srt"
+        assert rep["transcript_fallback"] is True
+        assert rep["cues"] == 2
+        assert rep["ok"] is True
+
+    def test_report_json_written_under_dubbed(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "the hole")]
+        mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        out = root / "dubbed" / "_audit_coverage.json"
+        assert out.is_file()
+        on_disk = json.loads(out.read_text(encoding="utf-8"))
+        assert on_disk["gap_count"] == 1
+
+    def test_stage_logs_to_stderr_stdout_stays_clean(self, tmp_path, capsys):
+        """Progress logs go to stderr so both the standalone CLI and cook's
+        in-process forward keep stdout a single JSON document."""
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        segs = [(5.0, 8.5, "the hole")]
+        mod.stage_audit_coverage(
+            root, "vid", transcriber=self._transcriber(
+                {"vocals": segs, "raw": segs}))
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "audit-coverage" in captured.err
+
+    def test_missing_transcript_is_error(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path)
+        (root / "transcript" / "vid.en.full.srt").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_audit_coverage(root, "vid", transcriber=lambda p: [])
+        assert e.value.code not in (0, None)
+
+    def test_no_audio_tracks_is_error(self, tmp_path):
+        mod = _load_audit_coverage()
+        root = self._fixture(tmp_path, with_vocals=False)
+        (root / "raw" / "vid.raw.mp4").unlink()
+        with pytest.raises(SystemExit) as e:
+            mod.stage_audit_coverage(root, "vid", transcriber=lambda p: [])
+        assert e.value.code not in (0, None)
+
+
+class TestDubAuditCoverageCommand:
+    """cook dub audit-coverage: in-process forward to the packaged stage
+    function; JSON on stdout; exit 1 when gaps were found (the gate)."""
+
+    def test_parser_wires_audit_coverage(self):
+        args = cook.build_parser().parse_args(
+            ["dub", "audit-coverage", "some/root", "name"])
+        assert args.func is cook.cmd_dub_audit_coverage
+        assert args.output_root == "some/root"
+        assert args.name == "name"
+
+    def test_cmd_forwards_to_stage_function_and_emits_report(
+            self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        root.mkdir()
+        calls = {}
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                calls["args"] = (output_root, name)
+                return {"ok": True, "gap_count": 0, "gaps": [],
+                        "covered_count": 12, "segments_scanned": 12}
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 0
+        assert calls["args"] == (root.resolve(), "video")
+        assert report["ok"] is True
+        assert report["stage"] == "audit-coverage"
+        assert report["gap_count"] == 0
+
+    def test_cmd_exits_fail_when_gaps_found(self, tmp_path, monkeypatch):
+        root = tmp_path / "vid"
+        root.mkdir()
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                return {"ok": False, "gap_count": 2,
+                        "gaps": [{"start": 5.0, "end": 8.5,
+                                  "text": "x", "covered": False,
+                                  "sources": ["raw"]}]}
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert report["gap_count"] == 2
+
+    def test_stage_refusal_becomes_cook_json_error(self, tmp_path, monkeypatch):
+        """The stage's SystemExit (missing transcript / missing
+        faster-whisper) surfaces as cook's JSON error, not a bare exit."""
+        root = tmp_path / "vid"
+        root.mkdir()
+
+        class _Stub:
+            def stage_audit_coverage(self, output_root, name):
+                raise SystemExit("faster-whisper is not installed in this "
+                                 "interpreter: pip install faster-whisper")
+
+        monkeypatch.setattr(cook, "_import_stage_module",
+                            lambda stage, script, modname: _Stub())
+        report, code = _run_cook_cmd(
+            ["dub", "audit-coverage", str(root), "video"])
+        assert code == 1
+        assert report["ok"] is False
+        assert "faster-whisper" in report["error"]

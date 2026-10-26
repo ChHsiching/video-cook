@@ -45,6 +45,19 @@ is ~45 Chinese chars / ~90 ASCII per cue), and whisperX occasionally emits
 one cue spanning several sentences. `shorten` fixes both: split on 。！？；/.!?;,
 then hard-wrap at commas when a fragment still exceeds the limit.
 
+Comma-first hard cuts (ticket 04, nate-herk reflux): when a cue exceeds the
+limit and the sentence-punctuation ladder leaves a block that STILL exceeds
+it, the hard cut prefers the last clause comma (，,；;) inside the limit over
+a word boundary, and only falls to the word-level cut when no such comma
+exists. Judgment case, hit by BOTH the bilingual-subtitle and the dubbing
+pipelines (nate-herk en cue 146 / dub Gate C round 1): the long question
+"Where does that break ... right scoped API keys or whatever ..." has no
+sentence punctuation, its comma clause still ran past 160 chars, and the
+word-level cut split "API keys" across two cues. A comma BEYOND the limit is
+not a legal cut (it would trade a length violation for term integrity) —
+that specific cue was patched at the product layer; this rule narrows the
+class of cues where a word-level split can break a multi-word term at all.
+
 Sub-clauses that STILL exceed the limit after the punctuation ladder
 (sentence -> clause -> dash/quote) is exhausted are hard-cut at the width
 boundary, snapped to the nearest jieba word boundary when jieba is
@@ -493,9 +506,38 @@ def split_en(text, limit=MAX_EN_DEFAULT):
     return refined
 
 
+# Soft clause punctuation the hard cut prefers over a word boundary
+# (ticket 04). Full-width ，and ；are normally consumed upstream by the
+# punctuation ladder; ASCII , and ; (and full-width chars surviving an
+# English-side split) are exactly the ones that reach the hard cut.
+_SOFT_BREAK = "，,；;"
+
+
+def _last_comma_cut(p: str, limit: int, width_two: bool) -> int:
+    """Char index just past the last soft clause punct (，,；;) whose prefix
+    still fits `limit` length units, or 0 when none exists — the caller then
+    keeps its legacy word-level/width cut. `width_two=True` counts width
+    units (wlen, CJK=2) like pack_zh; False counts chars like pack. A comma
+    past the limit is never returned: cutting there would trade a length
+    violation for term integrity (see the module docstring's judgment case).
+    """
+    best, w = 0, 0
+    for i, c in enumerate(p):
+        w += 2 if (width_two and ord(c) > 127) else 1
+        if w > limit:
+            break
+        if c in _SOFT_BREAK:
+            best = i + 1
+    return best
+
+
 def pack(parts, limit):
     """Greedily pack fragments into chunks under `limit` chars (English).
-    Word-boundary safe: never splits a word mid-character."""
+    Word-boundary safe: never splits a word mid-character. A piece that
+    itself exceeds the limit (hard cut) prefers the last clause comma
+    within the limit over a word boundary (ticket 04 — keeps multi-word
+    terms like "API keys" off a cue boundary); without a comma in range
+    the legacy last-space cut runs unchanged."""
     chunks, buf = [], ""
     for p in parts:
         cand = (buf + " " + p) if buf else p
@@ -506,9 +548,13 @@ def pack(parts, limit):
             chunks.append(buf)
             buf = ""
         while len(p) > limit:
-            cut = p.rfind(" ", 0, limit)
-            if cut <= 0:
-                cut = limit
+            # comma-first: a clause boundary beats the last space (the
+            # space cut is free to split "API keys" mid-term)
+            cut = _last_comma_cut(p, limit, width_two=False)
+            if cut < 2:
+                cut = p.rfind(" ", 0, limit)
+                if cut <= 0:
+                    cut = limit
             chunks.append(p[:cut])
             p = p[cut:].lstrip()
         buf = p
@@ -584,7 +630,10 @@ def pack_zh(parts, limit):
     No space joiner (Chinese has no spaces). Fragments exceeding the limit
     after split_zh's punctuation splitting are hard-cut at the width
     boundary, snapped to the nearest jieba word boundary when jieba is
-    available (see _snap_cut_to_word)."""
+    available (see _snap_cut_to_word). Before that width cut fires, the
+    last clause comma within the limit wins (ticket 04) — ASCII commas and
+    semicolons slip past split_zh's full-width clause ladder, and cutting
+    at them keeps multi-word terms off a cue boundary."""
     chunks, buf = [], ""
     for p in parts:
         cand = (buf + p) if buf else p
@@ -595,6 +644,12 @@ def pack_zh(parts, limit):
             chunks.append(buf)
             buf = ""
         while wlen(p) > limit:
+            # comma-first: a clause boundary beats the width cut
+            ccut = _last_comma_cut(p, limit, width_two=True)
+            if ccut >= 2:
+                chunks.append(p[:ccut])
+                p = p[ccut:].lstrip()
+                continue
             w, cut = 0, 0
             for i, c in enumerate(p):
                 w += 2 if ord(c) > 127 else 1

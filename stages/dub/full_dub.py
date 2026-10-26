@@ -15,6 +15,19 @@ Staged design — each stage writes its outputs to disk, so re-runs resume from
 cache. Designed to be called by the `cook dub` CLI (thin wrapper that runs this
 script as a subprocess), or directly.
 
+Cache safety — the fit sidecar: assembly NEVER writes the synth cache
+(_segments/). The fit pass's atempo products go to _full/_segments_fitted/,
+a sidecar directory wiped and rebuilt at the start of EVERY assemble;
+placement (2b) and the subtitle windows (2c) read takes through the
+fitted-first resolver take_path(p, idx), so what was placed and what the
+subtitles span can never disagree. Structural fix for the nate-herk
+incident: an experimental 463-cue assemble errored out mid-run, but only
+after its fit pass had atempo-crushed 144 synthesized takes against
+misaligned windows and replaced them in place; the next assemble silently
+consumed the corrupted cache and shipped it. A cache that cost hours of
+synthesis must be physically un-writable by assembly: an aborted, failed,
+or misaligned assemble can now damage nothing but its own sidecar.
+
 Usage (CLI):
   python full_dub.py synth        <output-root> <name>   # stage 1: TTS synthesis (supervisor: all cues, ascending)
   python full_dub.py synth-worker <output-root> <name> --lo N --hi M [--stagger S]
@@ -69,6 +82,7 @@ def _paths(output_root: str | Path, name: str) -> dict:
         "no_vocals": root / "dubbed" / "no_vocals.wav",
         "work": work,
         "segments": work / "_segments",
+        "segments_fitted": work / "_segments_fitted",
         "dub_wav": work / "dub.wav",
         "dubbing_srt": work / "dubbing.srt",
         "dubbing_en_srt": work / "dubbing.en.srt",
@@ -444,6 +458,18 @@ _LOUDNORM_I = -18.0    # dub track loudness; NOT source-matched — a quiet sour
                        # master (screencast mics) must not drag the dub down to a whisper
 
 
+def take_path(p: dict, idx: int) -> Path:
+    """Fitted-first take resolver: the wav THIS assembly consumes for cue
+    idx — the fit sidecar's product when this assemble produced one, else
+    the untouched synth cache. Placement (2b) and the subtitle window (2c)
+    both resolve through here, so the placed audio and the subtitle clock
+    can never disagree about which take was used."""
+    fitted = p["segments_fitted"] / f"sent_{idx:04d}.wav"
+    if fitted.exists():
+        return fitted
+    return p["segments"] / f"sent_{idx:04d}.wav"
+
+
 def stage_assemble(output_root, name: str, keep_subs: bool = False,
                    no_retime: bool = False):
     p = _paths(output_root, name)
@@ -458,18 +484,27 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
                 log(f"  ERROR: --keep-subs needs {f} on disk; run a plain assemble first")
                 sys.exit(1)
 
-    # 2a. Fit pass — compress-only. Audio longer than its window is atempo'd
-    #     down (it would otherwise collide with the next cue); audio SHORTER
-    #     keeps its natural pace and 2b pads the tail with silence (a
-    #     breathing pause). Time-stretching short audio to fill the window is
-    #     forbidden — slowed TTS reads as robotic, and stretching shipped and
-    #     was rejected three rounds running before the rule landed.
+    # 2a. Fit pass — compress-only, INTO THE FIT SIDECAR. Audio longer than
+    #     its window is atempo'd down (it would otherwise collide with the
+    #     next cue); audio SHORTER keeps its natural pace and 2b pads the
+    #     tail with silence (a breathing pause). Time-stretching short audio
+    #     to fill the window is forbidden — slowed TTS reads as robotic, and
+    #     stretching shipped and was rejected three rounds running before the
+    #     rule landed. The atempo products land in _segments_fitted/, which
+    #     every assemble wipes and rebuilds first: the synth cache
+    #     (_segments/) is READ-ONLY for assembly — an aborted, failed, or
+    #     misaligned-window assemble must be physically unable to corrupt
+    #     hours of synthesis work (the nate-herk 463-cue incident).
     log("  2a: fit pass (compress over-window audio only)")
+    fitted_dir = p["segments_fitted"]
+    if fitted_dir.exists():
+        shutil.rmtree(fitted_dir)
+    fitted_dir.mkdir(parents=True, exist_ok=True)
     n_fit = 0
     budget_misses = []
     durs = []
     for i, (idx, s, e, en, zh) in enumerate(cues):
-        wav = p["segments"] / f"sent_{idx:04d}.wav"
+        wav = p["segments"] / f"sent_{idx:04d}.wav"  # cache: read-only here
         if not wav.exists() or wav.stat().st_size <= 1000:
             log(f"  ERROR: missing/truncated {wav.name} — run the synth stage first")
             sys.exit(1)
@@ -482,16 +517,15 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
         if factor > 1.5:
             budget_misses.append((idx, factor, d, window))
         k = clamp_factor(factor)
-        tmp = wav.with_suffix(".fit.wav")
+        fitted = fitted_dir / wav.name
         r = subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-i", str(wav),
-             "-af", f"atempo={k:.5f}", "-c:a", "pcm_s16le", str(tmp)],
+             "-af", f"atempo={k:.5f}", "-c:a", "pcm_s16le", str(fitted)],
             capture_output=True, text=True)
-        if r.returncode != 0 or not tmp.exists():
+        if r.returncode != 0 or not fitted.exists():
             log(f"  ERROR: atempo cue {idx}: {r.stderr[-200:]}")
             sys.exit(1)
-        tmp.replace(wav)
-        d = get_dur(wav)
+        d = get_dur(fitted)
         durs.append(d)
         n_fit += 1
     log(f"    fitted {n_fit}/{len(cues)} cues")
@@ -518,7 +552,7 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
             if s > clock + 0.001:
                 out_w.writeframes(b"\x00" * (int((s - clock) * 22050) * 2))
                 clock = s
-            wav = p["segments"] / f"sent_{idx:04d}.wav"
+            wav = take_path(p, idx)  # fitted-first: sidecar product if any
             d = get_dur(wav)
             next_start = cues[i + 1][1] if i + 1 < len(cues) else raw_dur
             pad = max(0.0, next_start - (clock + d))
@@ -568,7 +602,7 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
         log("  2c: generate dubbing.srt + dubbing.en.srt on the original clock")
         zh_lines, en_lines = [], []
         for i, (idx, s, e, en, zh) in enumerate(cues):
-            ne = max(e, s + get_dur(p["segments"] / f"sent_{idx:04d}.wav"))
+            ne = max(e, s + get_dur(take_path(p, idx)))  # the PLACED audio
             zh_lines += [str(i + 1), f"{fmt_ts(s)} --> {fmt_ts(ne)}", zh, ""]
             en_lines += [str(i + 1), f"{fmt_ts(s)} --> {fmt_ts(ne)}", en, ""]
         (p["dubbing_srt"]).write_text("\n".join(zh_lines), encoding="utf-8")

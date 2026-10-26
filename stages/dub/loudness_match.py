@@ -6,7 +6,9 @@ level spread BETWEEN voices — two clone references can sit 25 dB apart, and
 every cue lands wherever its synthesis did. This script measures each
 dubbed/_full/_segments/sent_NNNN.wav (ffmpeg ebur128, Summary block only) and
 pulls it to the anchor with peak protection. Run it once after synth, before
-`cook dub assemble` (assemble's fit pass overwrites segments in place).
+`cook dub assemble` (assembly never writes the synth cache — its fit pass's
+atempo products land in the _segments_fitted/ sidecar — so the matched
+segments survive any later re-assembly).
 
 Usage:
   python loudness_match.py <output-root> <name> [--anchor -18.7] [--peak -1.5]
