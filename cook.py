@@ -1224,15 +1224,32 @@ def _count_dub_cues(root: Path) -> int:
 # least one .wav (the synthesized segments). That is expressed with kind="dir_glob".
 # ----------------------------------------------------------------------------
 
-def _dub_prereqs() -> dict:
+def _dub_prereqs(root) -> dict:
     """Return the stage -> prerequisites mapping. Built fresh each call so the
-    paths derive from the (resolved) video root passed to the check."""
+    paths derive from the (resolved) video root passed to the check.
+
+    Two-voice runs (dubbed/_reference/speakers.txt) satisfy the reference
+    requirement with ref_<SPK>.wav per speaker instead of a placeholder
+    ref.wav the stage would never read (E2E finding, 2026-11: the
+    unconditional ref.wav check blocked a speakers.txt-only run)."""
+    ref_dir = root / "dubbed" / "_reference"
+    if (ref_dir / "speakers.txt").is_file():
+        labels = [l.strip() for l in
+                  (ref_dir / "speakers.txt").read_text(encoding="utf-8")
+                  .splitlines() if l.strip()]
+        ref_reqs = [
+            {"rel": f"dubbed/_reference/ref_{s}.wav", "kind": "file",
+             "produces": "the dub-prep reference step (per speakers.txt)"}
+            for s in sorted(set(labels))]
+    else:
+        ref_reqs = [
+            {"rel": "dubbed/_reference/ref.wav", "kind": "file",
+             "produces": "cook dub separate + the dub-prep step"}]
     return {
         "synth": [
             {"rel": "transcript/translations_dub.txt", "kind": "file",
              "produces": "cook dub verify / the upstream dub-prep step"},
-            {"rel": "dubbed/_reference/ref.wav", "kind": "file",
-             "produces": "cook dub separate + the dub-prep step"},
+            *ref_reqs,
         ],
         "assemble": [
             {"rel": "dubbed/_full/_segments/", "kind": "dir_glob", "glob": "*.wav",
@@ -1253,7 +1270,7 @@ def _check_dub_stage_prerequisites(stage: str, root: Path, name: str) -> None:
     """Verify all prerequisite files for a dub stage exist and are non-empty.
     Calls _die with a clear, actionable message on the first missing/empty
     one. No-op for stages with no prerequisites in the mapping."""
-    prereqs = _dub_prereqs().get(stage)
+    prereqs = _dub_prereqs(root).get(stage)
     if not prereqs:
         return
     for spec in prereqs:
