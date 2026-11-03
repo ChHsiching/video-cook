@@ -633,7 +633,7 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
                 clock = s
             elif clock - s > PLACE_TOL_S:
                 # unreachable while the fit pass cuts every residual; a
-                # regression guard, not a recovery path — 46 cues up to
+                # regression guard, not a recovery path (46 cues up to
                 # 0.51s late shipped silently before this existed
                 late.append((idx, clock - s))
             wav = take_path(p, idx)  # fitted-first: sidecar product if any

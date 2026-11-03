@@ -104,10 +104,10 @@ def evaluate(srt_text: str, trans_text: str, rate: float, *,
     """Run the three gate checks at the given measured rate.
 
     speakers/rates: optional per-cue speaker labels (aligned to cues) and a
-    label->chars/s map (a measure-rate sidecar's per_speaker block) — each
+    label->chars/s map (a measure-rate sidecar's per_speaker block). Each
     cue gates by its own speaker's rate, falling back to `rate` per label.
     breath_s/breath_min_window_s: the breathing reserve (see BREATH_*
-    above) — windows longer than the exemption are budgeted at
+    above); windows longer than the exemption are budgeted at
     window-breath, so a fully-filled budget still leaves an audible gap
     before the next cue.
 
@@ -144,7 +144,7 @@ def evaluate(srt_text: str, trans_text: str, rate: float, *,
     if speakers is not None and len(speakers) != len(lines):
         raise ValueError(
             f"speakers.txt has {len(speakers)} labels vs {len(lines)} "
-            "translation lines — per-speaker gating needs the 1:1 pairing")
+            "translation lines; per-speaker gating needs the 1:1 pairing")
 
     short, over, under = [], [], []
     total_est = total_budget = 0.0

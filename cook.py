@@ -2698,7 +2698,7 @@ def _gate_load_rate_file(path: Path, root) -> tuple[float, dict | None, str]:
              obj={"stage": "gate"})
     rate = data.get("rate")
     if not isinstance(rate, (int, float)) or not (rate > 0):
-        _die(f"--rate-file {path} has no positive 'rate' — regenerate it "
+        _die(f"--rate-file {path} has no positive 'rate'. Regenerate it "
              "with cook dub measure-rate --write", obj={"stage": "gate"})
     per = data.get("per_speaker") or None
     if per and not all(isinstance(v, (int, float)) and v > 0
@@ -2711,8 +2711,8 @@ def _gate_load_rate_file(path: Path, root) -> tuple[float, dict | None, str]:
     df = data.get("duration_factor")
     if df is not None and df != float(os.environ.get("DUB_DURATION_FACTOR", "1.0")):
         _log(f"gate: rate-file was measured at duration_factor={df} but the "
-             f"env now says {os.environ.get('DUB_DURATION_FACTOR', '1.0')} — "
-             "rates are df-dependent; re-measure if df changed")
+             f"env now says {os.environ.get('DUB_DURATION_FACTOR', '1.0')}. "
+             "Rates are df-dependent; re-measure if df changed")
     return float(rate), per, src
 
 
@@ -3188,7 +3188,7 @@ def build_parser() -> argparse.ArgumentParser:
     pgr.add_argument("name")
     pgr.add_argument("--rate-file", metavar="PATH",
                      help="rate sidecar written by `cook dub measure-rate "
-                          "--write` — the preferred rate source (provenance: "
+                          "--write`; the preferred rate source (provenance: "
                           "df, ref md5s, per-speaker rates via speakers.txt)")
     pgr.add_argument("--rate", type=float, metavar="CHARS_PER_SEC",
                      help="measured chars/s; accepted ONLY together with "
