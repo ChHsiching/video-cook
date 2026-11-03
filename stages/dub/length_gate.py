@@ -58,13 +58,13 @@ HEALTHY_MAX = 1.05
 SHORT_SYLLS = 8
 # Breathing reserve (2026-11 Titus run): the budget formula window×rate
 # counts the original inter-cue pause as fillable text space, and the
-# coverage metric pushes fills — edge-trimmed takes made honest, a fully
-# filled window lands speech hard against the next cue's first sample.
-# The reserve shaves the BUDGET (never the placement: the assembler still
+# coverage metric rewards filling it. With edge-trimmed durations a fully
+# filled budget ends the take at the next cue's first sample. The
+# reserve shaves the BUDGET (never the placement: the assembler still
 # pads to the next cue's start, so an under-filled window breathes by the
 # unshaved remainder). Windows at or below the exemption are backchannel-
 # tight cues where the next voice overlaps anyway. Defaults are CLI flags
-# on `cook dub gate` — a starting calibration, not a constant of nature.
+# on `cook dub gate`; they are starting calibrations, tune per voice.
 BREATH_MARGIN_S = 0.12
 BREATH_MIN_WINDOW_S = 1.2
 

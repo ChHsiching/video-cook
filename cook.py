@@ -2528,7 +2528,7 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
                 speakers_map = spk_labels
             else:
                 _log(f"measure-rate: speakers.txt has {len(spk_labels)} labels "
-                     f"vs {len(pairs)} pairs — skipping per-speaker grouping")
+                     f"vs {len(pairs)} pairs; skipping per-speaker grouping")
     if speakers_map:
         agg = {}
         for row, spk in zip(rows, speakers_map):
@@ -2551,7 +2551,7 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
     if getattr(args, "write", None):
         sidecar = _write_rate_sidecar(Path(args.write), report, root_for_sidecar)
         report["sidecar"] = str(sidecar)
-        _log(f"rate sidecar written: {sidecar} — gate with "
+        _log(f"rate sidecar written: {sidecar}. Gate with "
              f"`cook dub gate ... --rate-file {sidecar}`")
     if getattr(args, "json", False):
         _emit_json(report)
@@ -2565,11 +2565,11 @@ def cmd_dub_measure_rate(args: argparse.Namespace) -> None:
 
 def _write_rate_sidecar(path: Path, report: dict, root) -> Path:
     """Write the rate sidecar (rate-lock): the measured rate(s) plus the
-    provenance a bare --rate number cannot carry — duration_factor, ref-wav
-    md5s, sample counts. `cook dub gate --rate-file` reads exactly this file,
-    so a gate pass is traceable to a measure-rate run instead of a typed
-    number (the 2026-11 ruling: assumed rates pass every gate and dub to
-    dead air)."""
+    provenance a bare --rate number cannot carry, namely duration_factor,
+    ref-wav md5s, and sample counts. `cook dub gate --rate-file` reads
+    exactly this file, so a gate pass is traceable to a measure-rate run
+    instead of a typed number (the 2026-11 ruling: assumed rates pass
+    every gate and dub to dead air)."""
     refs_meta = {}
     if root is not None:
         ref_dir = root / "dubbed" / "_reference"
@@ -2685,10 +2685,11 @@ def _gate_self_measure(root: Path) -> float:
 
 def _gate_load_rate_file(path: Path, root) -> tuple[float, dict | None, str]:
     """Read a measure-rate sidecar (rate-lock). Returns (single_rate,
-    per_speaker_or_None, rate_source). Dies on a missing/invalid file or a
-    non-positive rate — a sidecar that lies is worse than none."""
+    per_speaker_or_None, rate_source). Dies on a missing or invalid file
+    or a non-positive rate; a sidecar with a wrong rate must fail the
+    gate, not pass it."""
     if not path.is_file():
-        _die(f"--rate-file not found: {path} — write one with `cook dub "
+        _die(f"--rate-file not found: {path}. Write one with `cook dub "
              f"measure-rate --write {path}`", obj={"stage": "gate"})
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -3170,8 +3171,8 @@ def build_parser() -> argparse.ArgumentParser:
     pmr.add_argument("--write", metavar="PATH",
                      help="write a rate sidecar JSON (rate + per-speaker "
                           "rates + duration_factor + ref md5s) for "
-                          "`cook dub gate --rate-file` — the rate-lock "
-                          "provenance chain")
+                          "`cook dub gate --rate-file`; this is the "
+                          "rate-lock provenance chain")
     pmr.add_argument("--json", action="store_true",
                      help="emit the machine-readable report on stdout "
                           "(per-file voiced seconds, chars, and the rate). "
@@ -3190,7 +3191,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "--write` — the preferred rate source (provenance: "
                           "df, ref md5s, per-speaker rates via speakers.txt)")
     pgr.add_argument("--rate", type=float, metavar="CHARS_PER_SEC",
-                     help="measured chars/s — accepted ONLY together with "
+                     help="measured chars/s; accepted ONLY together with "
                           "--rate-override (explicit escape hatch)")
     pgr.add_argument("--rate-override", action="store_true",
                      help="accept a typed --rate despite no provenance")
@@ -3200,13 +3201,13 @@ def build_parser() -> argparse.ArgumentParser:
                           "and gate by the measured value")
     pgr.add_argument("--breath", type=float, metavar="SECONDS",
                      help="breathing reserve shaved from each budgeted "
-                          "window (default 0.12s — a fully-filled budget "
-                          "still leaves an audible gap before the next cue; "
-                          "calibration starting point, tune per voice)")
+                          "window; a fully-filled budget still leaves an "
+                          "audible gap before the next cue (default and "
+                          "tuning guidance in GLOSSARY.md)")
     pgr.add_argument("--breath-min-window", type=float, metavar="SECONDS",
                      help="windows at or below this skip the breathing "
-                          "reserve (default 1.2s — backchannel-tight cues "
-                          "overlap anyway)")
+                          "reserve; backchannel-tight cues overlap anyway "
+                          "(default in GLOSSARY.md)")
     pgr.add_argument("--json", action="store_true",
                      help="emit the machine-readable report on stdout "
                           "(findings, coverage, verdict). Without it only a "

@@ -108,3 +108,5 @@ AGPL-3.0-only · Copyright (c) 2026 ChHsiching —— 见 [LICENSE](LICENSE)。
 ### 贡献条款
 
 提交 PR 即表示你同意以 AGPL-3.0 授权你的贡献，并授予维护者在 AGPL 之外另行提供商业授权的权利（你的贡献始终以 AGPL 对所有人开放）。
+
+Terms coined in `cook dub` output (rate-lock, breathing reserve, placement invariant, absorption window) are defined in [GLOSSARY.md](GLOSSARY.md); reach for it when a flag or log names one.

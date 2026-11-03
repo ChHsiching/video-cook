@@ -1,23 +1,23 @@
 # Changelog
 
-## 0.9.1 — 2026-11-03
+## 0.9.1 (2026-11-03)
 
-Assembly placement & rate-lock (2026-11 Titus run reflux; ADR 0003):
+Assembly placement and rate-lock (2026-11 Titus run reflux; ADR 0003):
 
 - **synth**: edge-trim every take at publish (-45dB, 80ms margins,
-  idempotent) — honest durations downstream; one full-run trim recovered
-  173s across 1135 takes.
+  idempotent), so downstream durations exclude the synthesized pad
+  silence. One full-run trim recovered 173s across 1135 takes.
 - **assemble fit pass**: hard-cut residuals beyond the atempo cap to the
-  window end + 30ms fade (broadcast ducking) — a take can no longer push
-  the NEXT cue late (46 cues up to 0.51s late shipped in 0.9.0).
-- **assemble placement invariant**: `placed - start <= 20ms` enforced in
-  the placement loop; violation fails the assemble (regression guard).
-- **measure-rate --write**: rate sidecar (rate + per-speaker grouping +
-  duration_factor + ref md5s) — the provenance chain.
+  window end with a 30ms fade (GLOSSARY: fit). A take can no longer push
+  the NEXT cue late; that defect shipped 46 late cues in 0.9.0.
+- **assemble placement invariant**: enforced in the placement loop; a
+  violation fails the assemble (GLOSSARY: placement invariant).
+- **measure-rate --write**: rate sidecar with per-speaker grouping,
+  duration_factor, and ref md5s. This is the provenance chain.
 - **gate --rate-file**: gates by the sidecar, per-speaker rates applied
-  via speakers.txt; a typed `--rate` now requires `--rate-override`.
-- **gate --breath / --breath-min-window** (defaults 0.12s / 1.2s):
-  breathing reserve shaved from budgeted windows so a fully-filled budget
-  still leaves an audible gap; coverage reports against reserved windows.
-- GLOSSARY.md + ADR 0003 added; 260-test suite green with new
-  TestRateLockAndBreath.
+  via speakers.txt. A typed `--rate` now requires `--rate-override`.
+- **gate --breath / --breath-min-window**: breathing reserve in the
+  budget math (GLOSSARY: breathing reserve), so a fully-filled budget
+  still leaves an audible gap. Coverage reports against reserved
+  windows.
+- GLOSSARY.md and ADR 0003 added; TestRateLockAndBreath added.
