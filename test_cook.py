@@ -1301,7 +1301,8 @@ class TestDubScriptsInPackage:
                            ["一句话占个位子而已", "两句话占个位子而已呀"])
         r = subprocess.run(
             [sys.executable, str(_HERE / "cook.py"), "dub", "gate",
-             str(root), "video", "--rate", "4.0"],
+             str(root), "video", "--rate", "4.0",
+             "--rate-override", "--breath", "0"],  # pin the hand math (43.2%)
             capture_output=True, text=True, timeout=60,
         )
         combined = r.stdout + r.stderr
@@ -4194,6 +4195,10 @@ class TestDubGateRateRequired:
             "name": "video",
             "rate": rate,
             "self_measure": self_measure,
+            "rate_file": None,
+            "rate_override": True,   # these tests validate the VALUE, not provenance
+            "breath": 0.0,           # pin pre-breath hand-worked math
+            "breath_min_window": 1.2,
             "json": as_json,
         })()
         code = None
@@ -4258,6 +4263,10 @@ class TestDubGateVerdict:
             "name": "video",
             "rate": rate,
             "self_measure": self_measure,
+            "rate_file": None,
+            "rate_override": True,   # these tests validate the VALUE, not provenance
+            "breath": 0.0,           # pin pre-breath hand-worked math
+            "breath_min_window": 1.2,
             "json": as_json,
         })()
         code = None
@@ -4277,7 +4286,7 @@ class TestDubGateVerdict:
         assert report["ok"] is True
         assert report["verdict"] == "pass"
         assert report["rate"] == 5.0
-        assert report["rate_source"] == "flag"
+        assert report["rate_source"] == "flag-override"
         assert report["lines"] == 3
         assert report["short"] == [] and report["over"] == [] \
             and report["under"] == []
@@ -4344,6 +4353,10 @@ class TestDubGateSelfMeasure:
             "name": "video",
             "rate": rate,
             "self_measure": self_measure,
+            "rate_file": None,
+            "rate_override": True,   # these tests validate the VALUE, not provenance
+            "breath": 0.0,           # pin pre-breath hand-worked math
+            "breath_min_window": 1.2,
             "json": as_json,
         })()
         code = None
@@ -4439,6 +4452,8 @@ class TestDubGateContract:
         args = type("A", (), {
             "output_root": str(root), "name": "video",
             "rate": 5.0, "self_measure": False, "json": False,
+            "rate_file": None, "rate_override": True,
+            "breath": 0.0, "breath_min_window": 1.2,
         })()
         import io
         import contextlib
@@ -4450,7 +4465,7 @@ class TestDubGateContract:
                 assert e.code == 0
         assert buf.getvalue() == ""  # stdout is pure-JSON-only territory
         err = capsys.readouterr().err
-        assert "rate: 5.000 chars/s (flag)" in err
+        assert "rate: 5.000 chars/s (flag-override)" in err
         assert "coverage" in err
 
     def test_cue_line_count_mismatch_is_refused(self, tmp_path):
@@ -4465,6 +4480,8 @@ class TestDubGateContract:
         args = type("A", (), {
             "output_root": str(root), "name": "video",
             "rate": 5.0, "self_measure": False, "json": True,
+            "rate_file": None, "rate_override": True,
+            "breath": 0.0, "breath_min_window": 1.2,
         })()
         import io
         import contextlib
@@ -4498,6 +4515,146 @@ class TestDubGateContract:
         with pytest.raises(SystemExit) as ei:
             p.parse_args(["dub", "gate", "r", "n", "--rate", "fast"])
         assert ei.value.code != 0
+
+
+class TestRateLockAndBreath:
+    """2026-11 rulings, code-side: (1) rate-lock — the gate prefers the
+    measure-rate SIDECAR (provenance: df, ref md5s, per-speaker rates) and
+    a typed --rate needs --rate-override; (2) the breathing reserve —
+    budgets are shaved by --breath on windows above --breath-min-window, so
+    a fully-filled budget still leaves a gap before the next cue."""
+
+    def _gate_args(self, root, **kw):
+        base = {
+            "output_root": str(root), "name": "video",
+            "rate": None, "self_measure": False,
+            "rate_file": None, "rate_override": False,
+            "breath": None, "breath_min_window": None,
+            "json": True,
+        }
+        base.update(kw)
+        return type("A", (), base)()
+
+    def _run(self, root, **kw):
+        import io as _io
+        import contextlib
+        buf = _io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(buf):
+            try:
+                cook.cmd_dub_gate(self._gate_args(root, **kw))
+            except SystemExit as e:
+                code = e.code
+        text = buf.getvalue().strip()
+        return (json.loads(text) if text else None), code
+
+    def test_bare_rate_refused_without_override(self, tmp_path):
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸", "甲乙丙丁戊己庚辛壬癸"])
+        report, code = self._run(root, rate=5.0)
+        assert code != 0 and report["ok"] is False
+        assert "--rate-override" in report["error"]
+
+    def test_rate_override_passes_resolution(self, tmp_path):
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己", "甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己"])
+        report, code = self._run(root, rate=5.0, rate_override=True)
+        # resolution passed (no --rate-override error); verdict is the
+        # coverage math's business, not provenance's
+        assert report is not None and "coverage" in report
+
+    def test_rate_file_resolution_and_provenance(self, tmp_path):
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000"), ("00:00:04,500", "00:00:09,500")],
+            ["甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己", "甲乙丙丁戊己庚辛壬癸甲乙丙丁戊己"])
+        side = root / "dubbed" / "_reference" / "rate.json"
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(json.dumps({
+            "schema": 1, "rate": 5.0, "per_speaker": None,
+            "duration_factor": 1.0, "ref_md5": {}, "files_measured": 3,
+        }), encoding="utf-8")
+        report, code = self._run(root, rate_file=str(side))
+        assert report is not None
+        assert report["rate_source"].startswith("rate-file:")
+
+    def test_rate_file_missing_is_refused(self, tmp_path):
+        root = _make_gate_inputs(
+            tmp_path,
+            [("00:00:00,000", "00:00:04,000")],
+            ["甲乙丙丁戊己庚辛壬癸"])
+        report, code = self._run(root, rate_file=str(tmp_path / "nope.json"))
+        assert code != 0 and report["ok"] is False
+        assert "measure-rate --write" in report["error"]
+
+    def test_sidecar_roundtrip_carries_provenance(self, tmp_path):
+        root = tmp_path / "author" / "video"
+        ref = root / "dubbed" / "_reference"
+        ref.mkdir(parents=True, exist_ok=True)
+        (ref / "ref.wav").write_bytes(b"RIFF-fake")
+        report = {"ok": True, "mode": "explicit", "files": [], "files_measured": 1,
+                  "chars": 10, "voiced_seconds": 2.0, "rate": 5.0,
+                  "per_speaker": {"A": 4.5}}
+        path = cook._write_rate_sidecar(ref / "rate.json", report, root)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["schema"] == 1
+        assert data["rate"] == 5.0 and data["per_speaker"] == {"A": 4.5}
+        assert data["duration_factor"] == 1.0
+        assert data["ref_md5"]["ref.wav"]  # provenance present
+
+    def test_per_speaker_rates_gate_each_cue_by_its_speaker(self, tmp_path):
+        """Two identical cues/windows and identical texts; speaker A measured
+        slow (2.0 c/s), speaker B fast (10.0 c/s). Single-rate gating at the
+        pooled 4.0 calls both fine; per-speaker flags the per-cue truth the
+        pooled rate smears away (A: 12 chars/2.0 = 6s est in a 6s window is
+        factor 1.0-; B: 12/10 = 1.2s in 4s is deep under)."""
+        lg = cook._import_stage_module("dub", "length_gate.py",
+                                       "cook_stages_dub_gate")
+        srt_text = (
+            "1\n00:00:00,000 --> 00:00:04,000\ncue one\n\n"
+            "2\n00:00:06,000 --> 00:00:10,000\ncue two\n\n")
+        trans = "甲乙丙丁戊己庚辛壬癸子丑\n甲乙丙丁戊己庚辛壬癸子丑\n"
+        # windows: cue1 0->6 = 6s, cue2 6->end-of-srt(11s with last-cue rule
+        # handled by evaluate's gap math: last cue window = its span, 4s)
+        pooled = lg.evaluate(srt_text, trans, 4.0, breath_s=0.0)
+        # pooled smears: cue1 est 3s/6s = 0.5 reads as under-budget TEXT when
+        # the truth is speaker A is slower than the pool — wrong line flagged
+        assert [u["line"] for u in pooled["under"]] == [1]
+        per = lg.evaluate(srt_text, trans, 4.0,
+                          speakers=["A", "B"], rates={"A": 2.0, "B": 10.0},
+                          breath_s=0.0)
+        # A: 12 chars / 2.0 c/s = 6.0s est vs 6s window -> factor 1.0 (not over)
+        # B: 12 / 10.0 = 1.2s vs 4s window -> factor 0.3 (deep under)
+        assert not per["over"]
+        assert [u["line"] for u in per["under"]] == [2]
+
+    def test_breath_shaves_long_windows_only(self):
+        lg = cook._import_stage_module("dub", "length_gate.py",
+                                       "cook_stages_dub_gate")
+        # cue1: start 0, next start 6 -> window 6s (>1.2: shaved to 5.88)
+        # cue2: start 6, end 6.9, last cue -> window = span 0.9s (<=1.2: kept)
+        srt = ("1\n00:00:00,000 --> 00:00:05,000\na\n\n"
+               "2\n00:00:06,000 --> 00:00:06,900\nb\n\n")
+        rep = lg.evaluate(srt, "一\n二\n", 1.0, breath_s=0.12,
+                          breath_min_window_s=1.2)
+        # total effective window = 5.88 + 0.9 = 6.78; est = 1+1 = 2
+        assert abs(rep["total_window_s"] - 6.78) < 0.01
+        assert abs(rep["coverage"] - 2 / 6.78) < 0.001
+        # breath=0 keeps the raw windows (backward-compat pin)
+        rep0 = lg.evaluate(srt, "一\n二\n", 1.0, breath_s=0.0)
+        assert abs(rep0["total_window_s"] - 6.9) < 0.01
+
+    def test_speaker_label_count_mismatch_refused(self):
+        lg = cook._import_stage_module("dub", "length_gate.py",
+                                       "cook_stages_dub_gate")
+        srt = "1\n00:00:00,000 --> 00:00:03,000\na\n\n"
+        with pytest.raises(ValueError, match="speakers"):
+            lg.evaluate(srt, "一\n", 5.0, speakers=["A", "B"],
+                        rates={"A": 5.0, "B": 5.0})
 
 
 class TestPublishTmpSuffix:

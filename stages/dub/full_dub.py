@@ -178,6 +178,27 @@ def cue_window(cues, i, total_dur):
     return nxt - start
 
 
+# Edge-trim / fit-cut calibration (2026-11 Titus run): IndexTTS2 pads takes
+# with 0.1-0.5s of true silence at both edges. Untrimmed, every downstream
+# duration is inflated — one full-run trim recovered 173s across 1135 takes
+# and dropped the over-window count 559 -> 154 before any atempo ran.
+EDGE_TRIM_THRESHOLD_DB = -45   # frames below this count as silence
+EDGE_TRIM_KEEP_S = 0.08        # margin kept at each edge (natural attack/decay)
+EDGE_TRIM_FLOOR_S = 0.3        # never trim below this; all-silent glitch keeps its shell
+
+# Hard-cut (fit pass): atempo is capped, and a factor above the cap leaves a
+# residual that would push the NEXT cue late — the assembly clock writes each
+# cue at max(start, clock), so an overrun is paid by whoever speaks next (46
+# cues up to 0.51s late shipped in the 2026-11 run before this gate existed).
+# The residual is cut to the window end with a short fade: broadcast-ducking
+# shape, the cue is over budget and buried under the next speaker anyway.
+FIT_TOL_S = 0.01               # over-window tolerance before fit acts
+CUT_SLACK_S = 0.03             # cut target = window - slack, keeps a hair of air
+CUT_FADE_S = 0.03              # fade-out length on the cut
+CUT_FLOOR_S = 0.10             # windows below slack+floor skip the cut; the placement gate flags them
+PLACE_TOL_S = 0.02             # placement invariant: audio may start late by at most this
+
+
 # Long-cue chunking: single takes above this many chars collapse in pace
 # (rushed, flat) — synthesized as sentence chunks and concatenated instead.
 # Paired with the short-line trap in SKILL.md Step 3a (lines <= 8 syllables
@@ -224,6 +245,41 @@ def _concat_wavs(files, dst):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"concat failed: {r.stderr[-200:]}")
+
+
+def _edge_trim(wav: Path) -> None:
+    """Trim leading/trailing true silence from a take, in place. Runs right
+    after the atomic publish inside the synth loop, so the cache stays
+    single-writer; mid-stream silence is untouched (areverse trick trims the
+    tail with the same filter that trims the head). On ffmpeg failure or an
+    absurd result the original keeps — a padded take is a soft defect the fit
+    pass absorbs; a missing one is not."""
+    af = (f"silenceremove=start_periods=1:"
+          f"start_threshold={EDGE_TRIM_THRESHOLD_DB}dB:start_silence={EDGE_TRIM_KEEP_S},"
+          f"areverse,"
+          f"silenceremove=start_periods=1:"
+          f"start_threshold={EDGE_TRIM_THRESHOLD_DB}dB:start_silence={EDGE_TRIM_KEEP_S},"
+          f"areverse")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(wav.parent), prefix=f".trim-{wav.stem}-", suffix=wav.suffix)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-af", af, str(tmp)],
+            capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 1000:
+            return
+        trimmed = get_dur(tmp)
+        # idempotence guard: replace only when the trim actually removed
+        # edge silence. Nothing removed -> keep the original bytes (no
+        # re-encode, no codec-boundary frame drift); absurdly short -> the
+        # take was silence-shell glitch, keep it too (fit pass absorbs).
+        if (EDGE_TRIM_FLOOR_S <= trimmed
+                and trimmed < get_dur(wav) - 0.01):
+            os.replace(tmp, wav)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace
 
 
 def _publish(dst: Path, produce) -> None:
@@ -435,6 +491,7 @@ def stage_synth(output_root, name: str, lo: int | None = None,
             _publish(out, lambda t: tts.infer(
                 spk_audio_prompt=str(ref), text=zh, output_path=str(t),
                 lang="zh", use_random=False, duration_factor=df))
+        _edge_trim(out)  # honest duration before any reader (fit/gate/assemble)
         dur = get_dur(out)
         n_done += 1
         elapsed = time.time() - t_start
@@ -526,6 +583,25 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
             log(f"  ERROR: atempo cue {idx}: {r.stderr[-200:]}")
             sys.exit(1)
         d = get_dur(fitted)
+        # Above the atempo cap a residual survives and would push the NEXT
+        # cue late (clock writes at max(start, clock)). Cut to the window end
+        # with a fade; the placement gate below holds the invariant.
+        if d > window + FIT_TOL_S:
+            target = window - CUT_SLACK_S
+            if target >= CUT_FLOOR_S:
+                cut = Path(str(fitted) + ".cut.wav")
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-i", str(fitted),
+                     "-af", (f"afade=t=out:st={max(0.0, target - CUT_FADE_S):.3f}:"
+                             f"d={CUT_FADE_S}"),
+                     "-t", f"{target:.3f}", "-c:a", "pcm_s16le", str(cut)],
+                    capture_output=True, text=True)
+                if r.returncode == 0 and cut.exists() and cut.stat().st_size > 1000:
+                    cut.replace(fitted)
+                    d = get_dur(fitted)
+                    log(f"    CUT idx{idx}: factor {factor:.2f} beyond atempo cap — "
+                        f"hard cut to {d:.2f}s (window {window:.2f}s); edit the line "
+                        f"and re-synthesize for best quality")
         durs.append(d)
         n_fit += 1
     log(f"    fitted {n_fit}/{len(cues)} cues")
@@ -548,10 +624,16 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
         out_w.setsampwidth(2)
         out_w.setframerate(22050)
         clock = 0.0
+        late = []
         for i, (idx, s, e, en, zh) in enumerate(cues):
             if s > clock + 0.001:
                 out_w.writeframes(b"\x00" * (int((s - clock) * 22050) * 2))
                 clock = s
+            elif clock - s > PLACE_TOL_S:
+                # unreachable while the fit pass cuts every residual; a
+                # regression guard, not a recovery path — 46 cues up to
+                # 0.51s late shipped silently before this existed
+                late.append((idx, clock - s))
             wav = take_path(p, idx)  # fitted-first: sidecar product if any
             d = get_dur(wav)
             next_start = cues[i + 1][1] if i + 1 < len(cues) else raw_dur
@@ -568,6 +650,12 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
             with contextlib.closing(wave.open(str(padded), "rb")) as w:
                 out_w.writeframes(w.readframes(w.getnframes()))
             clock += get_dur(padded)
+        if late:
+            log(f"  ERROR: placement invariant violated — {len(late)} cue(s) would "
+                f"start late (a take overran its window past the next cue's start):")
+            for idx, by in late[:20]:
+                log(f"    idx{idx} late by {by:.2f}s")
+            sys.exit(1)
     if get_dur(p["dub_wav"]) > raw_dur + 0.05:
         tmp = p["work"] / "_dub_full.wav"
         p["dub_wav"].replace(tmp)
