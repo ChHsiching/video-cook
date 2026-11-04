@@ -56,6 +56,17 @@ HEALTHY_MIN = 0.90
 HEALTHY_MAX = 1.05
 # IndexTTS2's standalone short-line threshold (narration-pace trap).
 SHORT_SYLLS = 8
+# Breathing reserve (2026-11 Titus run): the budget formula window×rate
+# counts the original inter-cue pause as fillable text space, and the
+# coverage metric rewards filling it. With edge-trimmed durations a fully
+# filled budget ends the take at the next cue's first sample. The
+# reserve shaves the BUDGET (never the placement: the assembler still
+# pads to the next cue's start, so an under-filled window breathes by the
+# unshaved remainder). Windows at or below the exemption are backchannel-
+# tight cues where the next voice overlaps anyway. Defaults are CLI flags
+# on `cook dub gate`; they are starting calibrations, tune per voice.
+BREATH_MARGIN_S = 0.12
+BREATH_MIN_WINDOW_S = 1.2
 
 _CUE_RE = re.compile(r"(\d+)\n([\d:,]+) --> ([\d:,]+)\n(.*?)\n", re.S)
 
@@ -85,12 +96,25 @@ def sec(ts: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
-def evaluate(srt_text: str, trans_text: str, rate: float) -> dict:
+def evaluate(srt_text: str, trans_text: str, rate: float, *,
+             speakers: list[str] | None = None,
+             rates: dict[str, float] | None = None,
+             breath_s: float | None = None,
+             breath_min_window_s: float | None = None) -> dict:
     """Run the three gate checks at the given measured rate.
+
+    speakers/rates: optional per-cue speaker labels (aligned to cues) and a
+    label->chars/s map (a measure-rate sidecar's per_speaker block). Each
+    cue gates by its own speaker's rate, falling back to `rate` per label.
+    breath_s/breath_min_window_s: the breathing reserve (see BREATH_*
+    above); windows longer than the exemption are budgeted at
+    window-breath, so a fully-filled budget still leaves an audible gap
+    before the next cue.
 
     Returns a report dict:
       lines, short[], over[], under[]   findings (line numbers are 1-based)
-      coverage, total_est_s, total_window_s
+      coverage, total_est_s, total_window_s   coverage is over the
+                                        breath-adjusted effective windows
       verdict: "pass" | "fail"          fail = coverage out of band, or any
                                         short/over line (under alone = pass)
       advisory_under: bool              True when only under-budget lines
@@ -98,6 +122,12 @@ def evaluate(srt_text: str, trans_text: str, rate: float) -> dict:
     Raises ValueError when the cue/line counts do not pair 1:1."""
     if not (rate > 0):
         raise ValueError(f"rate must be positive (got {rate!r})")
+    if rates and any(not (r > 0) for r in rates.values()):
+        bad = [k for k, r in rates.items() if not (r > 0)]
+        raise ValueError(f"per-speaker rates must be positive (got {bad!r})")
+    breath = BREATH_MARGIN_S if breath_s is None else breath_s
+    breath_min = (BREATH_MIN_WINDOW_S if breath_min_window_s is None
+                  else breath_min_window_s)
 
     spans = [(sec(m.group(2)), sec(m.group(3)))
              for m in _CUE_RE.finditer(srt_text)]
@@ -111,26 +141,34 @@ def evaluate(srt_text: str, trans_text: str, rate: float) -> dict:
         raise ValueError(
             f"{len(budgets)} srt cues vs {len(lines)} translation lines — "
             "rerun after aligning (make_zh_dub_srt reports the same counts)")
+    if speakers is not None and len(speakers) != len(lines):
+        raise ValueError(
+            f"speakers.txt has {len(speakers)} labels vs {len(lines)} "
+            "translation lines; per-speaker gating needs the 1:1 pairing")
 
     short, over, under = [], [], []
     total_est = total_budget = 0.0
     for i, (budget, zh) in enumerate(zip(budgets, lines), 1):
+        cue_rate = rate
+        if rates and speakers:
+            cue_rate = rates.get(speakers[i - 1], rate)
+        eff = budget - breath if budget > breath_min else budget
         chars = count_chars(zh)
-        est = chars / rate
+        est = chars / cue_rate
         total_est += est
-        total_budget += budget
+        total_budget += eff
         if syllables(zh) <= SHORT_SYLLS:
             short.append({"line": i, "sylls": syllables(zh),
                           "est_s": round(est, 2), "text": zh})
-        if budget > 0:
-            factor = est / budget
+        if eff > 0:
+            factor = est / eff
             if factor > OVER_FACTOR:
                 over.append({"line": i, "factor": round(factor, 2),
                              "est_s": round(est, 2),
-                             "window_s": round(budget, 2), "text": zh})
+                             "window_s": round(eff, 2), "text": zh})
             elif factor < UNDER_FACTOR:
                 under.append({"line": i, "factor": round(factor, 2),
-                              "window_s": round(budget, 2), "text": zh})
+                              "window_s": round(eff, 2), "text": zh})
 
     coverage = total_est / total_budget if total_budget else 0.0
     fail = (coverage < COVERAGE_MIN or coverage > COVERAGE_MAX
@@ -143,6 +181,9 @@ def evaluate(srt_text: str, trans_text: str, rate: float) -> dict:
         "coverage": round(coverage, 4),
         "total_est_s": round(total_est, 2),
         "total_window_s": round(total_budget, 2),
+        "breath_s": breath,
+        "breath_min_window_s": breath_min,
+        "per_speaker": rates or None,
         "verdict": "fail" if fail else "pass",
         "advisory_under": not fail and bool(under),
     }
@@ -151,6 +192,13 @@ def evaluate(srt_text: str, trans_text: str, rate: float) -> dict:
 def format_report(rep: dict, rate: float, rate_source: str) -> list[str]:
     """Human-readable rendering (cook prints these lines to stderr)."""
     out = [f"rate: {rate:.3f} chars/s ({rate_source})"]
+    if rep.get("per_speaker"):
+        ps = ", ".join(f"{k}={v:.2f}" for k, v in rep["per_speaker"].items())
+        out.append(f"per-speaker rates: {ps}")
+    if rep.get("breath_s"):
+        out.append(f"breathing reserve: {rep['breath_s']:.2f}s shaved from "
+                   f"windows > {rep.get('breath_min_window_s', 0):.2f}s "
+                   "(budget-side only; placement still pads to the next cue)")
     if rep["short"]:
         out.append(f"short-line trap (<= {SHORT_SYLLS} syllables, "
                    "IndexTTS2 narration pace):")
