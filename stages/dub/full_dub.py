@@ -266,9 +266,17 @@ def _edge_trim(wav: Path) -> None:
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-af", af, str(tmp)],
-            capture_output=True, text=True)
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-af", af, str(tmp)],
+                capture_output=True, text=True)
+        except FileNotFoundError:
+            # no ffmpeg on PATH: the take keeps its pad silence (the fit pass
+            # absorbs it); assemble fails later with its own clear no-ffmpeg
+            # message — synth must not die here (CI smoke runs have no
+            # ffmpeg; the 2026-11 tag push died on exactly this path)
+            log("  edge-trim skipped: ffmpeg not on PATH")
+            return
         if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 1000:
             return
         trimmed = get_dur(tmp)
