@@ -3219,12 +3219,12 @@ def build_parser() -> argparse.ArgumentParser:
     pgr.add_argument("--breath", type=float, metavar="SECONDS",
                      help="breathing reserve shaved from each budgeted "
                           "window; a fully-filled budget still leaves an "
-                          "audible gap before the next cue (default and "
-                          "tuning guidance in GLOSSARY.md)")
+                          "audible gap before the next cue (default 0.12; a "
+                          "calibration starting point, tune per voice)")
     pgr.add_argument("--breath-min-window", type=float, metavar="SECONDS",
                      help="windows at or below this skip the breathing "
                           "reserve; backchannel-tight cues overlap anyway "
-                          "(default in GLOSSARY.md)")
+                          "(default 1.2)")
     pgr.add_argument("--json", action="store_true",
                      help="emit the machine-readable report on stdout "
                           "(findings, coverage, verdict). Without it only a "
