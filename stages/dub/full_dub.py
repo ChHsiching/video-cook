@@ -589,6 +589,7 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
         # cue late (clock writes at max(start, clock)). Cut to the window
         # end with a fade; the placement gate below holds the invariant.
         if d > window + FIT_TOL_S:
+            pre_cut = d  # what atempo (capped) left in the window
             target = window - CUT_SLACK_S
             if target >= CUT_FLOOR_S:
                 cut = Path(str(fitted) + ".cut.wav")
@@ -601,9 +602,13 @@ def stage_assemble(output_root, name: str, keep_subs: bool = False,
                 if r.returncode == 0 and cut.exists() and cut.stat().st_size > 1000:
                     cut.replace(fitted)
                     d = get_dur(fitted)
-                    log(f"    CUT idx{idx}: factor {factor:.2f} beyond atempo cap; "
-                        f"hard cut to {d:.2f}s (window {window:.2f}s). Edit the line "
-                        f"and re-synthesize for best quality")
+                    # pre_cut > window both when factor exceeded the atempo cap
+                    # and when a sub-cap factor left a codec-rounding residual
+                    # (E2E idx3: factor 1.91, atempo output 1.13s in a 1.10s
+                    # window); the wording covers both without distinguishing
+                    log(f"    CUT idx{idx}: factor {factor:.2f}, atempo left "
+                        f"{pre_cut:.2f}s in a {window:.2f}s window; hard cut to "
+                        f"{d:.2f}s. Edit the line and re-synthesize for best quality")
         durs.append(d)
         n_fit += 1
     log(f"    fitted {n_fit}/{len(cues)} cues")
