@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2 (2026-11-04)
+
+- **help**: --breath/--breath-min-window state their defaults inline
+  (0.12s / 1.2s). 0.9.1's wheel shipped a GLOSSARY.md pointer instead,
+  but the wheel carries no GLOSSARY.md; --help is the CLI's environment
+  and must be self-contained for pip users.
+
 ## 0.9.1 (2026-11-03)
 
 Assembly placement and rate-lock (2026-11 Titus run reflux; ADR 0003):
