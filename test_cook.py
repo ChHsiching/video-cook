@@ -2637,14 +2637,15 @@ class _DubMergeHarness:
         _make_translations(zh_txt, zh_lines)
         return root, en_srt, zh_txt
 
-    def _run(self, root: Path, groups, name="video"):
+    def _run(self, root: Path, groups, name="video", expects=None):
         """Invoke cmd_dub_merge in-process. Returns (exit_code, stdout_json).
         exit_code None = returned normally (exit 0)."""
         import io
         import contextlib
         buf = io.StringIO()
         args = type("A", (), {"output_root": str(root), "name": name,
-                              "group": list(groups)})()
+                              "group": list(groups),
+                              "expect": list(expects) if expects else None})()
         code = None
         with contextlib.redirect_stdout(buf):
             try:
@@ -2678,6 +2679,89 @@ class _DubMergeHarness:
 
 
 class TestDubMerge(_DubMergeHarness):
+
+    def test_expect_match_merges(self, tmp_path):
+        """--expect pointing at the right line changes nothing: the merge
+        proceeds exactly as without it."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+            (3, "00:00:05,300 --> 00:00:06,400", "third cue"),
+        ]
+        zh = ["第一句", "目标句开头", "第三句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        code, report = self._run(root, ["2,3"], expects=["目标句开头"])
+        assert code is None
+        assert report["ok"] is True
+        assert report["cues_after"] == 2
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["第一句", "目标句开头第三句"]
+
+    def test_expect_mismatch_refuses_with_zero_side_effects(self, tmp_path):
+        """The address guard: after an earlier merge shifts the numbering, a
+        stale line number is legal but wrong. --expect catches it: the
+        merge refuses, quotes the line actually sitting at that number, and
+        leaves both files untouched (the 2026-11 incident: a wrong pair was
+        legally merged and needed hand surgery to undo)."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+            (3, "00:00:05,300 --> 00:00:06,400", "third cue"),
+        ]
+        zh = ["第一句", "别的句子", "第三句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["2,3"], expects=["目标句开头"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_expect_count_mismatch_refuses(self, tmp_path):
+        """One substring per group, paired with --group in flag order; any
+        other count is a refusal with zero side effects."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+        ]
+        zh = ["第一句", "第二句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,2"], expects=["第一句", "多余"])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
+
+    def test_expect_pairs_with_group_flag_order_not_sorted_order(self, tmp_path):
+        """--group 7,8 --group 2,3 pairs its expects with the FLAG order even
+        though the command sorts groups internally: expect[0] guards 7,8,
+        expect[1] guards 2,3. Sorting before pairing checked each substring
+        against the other group and refused good input."""
+        en_cues = [
+            (i, f"00:00:0{i},000 --> 00:00:0{i},900", f"cue {i}")
+            for i in range(1, 6)
+        ]
+        zh = ["一", "二", "三", "四", "五"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        code, report = self._run(root, ["4,5", "2,3"], expects=["四", "二"])
+        assert code is None
+        assert report["ok"] is True
+        assert zh_txt.read_text(encoding="utf-8").splitlines() == \
+            ["一", "二三", "四五"]
+
+    def test_expect_empty_substring_refuses(self, tmp_path):
+        """An empty --expect matches every line and pins nothing; the guard
+        treats it as a refusal rather than a silent disarm."""
+        en_cues = [
+            (1, "00:00:01,000 --> 00:00:02,000", "first cue"),
+            (2, "00:00:03,100 --> 00:00:04,200", "second cue"),
+        ]
+        zh = ["第一句", "第二句"]
+        root, en_srt, zh_txt = self._setup(tmp_path, en_cues, zh)
+        orig_en = en_srt.read_text(encoding="utf-8")
+        orig_zh = zh_txt.read_text(encoding="utf-8")
+        code, report = self._run(root, ["1,2"], expects=[""])
+        self._assert_refused_untouched(root, en_srt, zh_txt,
+                                       orig_en, orig_zh, code, report)
 
     def test_single_group_merges_both_sides_in_lockstep(self, tmp_path):
         """The happy path: --group 2,3 merges cue 2+3 on BOTH sides in one
