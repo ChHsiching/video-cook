@@ -2410,6 +2410,13 @@ def cmd_dub_merge(args: argparse.Namespace) -> None:
     repeatable; a run applies to the current numbering (after a merge the
     file is renumbered, so the next --group uses the new numbers).
 
+    --expect SUBSTR (repeatable, one per --group, paired in --group flag
+    order, case-insensitive) pins the address: each group's FIRST zh line
+    must contain its substring or the merge refuses. A legal-but-wrong pair
+    passed every invariant below once (a prior merge had shifted the
+    numbering); --expect makes the mismatch visible before anything is
+    written.
+
     Refuses to write anything (zero side effects — no backup, no rewrite)
     unless every invariant holds:
       1. both sides carry the same number of lines (nothing was hand-merged
@@ -2447,6 +2454,26 @@ def cmd_dub_merge(args: argparse.Namespace) -> None:
         groups = _parse_dub_merge_groups(getattr(args, "group", None), len(cues))
     except ValueError as e:
         _die(f"--group rejected: {e}", {"en_cues": len(cues)})
+
+    expects = [str(e) for e in (getattr(args, "expect", None) or [])]
+    if expects:
+        if len(expects) != len(getattr(args, "group", None) or []):
+            _die(f"--expect count ({len(expects)}) must match --group count "
+                 f"({len(getattr(args, 'group', None) or [])}); one substring "
+                 f"per group, paired in --group flag order")
+        for g_raw, want in zip(args.group, expects):
+            idx = [int(x) for x in str(g_raw).split(",")]
+            first = idx[0] - 1
+            if not want.strip():
+                _die(f"--expect rejected for group {g_raw}: an empty substring "
+                     f"matches anything and pins nothing")
+            first_zh = zh_lines[first]
+            if want.casefold() not in first_zh.casefold():
+                _die(f"--expect rejected for group {g_raw}: line {idx[0]} "
+                     f"does not contain {want!r}. It reads: {first_zh!r} — "
+                     f"the numbering may have shifted since the address was "
+                     f"computed; re-locate the lines by content and retry",
+                     {"line": idx[0], "expect": want, "actual": first_zh})
 
     new_cues, new_zh = _apply_dub_merge(cues, zh_lines, groups)
     en_text = _serialize_srt(new_cues)
@@ -3168,6 +3195,11 @@ def build_parser() -> argparse.ArgumentParser:
                            "cue, e.g. --group 12,13 (repeatable; after a merge "
                            "the file is renumbered, so the next --group uses "
                            "the new numbers)")
+    pdmg.add_argument("--expect", action="append", metavar="SUBSTR",
+                      help="substring the group's FIRST zh line must contain "
+                           "(repeatable, paired with --group in flag order, "
+                           "case-insensitive); guards against a numbering "
+                           "shift silently merging the wrong pair")
     pdmg.set_defaults(func=cmd_dub_merge)
 
 
