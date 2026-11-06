@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.3 (2026-11-07)
+
+- **dub merge --expect**: pin the merge address to content before writing.
+  `--expect SUBSTR` (repeatable, paired with `--group` in flag order,
+  case-insensitive) requires the group's first zh line to contain the
+  substring or the merge refuses, quoting the line actually sitting at
+  that number; empty substrings refuse (they pin nothing). Every merge
+  renumbers the file, so a group computed against the pre-merge
+  numbering addresses a legal but wrong pair that passes every existing
+  invariant — the 2026-11 incident merged exactly that and needed hand
+  surgery to undo.
+
 ## 0.9.2 (2026-11-04)
 
 - **help**: --breath/--breath-min-window state their defaults inline
